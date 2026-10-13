@@ -14,6 +14,7 @@ import {
   exactColor,
   loadLang,
   loadSplitLang,
+  makeRand,
   spansOf,
   type TestLang,
   textOf,
@@ -196,11 +197,15 @@ void t.test('swift: malformed constructs stay total and lossless', () => {
 });
 
 void t.test('swift: split ranges bound nested and hash-delimited scans', () => {
+  const split = loadSplitLang('swift');
   const src = String.raw`/* a /* b */ c */ ##"raw"## """multi
 line""" "value \(outer(inner()))" @available #if obj.call()`;
   const size = new TextEncoder().encode(src).length;
-  for (let split = 0; split <= size; split++)
-    checkInvariants(loadLang('swift', '$hlSwift', split).hl, src);
+  for (let at = 0; at <= size; at++) {
+    const html = split(src, at);
+    assert.equal(textOf(html), src, `split ${at}`);
+    spansOf(html);
+  }
 });
 
 void t.test(
@@ -214,13 +219,12 @@ void t.test(
 );
 
 void t.test('swift: deterministic fuzz preserves lexer invariants', () => {
-  let state = 0x5a17;
+  const rand = makeRand(0x5a17);
   const alphabet = 'abcXYZ09_#@ /\\"\'\n\t{}[]().,:;+-*=!?<>&|é';
   for (let n = 0; n < 160; n++) {
     let src = '';
-    for (let i = 0, len = state & 63; i < len; i++) {
-      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-      src += alphabet[state % alphabet.length];
+    for (let i = 0, len = rand() & 63; i < len; i++) {
+      src += alphabet[rand() % alphabet.length];
     }
     checkInvariants(swift.hl, src);
   }

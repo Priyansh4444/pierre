@@ -25,6 +25,9 @@
   (import "./langs/erlang.wat")
   (import "./langs/fortran.wat")
   (import "./langs/fsharp.wat")
+  (import "./langs/gdresource.wat")
+  (import "./langs/gdscript.wat")
+  (import "./langs/gdshader.wat")
   (import "./langs/gleam.wat")
   (import "./langs/glsl.wat")
   (import "./langs/go.wat")
@@ -95,6 +98,9 @@
     (language "fortran" $hlFortran "f90" "f95" "f03" "f08" "fortran-free-form")
     (language "fortran-fixed-form" $hlFortranFixed "f" "for" "f77")
     (language "fsharp" $hlFsharp "f#" "fs" "fsi" "fsx")
+    (language "gdresource" $hlGdresource "godot-resource" "tres" "tscn")
+    (language "gdscript" $hlGdscript "gd")
+    (language "gdshader" $hlGdshader "gdshaderinc" "godot-shader")
     (language "gleam" $hlGleam)
     (language "glsl" $hlGlsl "comp" "frag" "geom" "vert")
     (language "go" $hlGo "golang")
@@ -156,15 +162,13 @@
   (func $highlightLang (param $lang i32)
     (call_indirect (local.get $lang)))
 
-  ;; The language whose name or alias is the word [$lhs,$rhs), or 0 (plain)
-  ;; when none is; markdown resolves fence info words here. The build packs
-  ;; every name of the language table into $mem.languageNames, grouped by
-  ;; length: a u16 offset (from the table start) per length 0..19, where
-  ;; group L spans [L, L+1), then each group's records - the language id and
-  ;; the lowercase name, L + 1 bytes. Only the names of the same length are
-  ;; compared, eight bytes at a time with the tail masked off, ASCII
-  ;; case-insensitively (`| 0x20`; the names are lowercase). Loads past the
-  ;; word or a record read slack or neighboring bytes that the mask discards.
+  ;; Find the language for name or alias [$lhs,$rhs). Return 0 (plain) if
+  ;; absent. Markdown uses this for fence info strings.
+  ;; The build groups names by length in $mem.languageNames. A u16 offset
+  ;; per length 0..19 precedes the records. Group L spans offsets [L, L+1).
+  ;; Each record holds a language ID and lowercase name, L + 1 bytes total.
+  ;; Compare equal-length names eight bytes at a time, ignoring ASCII case
+  ;; with `| 0x20`. Masks discard bytes loaded past a word or record.
   (func $languageByName (param $lhs i32) (param $rhs i32) (result i32)
     (local $i i32)
     (local $len i32)

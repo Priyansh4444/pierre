@@ -548,6 +548,77 @@ let debug = true
 #endif`,
   ],
   [
+    'gdresource',
+    'Godot Resource',
+    `[gd_scene load_steps=3 format=3 uid="uid://c4ylbqk3m2v1x"]
+
+[ext_resource type="Script" path="res://player.gd" id="1_script"]
+
+[sub_resource type="CircleShape2D" id="CircleShape2D_1"]
+radius = 12.0
+
+[node name="Player" type="CharacterBody2D"]
+script = ExtResource("1_script")
+metadata/_edit_group_ = true
+
+[node name="Collision" type="CollisionShape2D" parent="."]
+shape = SubResource("CircleShape2D_1")
+points = PackedVector2Array(0, 0, 16, 8)
+tags = Array[StringName]([&"hero", &"player"])
+
+[connection signal="body_entered" from="." to="." method="_on_body_entered"]`,
+  ],
+  [
+    'gdscript',
+    'GDScript',
+    `@tool
+class_name Player
+extends CharacterBody2D
+
+## Emitted when the player picks up a coin.
+signal coin_collected(total: int)
+
+const SPEED := 220.0
+@export var jump_height: float = 48.0
+@onready var sprite: Sprite2D = $Visual/Sprite2D
+
+var coins := 0
+
+func _physics_process(delta: float) -> void:
+    var input := Input.get_axis(&"move_left", &"move_right")
+    velocity.x = input * SPEED
+    if not is_on_floor():
+        velocity.y += get_gravity().y * delta
+    move_and_slide()
+
+func collect(amount: int = 1) -> void:
+    coins += amount
+    %ScoreLabel.text = "Coins: %d" % coins
+    coin_collected.emit(coins)`,
+  ],
+  [
+    'gdshader',
+    'Godot Shader',
+    `shader_type canvas_item;
+render_mode blend_mix, unshaded;
+
+uniform vec4 tint : source_color = vec4(1.0);
+uniform sampler2D noise : filter_linear_mipmap, repeat_enable;
+uniform float speed : hint_range(0.0, 4.0) = 1.0;
+
+varying vec2 world_uv;
+
+void vertex() {
+  world_uv = (MODEL_MATRIX * vec4(VERTEX, 0.0, 1.0)).xy;
+}
+
+void fragment() {
+  float wave = texture(noise, world_uv * 0.01 + TIME * speed).r;
+  COLOR = texture(TEXTURE, UV) * tint;
+  COLOR.rgb *= 0.8 + 0.2 * sin(wave * TAU);
+}`,
+  ],
+  [
     'gleam',
     'Gleam',
     `import gleam/int
@@ -1729,23 +1800,52 @@ export function TodoList({ items }: { items: Todo[] }) @{
   [
     'tsx',
     'TSX',
-    `// Badge.tsx
+    `import { useId, useState, type ReactNode } from "react";
 
-import { useState } from "react";
-
-type BadgeProps = {
-  /** The label of the badge. */
-  label: string;
-  /** The count of the badge. */
-  count?: number;
+type Status = "open" | "merged" | "closed";
+type PullRequest = {
+  id: number;
+  title: string;
+  author: { name: string; avatar?: string };
+  status: Status;
+  additions: number;
+  deletions: number;
 };
 
-export default function Badge({ label, count = 0 }: BadgeProps) {
-  const [hot, setHot] = useState(count > 99);
+const statusLabels = {
+  open: "Ready for review",
+  merged: "Merged",
+  closed: "Closed",
+} satisfies Record<Status, string>;
+
+/** A searchable review queue with a custom action for each pull request. */
+export function ReviewQueue({ items, renderAction }: {
+  items: readonly PullRequest[];
+  renderAction: (item: PullRequest) => ReactNode;
+}) {
+  const searchId = useId();
+  const [query, setQuery] = useState("");
+  const matches = items.filter(({ title, author }) =>
+    \`\${title} \${author.name}\`.toLowerCase().includes(query.toLowerCase())
+  );
+
   return (
-    <button className={\`badge \${hot ? "hot" : "calm"}\`} onClick={() => setHot(!hot)}>
-      {label}: <strong>{count.toLocaleString()}</strong>
-    </button>
+    <section aria-label="Pull requests">
+      <label htmlFor={searchId}>Find a review</label>
+      <input id={searchId} value={query}
+        onChange={(event) => setQuery(event.currentTarget.value)} />
+      <ul>
+        {matches.map((pr) => (
+          <li key={pr.id} className={\`review review--\${pr.status}\`}>
+            <a href={\`/pull/\${pr.id}\`}>{pr.title}</a>
+            <span>{statusLabels[pr.status]} · {pr.author.name}</span>
+            <code>+{pr.additions} / −{pr.deletions}</code>
+            {renderAction(pr)}
+          </li>
+        ))}
+      </ul>
+      {matches.length === 0 && <p>No reviews match “{query}”.</p>}
+    </section>
   );
 }`,
   ],

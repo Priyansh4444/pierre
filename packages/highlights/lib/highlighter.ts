@@ -17,25 +17,21 @@ import type { ResolvedTheme } from './tokens';
 import {
   lineRecordsToTokens,
   multiThemeBlob,
-  multiThemeHtmlTags,
+  multiThemeHtmlOpeners,
   resolveOptionThemes,
   themeMeta,
 } from './tokens';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder('utf-8', { ignoreBOM: true });
-const strictDec = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
 const pageSize = 65536;
 const themePtr = 64; // $mem.themeTable in src/memory.wat
-const themeBytes = themeTableBytes;
 // Unicode identifier classes for the ECMAScript lexers; see #idClass.
 const idClassRegex = [/^\p{ID_Start}$/u, /^[\u200C\u200D\p{ID_Continue}]$/u];
 let idClassCache: Uint8Array | undefined;
 
 /**
- * Map of language names to their Wasm language ID.
- *
- * Ordered by the ID first, then the language name.
+ * Language names and Wasm IDs, sorted by ID and then name.
  */
 export const LANGS: Record<string, number> = languages;
 
@@ -84,21 +80,24 @@ export class HighlightsHighlighter implements Highlighter {
     this.dv = new DataView(this.memory.buffer);
   }
 
-  /** Write input to the text buffer and return its byte length. */
-  writeInput(input: string | Uint8Array | ArrayBuffer): number {
+  /** Write input at a byte offset in the text buffer and return its byte length. */
+  writeInput(input: string | Uint8Array | ArrayBuffer, offset = 0): number {
     if (typeof input === 'string') {
       // Use spare capacity for UTF-8, keeping 96 bytes for lexer lookahead.
-      this.#growMemoryIfNeeded(input.length + 96);
+      this.#growMemoryIfNeeded(offset + input.length + 96);
       let { read, written } = enc.encodeInto(
         input,
-        this.buffer.subarray(pageSize, this.buffer.length - 96)
+        this.buffer.subarray(pageSize + offset, this.buffer.length - 96)
       );
       if (read < input.length) {
         const rest = input.slice(read);
-        this.#growMemoryIfNeeded(written + rest.length * 3 + 96);
+        this.#growMemoryIfNeeded(offset + written + rest.length * 3 + 96);
         written += enc.encodeInto(
           rest,
-          this.buffer.subarray(pageSize + written, this.buffer.length - 96)
+          this.buffer.subarray(
+            pageSize + offset + written,
+            this.buffer.length - 96
+          )
         ).written;
       }
       return written;
@@ -109,15 +108,15 @@ export class HighlightsHighlighter implements Highlighter {
     if (!(input instanceof Uint8Array)) {
       throw new TypeError('input must be a string, Uint8Array, or ArrayBuffer');
     }
-    this.#growMemoryIfNeeded(input.length + 96);
-    this.buffer.set(input, pageSize);
+    this.#growMemoryIfNeeded(offset + input.length + 96);
+    this.buffer.set(input, pageSize + offset);
     return input.length;
   }
 
   /**
-   * Run the lexer over the first `inputLength` bytes: 0 inline colors, 1 CSS
-   * variables, 2 a packed theme set, or 3 UTF-16 line records. `reset`
-   * selects streaming mode.
+   * Lex the first `inputLength` bytes. Output modes:
+   * 0 inline colors, 1 CSS variables, 2 packed themes, 3 UTF-16 line records,
+   * 4 prepared HTML openers. `reset` selects streaming mode.
    */
   #run(
     langId: number,
@@ -138,8 +137,8 @@ export class HighlightsHighlighter implements Highlighter {
   }
 
   /**
-   * Highlight the input code as HTML.
-   * Returns HTML bytes, which may reference wasm memory until the next call.
+   * Return highlighted HTML bytes.
+   * The bytes can reference Wasm memory that the next call overwrites.
    */
   codeToHtml(
     input: string | Uint8Array | ArrayBuffer,
@@ -148,40 +147,34 @@ export class HighlightsHighlighter implements Highlighter {
     const langId = langIdOf(options.lang);
     const cssVariablePrefix =
       options.cssVariablePrefix ?? defaultCssVariablePrefix;
-    // A hex theme renders inline from its packed table and a theme set from
-    // its packed blob. The rest run the CSS-variable emitter: a CSS-variable
-    // theme with the prefix, while a Display P3 theme or a set containing one
-    // runs it with an empty prefix and has its `var(<token>)` openers
-    // rewritten by the tag replacements below.
     let table: Uint8Array | undefined;
     let blob: Uint8Array | undefined;
-    let tags: Map<string, string> | undefined;
+    let mode = 0;
     if (options.themes != null) {
       const themes = resolveOptionThemes(options);
       blob = multiThemeBlob(themes, cssVariablePrefix);
-      if (blob === undefined)
-        tags = multiThemeHtmlTags(themes, cssVariablePrefix);
+      mode = 2;
+      if (blob === undefined) {
+        blob = multiThemeHtmlOpeners(themes, cssVariablePrefix);
+        mode = 4;
+      }
     } else {
       const prepared = prepareTheme(options.theme, cssVariablePrefix);
       table = prepared.table;
-      tags = prepared.htmlTags;
+      blob = prepared.htmlOpeners;
+      if (blob !== undefined) mode = 4;
     }
     const inputLength = this.writeInput(input);
-    let mode: number;
     if (blob !== undefined) {
-      // the set travels with the input: the blob sits at the output base and
-      // the emitter starts output after it
       this.#growMemoryIfNeeded(inputLength + blob.length + 96);
       const blobPtr = (pageSize + inputLength + 47) & ~15;
       this.buffer.set(blob, blobPtr);
       this.dv.setUint32(14, blobPtr, true);
       this.dv.setUint32(18, blob.length, true);
-      mode = 2;
     } else if (table === undefined) {
-      const prefix = tags === undefined ? cssVariablePrefix : '';
-      if (this.#htmlPrefix !== prefix) {
-        this.#htmlPrefixBytes = enc.encode(escapeAttribute(prefix));
-        this.#htmlPrefix = prefix;
+      if (this.#htmlPrefix !== cssVariablePrefix) {
+        this.#htmlPrefixBytes = enc.encode(escapeAttribute(cssVariablePrefix));
+        this.#htmlPrefix = cssVariablePrefix;
       }
       const bytes = this.#htmlPrefixBytes;
       this.#growMemoryIfNeeded(inputLength + bytes.length + 96);
@@ -193,7 +186,11 @@ export class HighlightsHighlighter implements Highlighter {
     } else {
       if (this.#themeWritten !== table) {
         this.buffer.set(table, themePtr);
-        this.buffer.fill(0, themePtr + table.length, themePtr + themeBytes);
+        this.buffer.fill(
+          0,
+          themePtr + table.length,
+          themePtr + themeTableBytes
+        );
         this.#themeWritten = table;
       }
       mode = 0;
@@ -201,15 +198,7 @@ export class HighlightsHighlighter implements Highlighter {
     this.#run(langId, mode, inputLength);
     const outStart = this.dv.getUint32(6, true);
     const outLength = this.dv.getUint32(10, true);
-    const output = this.buffer.subarray(outStart, outStart + outLength);
-    if (tags === undefined) return output;
-    // Keep Wasm's escaping and line handling, replacing only generated tags
-    // with styles that cannot fit in its packed RGBA theme table.
-    return enc.encode(
-      dec
-        .decode(output)
-        .replace(/<(?:pre|span)[^>]*>/g, (tag) => tags.get(tag) ?? tag)
-    );
+    return this.buffer.subarray(outStart, outStart + outLength);
   }
 
   /** Return UTF-16 token records; `reset` starts or continues a stream. */
@@ -232,12 +221,21 @@ export class HighlightsHighlighter implements Highlighter {
     options: CodeToTokensOptions
   ): TokensResult {
     const code = toCode(input);
+    // Normalize malformed UTF-8 and avoid detaching borrowed input on memory growth.
+    if (
+      typeof input !== 'string' &&
+      (code.includes('\ufffd') ||
+        input === this.memory.buffer ||
+        (input instanceof Uint8Array && input.buffer === this.memory.buffer))
+    ) {
+      input = code;
+    }
     const themes = resolveOptionThemes(options);
     const cssVariablePrefix =
       options.cssVariablePrefix ?? defaultCssVariablePrefix;
     const recs = this.tokenizeLineRecords(
       langIdOf(options.lang),
-      this.writeInput(code)
+      this.writeInput(input)
     );
     const tokens = lineRecordsToTokens(
       code,
@@ -259,12 +257,11 @@ export class HighlightsHighlighter implements Highlighter {
   }
 
   /**
-   * Answer the ECMAScript lexers' `is_id_start` / `is_id_continue` imports
-   * for the non-ASCII code point encoded at `ptr` (`len` bytes long).
-   * `shift` selects the class: 0 for ID_Start, 2 for ID_Continue. The lexer
-   * asks once per code point, so the Unicode regex only runs on a cache miss;
-   * the cache stores 2 bits per class per BMP code point (0 unknown, 1 no,
-   * 2 yes) and astral code points fall back to the regex.
+   * Check `is_id_start` or `is_id_continue` for the code point at `ptr`.
+   * `len` is its UTF-8 byte length. `shift` is 0 for ID_Start or 2 for
+   * ID_Continue. Each BMP code point uses two cache bits per class:
+   * 0 unknown, 1 no, 2 yes. Use the Unicode regex for cache misses and
+   * astral code points.
    */
   #idClass(ptr: number, len: number, shift: number): number {
     this.bindMemory();
@@ -305,11 +302,12 @@ export class HighlightsHighlighter implements Highlighter {
   }
 }
 
-/** Decode non-string input so tokens can carry string content and offsets. */
+/** Decode bytes for token content; keep string input's original UTF-16. */
 function toCode(input: string | Uint8Array | ArrayBuffer): string {
   if (typeof input === 'string') return input;
-  if (input instanceof ArrayBuffer) return dec.decode(new Uint8Array(input));
-  if (input instanceof Uint8Array) return dec.decode(input);
+  if (input instanceof Uint8Array || input instanceof ArrayBuffer) {
+    return dec.decode(input);
+  }
   throw new TypeError('input must be a string, Uint8Array, or ArrayBuffer');
 }
 
@@ -324,8 +322,18 @@ let wasmModule: WebAssembly.Module | undefined;
 let pooledStreamHighlighter: HighlightsHighlighter | undefined;
 
 /** The shared highlighter, or throw before `init`. */
-function assertShared(): HighlightsHighlighter {
+function assertShared(
+  input: string | Uint8Array | ArrayBuffer
+): HighlightsHighlighter {
   if (shared == null) throw new Error('highlights is not initialized');
+  // Wasm memory cannot shrink. Replace instances above 8 MiB when small
+  // inputs resume, but keep reusing capacity for consecutive large calls.
+  if (
+    shared.pageN > 128 &&
+    (typeof input === 'string' ? input.length : input.byteLength) <= pageSize
+  ) {
+    shared = new HighlightsHighlighter(shared.wasmModule);
+  }
   return shared;
 }
 
@@ -348,37 +356,40 @@ export function init(wasm: WebAssembly.Module): Highlighter {
  * Create a highlighter with its own WebAssembly instance.
  * The shared highlighter is unchanged.
  */
-export function createHighlighter(wasmModule: WebAssembly.Module): Highlighter {
+export function createHighlighter(
+  wasmModule: WebAssembly.Module = assertWasmModule()
+): Highlighter {
   return new HighlightsHighlighter(wasmModule);
 }
 
 /**
- * Highlight code as a self-contained `<pre class="highlights">` fragment with
- * inline colors. With `themes`, each span carries the default theme inline and
- * the other themes as custom properties, like `codeToTokens`'s `htmlStyle`.
+ * Return a `<pre class="highlights">` fragment with inline colors.
+ * With `themes`, each span uses the default theme inline and CSS custom
+ * properties for the other themes, as in `codeToTokens`'s `htmlStyle`.
  */
 export function codeToHtml(
   input: string | Uint8Array | ArrayBuffer,
   options: CodeToHtmlOptions
 ): Uint8Array {
-  return assertShared().codeToHtml(input, options);
+  return assertShared(input).codeToHtml(input, options);
 }
 
 /**
- * Tokenize code into Shiki-compatible tokens, one array per line.
- * WebAssembly lexes and splits lines; JavaScript maps style records to tokens.
+ * Return Shiki-compatible tokens, grouped by line.
+ * WebAssembly lexes the input and splits lines. JavaScript converts the
+ * style records to tokens.
  */
 export function codeToTokens(
   input: string | Uint8Array | ArrayBuffer,
   options: CodeToTokensOptions
 ): TokensResult {
-  return assertShared().codeToTokens(input, options);
+  return assertShared(input).codeToTokens(input, options);
 }
 
 /**
- * Transform UTF-8 byte chunks into themed token arrays, one per completed line.
- * Also supports synchronous pushCode/end calls with strings or UTF-8 bytes.
- * An isolated Wasm instance scans each completed chunk once and preserves
+ * Convert UTF-8 chunks to themed token arrays, one per completed line.
+ * Use synchronous `pushCode` and `end` calls for strings or UTF-8 bytes.
+ * An isolated Wasm instance scans each completed chunk once and keeps
  * lexer state between chunks.
  */
 export class StreamTokenizer extends TransformStream<
@@ -433,10 +444,11 @@ export class StreamTokenizer extends TransformStream<
   }
 
   /**
-   * Append text or UTF-8 bytes and return one token array per completed line,
-   * with offsets relative to the full streamed input. Incomplete UTF-8 stays
-   * buffered across byte chunks; a nonempty string flushes it first. The
-   * incomplete final line stays buffered until a newline or `end()`.
+   * Append text or UTF-8 bytes. Return tokens for each completed line,
+   * with offsets relative to the full input.
+   * Incomplete UTF-8 stays buffered between byte chunks. A nonempty
+   * string flushes those bytes first. The final line stays buffered
+   * until a newline or `end()`.
    */
   pushCode(chunk: string | Uint8Array): ThemedToken[][] {
     if (this.#hl == null) throw new Error('stream has ended');
@@ -489,8 +501,9 @@ export class StreamTokenizer extends TransformStream<
   }
 
   /**
-   * Finish decoding UTF-8 and return the remaining lines, including the final
-   * line after a trailing terminator, matching codeToTokens line splitting.
+   * Finish UTF-8 decoding and return the remaining lines.
+   * A trailing line terminator produces a final empty line, as in
+   * `codeToTokens`.
    */
   end(): ThemedToken[][] {
     if (this.#hl == null) throw new Error('stream has ended');
@@ -550,27 +563,12 @@ export class StreamTokenizer extends TransformStream<
   #tokenizeChunk(input: string | Uint8Array, prefix = ''): ThemedToken[][] {
     const hl = this.#hl;
     if (hl == null) throw new Error('stream has ended');
-    let code: string;
-    if (typeof input === 'string') {
-      code = input;
-    } else {
-      try {
-        code = strictDec.decode(input);
-      } catch {
-        // Normalize malformed UTF-8 before lexing, matching codeToTokens.
-        code = dec.decode(input);
-        input = enc.encode(code);
-      }
-      if (prefix !== '') {
-        const bytes = enc.encode(prefix);
-        const combined = new Uint8Array(bytes.length + input.length);
-        combined.set(bytes);
-        combined.set(input, bytes.length);
-        input = combined;
-        code = prefix + code;
-      }
-    }
-    const byteLen = hl.writeInput(input);
+    let code = toCode(input);
+    // Replacement characters must reach Wasm as valid UTF-8 for matching offsets.
+    if (typeof input !== 'string' && code.includes('\ufffd')) input = code;
+    code = prefix + code;
+    let byteLen = prefix === '' ? 0 : hl.writeInput(prefix);
+    byteLen += hl.writeInput(input, byteLen);
     const recs = hl.tokenizeLineRecords(
       this.#langId,
       byteLen,

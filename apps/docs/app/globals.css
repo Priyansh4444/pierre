@@ -159,6 +159,20 @@
   }
 }
 
+/* Box-drawing glyphs (U+2500-257F) cut from JetBrains Mono, which shares
+   Berkeley Mono's 600/1000 advance. Berkeley Mono's --font-berkeley-mono
+   fallback list names this family first, so the glyphs Berkeley lacks
+   (like ━ ╰ ╴) stay on the character grid on every OS. unicode-range keeps
+   the file from loading on pages that never render these characters.
+   License: see NOTICE.md. */
+@font-face {
+  font-family: 'JetBrains Mono Box Drawing';
+  src: url('./JetBrainsMonoBoxDrawing.woff2') format('woff2');
+  font-weight: 100 800;
+  font-display: swap;
+  unicode-range: U+2500-257F;
+}
+
 :root {
   --diffs-font-family: var(--font-berkeley-mono);
   --cv-gutter-vertical: 0px;
@@ -238,6 +252,25 @@
 
   .inline-link {
     @apply text-foreground hover:text-foreground decoration-muted-foreground hover:decoration-foreground underline decoration-[1px] underline-offset-3 transition-[text-decoration-color,text-underline-offset];
+  }
+
+  .styled-link {
+    @apply text-foreground decoration-muted-foreground hover:decoration-foreground focus-visible:decoration-foreground underline decoration-[1px] underline-offset-3 transition-[color,text-decoration-color,text-underline-offset] focus-visible:rounded-xs focus-visible:outline-2 focus-visible:outline-offset-2;
+  }
+
+  .styled-link-muted {
+    color: var(--color-muted-foreground);
+    text-decoration-color: color-mix(
+      in oklab,
+      var(--color-muted-foreground) 50%,
+      transparent
+    );
+  }
+
+  .styled-link-muted:hover,
+  .styled-link-muted:focus-visible {
+    color: var(--color-foreground);
+    text-decoration-color: var(--color-foreground);
   }
 
   .no-scrollbar::-webkit-scrollbar {

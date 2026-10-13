@@ -14,6 +14,7 @@ export const defaultCssVariablePrefix = '--hls-';
  */
 export const themeTableBytes = 384;
 
+const enc = new TextEncoder();
 const colorReg = /^#([a-f0-9]{3,4}|[a-f0-9]{6}|[a-f0-9]{8})$/i;
 const displayP3Reg =
   /^color\(display-p3\s+[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s+[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s+[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*\/\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+))?\s*\)$/i;
@@ -75,10 +76,9 @@ function isThemeObject(value: unknown): value is Theme {
 }
 
 /**
- * The single `Theme` behind a `theme` option: a `ThemeFamily` resolves to its
- * first member. Throws a `TypeError` naming what was received when the value
- * is not a theme object, so a theme id passed as a string (Shiki style) fails
- * with a clear message instead of a raw engine error.
+ * Resolve a `theme` option. For a `ThemeFamily`, use its first member.
+ * Throw a `TypeError` that describes the received value if it is invalid.
+ * Theme ID strings are not supported.
  */
 export function resolveTheme(theme: Theme | ThemeFamily): Theme {
   const resolved: unknown =
@@ -155,10 +155,8 @@ function cssVariable(name: string, cssVariablePrefix: string): string {
 }
 
 /**
- * Escape a user string for a double-quoted HTML attribute, the same escaping
- * the CSS-variable emitter applies to its prefix. Theme colors never need it
- * (`isThemeColor` rejects anything but hex and numeric Display P3), but
- * prefixes and theme keys are arbitrary strings.
+ * Escape a string for a double-quoted HTML attribute.
+ * Prefixes and theme keys need escaping. Validated theme colors do not.
  */
 export function escapeAttribute(value: string): string {
   return value
@@ -169,60 +167,49 @@ export function escapeAttribute(value: string): string {
 }
 
 /**
- * The `<pre>` opener the CSS-variable emitter writes with an empty prefix.
- * Tag-replacement maps key on it and on `variableSpanTag` openers to rewrite
- * the emitter's output with colors it cannot carry itself.
+ * Pack HTML openers for Wasm mode 4. Store the u32 span reserve, then
+ * u32 byte offset/length pairs per token ID, then the UTF-8 bytes.
+ * Slot 0 holds the root opener with `<code>`. Other slots hold span openers.
  */
-export const variableRootTag =
-  '<pre class="highlights" style="background-color:var(background);color:var(foreground);">';
-
-/** The `<span>` opener the CSS-variable emitter writes for a token id with an empty prefix. */
-export function variableSpanTag(hl: number): string {
-  return `<span style="color:var(${tokenTypes[hl].replace(/[._]/g, '-')})">`;
+export function packHtmlOpeners(openers: string[]): Uint8Array {
+  const bytes = openers.map((opener) => enc.encode(opener));
+  let offset = 4 + 8 * bytes.length;
+  const blob = new Uint8Array(
+    offset + bytes.reduce((sum, entry) => sum + entry.length, 0)
+  );
+  const dv = new DataView(blob.buffer);
+  let spanReserve = 32;
+  for (let i = 0; i < bytes.length; i++) {
+    dv.setUint32(4 + 8 * i, offset, true);
+    dv.setUint32(8 + 8 * i, bytes[i].length, true);
+    blob.set(bytes[i], offset);
+    offset += bytes[i].length;
+    if (i !== 0) spanReserve = Math.max(spanReserve, bytes[i].length + 32);
+  }
+  dv.setUint32(0, spanReserve, true);
+  return blob;
 }
 
-/**
- * One theme prepared for every output path. `styles` is indexed by token id,
- * with `null` for unstyled slots; the foreground and background live in `fg`
- * and `bg` instead. Which extra representation is present depends on the
- * theme: hex themes carry the packed Wasm `table`, Display P3 themes carry
- * the HTML tag replacements, and CSS-variable themes carry neither because
- * every color is a prefixed custom property. Representations that only some
- * callers need are built on first read: the tag replacements, and the
- * variable references of a CSS-variable theme, which HTML output never reads.
- */
+/** Resolved token styles, root colors, and the theme's HTML representation. */
 export interface PreparedTheme {
   name: string;
+  /** Indexed by token id; null slots inherit the foreground. */
   styles: (TokenStyle | null)[];
   fg?: string;
   bg?: string;
-  /** True when any color is `color(display-p3 …)`. */
-  usesDisplayP3: boolean;
-  /**
-   * Five bytes per token id (`r g b a style`) for the Wasm theme table, or
-   * `undefined` when HTML must render through the CSS-variable emitter
-   * because the colors are custom properties or Display P3.
-   */
+  /** Five-byte RGBA/style records; undefined for Display P3 and CSS variables. */
   table: Uint8Array | undefined;
-  /**
-   * For Display P3 themes, the CSS-variable emitter's unprefixed `<pre>` and
-   * `<span>` openers mapped to openers with the theme's colors and font
-   * settings inlined; built on first read, so token-only callers never pay
-   * for it. `undefined` for other themes.
-   */
-  readonly htmlTags: Map<string, string> | undefined;
+  /** Lazy UTF-8 HTML openers for Display P3 themes and named CSS palettes. */
+  readonly htmlOpeners: Uint8Array | undefined;
 }
 
-// Cache by object identity, not name: same-named themes may have different
-// palettes, and a registered theme may be replaced by a new object with the
-// same name. CSS-variable themes get one entry per prefix; the others use ''.
+// Theme names are not unique. Replace the object to change its cached styles.
 const preparedCache = new WeakMap<Theme, Map<string, PreparedTheme>>();
 
 /**
- * Prepare a theme or family for rendering, resolving every token slot once.
- * Results are cached by theme object identity (and by prefix for
- * CSS-variable themes), so HTML, token, stream, and live output share one
- * prepared object per theme.
+ * Resolve all token styles for a theme or family.
+ * Cache by theme object identity and, for CSS-variable themes, by prefix.
+ * HTML, token, stream, and live output share the prepared object.
  */
 export function prepareTheme(
   theme: Theme | ThemeFamily,
@@ -236,7 +223,9 @@ export function prepareTheme(
   const prepared =
     resolved.cssVariables === true
       ? prepareCssVariables(resolved.name, cssVariablePrefix)
-      : prepareStyles(resolved);
+      : typeof resolved.cssVariables === 'object'
+        ? prepareCssPalette(resolved)
+        : prepareStyles(resolved);
   if (prefixes === undefined) {
     prefixes = new Map();
     preparedCache.set(resolved, prefixes);
@@ -245,10 +234,47 @@ export function prepareTheme(
   return prepared;
 }
 
+/** Palette colors are variable suffixes, not literal CSS values. */
+function prepareCssPalette(theme: Theme): PreparedTheme {
+  const config = theme.cssVariables;
+  if (typeof config !== 'object') throw new Error('Expected CSS palette');
+  const prefix = config.prefix ?? defaultCssVariablePrefix;
+  const variable = (name: string): string => {
+    const fallback = config.defaults?.[name];
+    return `var(${prefix}${name}${fallback ? `, ${fallback}` : ''})`;
+  };
+  const styles: (TokenStyle | null)[] = new Array(tokenTypes.length).fill(null);
+  const syntax = theme.style.syntax ?? {};
+  for (let i = 1; i < tokenTypes.length; i++) {
+    const setting = resolveThemeSyntax(syntax, tokenTypes[i]);
+    styles[i] = {
+      color: variable(setting?.color ?? 'foreground'),
+      italic: setting?.font_style === 'italic',
+      weight:
+        setting?.font_weight === undefined
+          ? 0
+          : Math.round(setting.font_weight / 100) * 100,
+    };
+  }
+  const fg = variable(themeForeground(theme.style) ?? 'foreground');
+  const bg = variable(themeBackground(theme.style) ?? 'background');
+  let htmlOpeners: Uint8Array | undefined;
+  return {
+    name: theme.name,
+    styles,
+    fg,
+    bg,
+    table: undefined,
+    get htmlOpeners() {
+      return (htmlOpeners ??= themeHtmlOpeners(styles, fg, bg));
+    },
+  };
+}
+
 /**
- * A CSS-variable theme: every slot references its prefixed custom property
- * and the theme's own `style` is never read. The references are built on
- * first read, since HTML output only needs to know there is no table.
+ * Each slot uses its prefixed CSS custom property. The theme's `style`
+ * is not read. Build these references on first use. HTML output only
+ * needs to know that there is no packed theme table.
  */
 function prepareCssVariables(
   name: string,
@@ -267,9 +293,8 @@ function prepareCssVariables(
     get bg() {
       return resolve().bg;
     },
-    usesDisplayP3: false,
     table: undefined,
-    htmlTags: undefined,
+    htmlOpeners: undefined,
   };
 }
 
@@ -293,11 +318,10 @@ function cssVariableStyles(
 }
 
 /**
- * Resolve every token slot of a hex or Display P3 theme in one pass, packing
- * each hex color and its font settings into the Wasm theme table as it goes.
- * Font settings stay in the table even without a color. Display P3 colors
- * cannot fit the packed RGBA records, so such a theme drops the table and
- * gets HTML tag replacements instead.
+ * Resolve token styles and pack hex colors and font settings into a Wasm
+ * theme table. Keep font settings even when the color is absent.
+ * Display P3 colors do not fit RGBA records. Themes with these colors
+ * use prepared HTML openers instead of a packed table.
  */
 function prepareStyles(theme: Theme): PreparedTheme {
   const themeStyle = theme.style ?? {};
@@ -329,38 +353,35 @@ function prepareStyles(theme: Theme): PreparedTheme {
     else if (name === 'background') bg = color;
     else styles[i] = style;
   }
-  let htmlTags: Map<string, string> | undefined;
+  let htmlOpeners: Uint8Array | undefined;
   return {
     name: theme.name,
     styles,
     fg,
     bg,
-    usesDisplayP3,
     table: usesDisplayP3 ? undefined : table,
-    get htmlTags() {
+    get htmlOpeners() {
       if (!usesDisplayP3) return undefined;
-      return (htmlTags ??= displayP3HtmlTags(styles, fg, bg));
+      return (htmlOpeners ??= themeHtmlOpeners(styles, fg, bg));
     },
   };
 }
 
 /**
- * Tag replacements for Display P3 HTML. The CSS-variable emitter runs with an
- * empty prefix, so its openers read `var(<token>)`; each maps to an opener
- * with the theme's color and font settings inlined, the shape the packed-table
- * emitter produces. Every color passed `isThemeColor`, so none can escape the
- * style attribute.
+ * Pack theme colors and font styles for the Wasm HTML emitter.
+ * Escape attributes because CSS prefixes and defaults may contain quotes.
  */
-function displayP3HtmlTags(
+function themeHtmlOpeners(
   styles: (TokenStyle | null)[],
   fg: string | undefined,
   bg: string | undefined
-): Map<string, string> {
-  const tags = new Map<string, string>();
+): Uint8Array {
   const rootStyle =
     (bg === undefined ? '' : `background-color:${bg};`) +
     (fg === undefined ? '' : `color:${fg}`);
-  tags.set(variableRootTag, `<pre class="highlights" style="${rootStyle}">`);
+  const openers = [
+    `<pre class="highlights" style="${escapeAttribute(rootStyle)}"><code>`,
+  ];
   for (let i = 1; i < tokenTypes.length; i++) {
     const style = styles[i];
     const css =
@@ -369,7 +390,7 @@ function displayP3HtmlTags(
       (style != null && style.weight !== 0
         ? `;font-weight:${style.weight}`
         : '');
-    tags.set(variableSpanTag(i), `<span style="${css}">`);
+    openers.push(`<span style="${escapeAttribute(css)}">`);
   }
-  return tags;
+  return packHtmlOpeners(openers);
 }

@@ -1,5 +1,4 @@
 import type { Element as HASTElement } from 'hast';
-import { toHtml } from 'hast-util-to-html';
 
 import {
   CUSTOM_HEADER_SLOT_ID,
@@ -36,6 +35,7 @@ export type { FileEditCompleteEvent } from '../editor/types';
 import {
   getHighlighterIfLoaded,
   getSharedHighlighter,
+  HighlighterDisposedError,
 } from '../highlighter/shared_highlighter';
 import type {
   AppliedThemeStyleCache,
@@ -78,14 +78,17 @@ import { getLineAnnotationName } from '../utils/getLineAnnotationName';
 import { getOrCreateCodeNode } from '../utils/getOrCreateCodeNode';
 import { getThemes } from '../utils/getThemes';
 import { guardWebKitScrollDuringRebuild } from '../utils/guardWebKitScrollDuringRebuild';
+import { hastToHtml } from '../utils/hastToHtml';
 import { upsertHostThemeStyle } from '../utils/hostTheme';
 import { isFilePlainText } from '../utils/isFilePlainText';
 import { isStyleNode } from '../utils/isStyleNode';
 import { isSafari } from '../utils/platform';
 import { prerenderHTMLIfNecessary } from '../utils/prerenderHTMLIfNecessary';
+import { resolvePreferredHighlighter } from '../utils/resolvePreferredHighlighter';
 import { getMeasuredScrollbarGutter } from '../utils/scrollbarGutter';
 import { setPreNodeProperties } from '../utils/setWrapperNodeProps';
 import type { WorkerPoolManager } from '../worker';
+import { isHandledWorkerPoolError } from '../worker/errors';
 import { DiffsContainerLoaded } from './web-components';
 
 const EMPTY_STRINGS: string[] = [''];
@@ -1024,17 +1027,27 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     const lang = file.lang ?? getFiletypeFromFileName(file.name);
     // Sync editor synchronously whenever the shared highlighter is ready;
     // otherwise load it and sync once it resolves.
-    const highlighter = getHighlighterIfLoaded({ theme, lang });
+    const highlighter = getHighlighterIfLoaded({
+      theme,
+      lang,
+    });
     if (highlighter != null) {
       syncEditor(highlighter);
     } else {
       void getSharedHighlighter({
         themes: getThemes(theme),
         langs: Array.from(new Set(['text', lang])),
-        preferredHighlighter:
-          this.workerManager?.getPreferredHighlighter() ??
-          this.options.preferredHighlighter,
-      }).then(syncEditor);
+        preferredHighlighter: resolvePreferredHighlighter(
+          this.workerManager,
+          this.options
+        ),
+      })
+        .then(syncEditor)
+        .catch((error: unknown) => {
+          if (!(error instanceof HighlighterDisposedError)) {
+            console.error(error);
+          }
+        });
     }
   }
 
@@ -1619,6 +1632,9 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     await workerManager
       .primeFileHighlightCache(file)
       .catch((error: unknown) => {
+        if (isHandledWorkerPoolError(error)) {
+          return;
+        }
         console.error(error);
       });
   }
@@ -1732,6 +1748,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
 
   private injectUnsafeCSS(): void {
     const { unsafeCSS } = this.options;
+    this.pre?.toggleAttribute('data-custom-styles', Boolean(unsafeCSS));
     const shadowRoot = this.fileContainer?.shadowRoot;
     if (shadowRoot == null) {
       return;
@@ -1849,11 +1866,11 @@ export class File<LAnnotation = undefined, Caret = undefined> {
         for (let i = 0; i < 2; i++) {
           const domEl = code.children[i] as HTMLElement;
           const astEl = codeAst[i] as HASTElement;
-          domEl.innerHTML = toHtml(astEl.children);
+          domEl.innerHTML = hastToHtml(astEl.children);
           domEl.style.cssText = astEl.properties.style as string;
         }
       } else {
-        code.innerHTML = toHtml(codeAst);
+        code.innerHTML = hastToHtml(codeAst);
       }
       if (!pre.contains(code)) {
         pre.replaceChildren(code);
@@ -2133,7 +2150,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.cleanupErrorWrapper();
     this.placeHolder?.remove();
     this.placeHolder = undefined;
-    const headerHTML = this.cachedHeaderHTML ?? toHtml(headerAST);
+    const headerHTML = this.cachedHeaderHTML ?? hastToHtml(headerAST);
     this.cachedHeaderHTML = headerHTML;
     if (headerHTML !== this.lastRenderedHeaderHTML) {
       const tempDiv = document.createElement('div');

@@ -2,17 +2,22 @@ import LRUMapPkg from 'lru_map';
 import type { LRUMap } from 'lru_map';
 
 import { DEFAULT_THEMES } from '../constants';
+import { resolveHighlighterType } from '../highlighter/highlighterType';
 import { areLanguagesAttached } from '../highlighter/languages/areLanguagesAttached';
 import { getResolvedLanguages } from '../highlighter/languages/getResolvedLanguages';
 import { hasResolvedLanguages } from '../highlighter/languages/hasResolvedLanguages';
 import { resolveLanguages } from '../highlighter/languages/resolveLanguages';
-import { getSharedHighlighter } from '../highlighter/shared_highlighter';
-import { attachResolvedThemes } from '../highlighter/themes/attachResolvedThemes';
+import {
+  getHighlighterIfLoaded,
+  getSharedHighlighter,
+  HighlighterDisposedError,
+} from '../highlighter/shared_highlighter';
 import { getResolvedThemes } from '../highlighter/themes/getResolvedThemes';
 import { hasResolvedThemes } from '../highlighter/themes/hasResolvedThemes';
 import { resolveThemes } from '../highlighter/themes/resolveThemes';
 import type {
-  DiffsHighlighter,
+  DiffsTheme,
+  DiffsThemeNames,
   FileContents,
   FileDiffMetadata,
   HighlighterTypes,
@@ -25,7 +30,6 @@ import type {
   SupportedLanguages,
   ThemedDiffResult,
   ThemedFileResult,
-  ThemeRegistrationResolved,
 } from '../types';
 import { areDiffRenderOptionsEqual } from '../utils/areDiffRenderOptionsEqual';
 import { areDiffTargetsEqual } from '../utils/areDiffTargetsEqual';
@@ -42,6 +46,14 @@ import { isDiffPlainText } from '../utils/isDiffPlainText';
 import { isFilePlainText } from '../utils/isFilePlainText';
 import { renderDiffWithHighlighter } from '../utils/renderDiffWithHighlighter';
 import { renderFileWithHighlighter } from '../utils/renderFileWithHighlighter';
+import {
+  isHandledWorkerPoolError,
+  markWorkerErrorReported,
+  WorkerPoolTaskCanceledError,
+  WorkerPoolTerminatedError,
+  WorkerPoolWorkerError,
+} from './errors';
+import { decodeHastLines } from './hastLinesTransport';
 import type {
   AllWorkerTasks,
   DiffRendererInstance,
@@ -59,24 +71,15 @@ import type {
   WorkerPoolOptions,
   WorkerRenderingOptions,
   WorkerRequestId,
-  WorkerResponse,
   WorkerStats,
 } from './types';
+import type {
+  InitializeWorkerWireRequest,
+  WorkerWireResponse,
+} from './workerMessage';
 
 const IGNORE_RESPONSE = Symbol('IGNORE_RESPONSE');
 const DEFAULT_WORKER_INITIALIZATION_TIMEOUT = 10_000;
-
-class WorkerPoolTerminatedError extends Error {
-  constructor() {
-    super('WorkerPoolManager: operation canceled because the pool terminated');
-  }
-}
-
-class WorkerPoolTaskCanceledError extends Error {
-  constructor() {
-    super('WorkerPoolManager: operation canceled before the task completed');
-  }
-}
 
 interface GetCachesResult {
   fileCache: LRUMap<string, RenderFileResult>;
@@ -101,7 +104,6 @@ type RenderTask = RenderFileTask | RenderDiffTask;
 type RenderTaskInstance = FileRendererInstance | DiffRendererInstance;
 
 export class WorkerPoolManager {
-  private highlighter: DiffsHighlighter | undefined;
   private readonly preferredHighlighter: HighlighterTypes;
   private renderOptions: WorkerRenderingOptions;
   private renderOptionsRequestVersion = 0;
@@ -142,10 +144,10 @@ export class WorkerPoolManager {
       lineDiffType = 'word-alt',
       maxLineDiffLength = 1000,
       tokenizeMaxLineLength = 1000,
-      preferredHighlighter = 'shiki-js',
+      preferredHighlighter,
     }: WorkerInitializationRenderOptions
   ) {
-    this.preferredHighlighter = preferredHighlighter;
+    this.preferredHighlighter = resolveHighlighterType(preferredHighlighter);
     this.renderOptions = {
       theme,
       useTokenTransformer,
@@ -228,31 +230,27 @@ export class WorkerPoolManager {
       }
 
       const themeNames = getThemes(theme);
-      let resolvedThemes: ThemeRegistrationResolved[] = [];
+      let resolvedThemes: DiffsTheme[] = [];
       if (!areThemesEqual(newRenderOptions.theme, this.renderOptions.theme)) {
-        if (hasResolvedThemes(themeNames)) {
-          resolvedThemes = getResolvedThemes(themeNames);
-        } else {
-          resolvedThemes = await resolveThemes(themeNames);
-        }
+        resolvedThemes = hasResolvedThemes(
+          themeNames,
+          this.preferredHighlighter
+        )
+          ? getResolvedThemes(themeNames, this.preferredHighlighter)
+          : await resolveThemes(themeNames, this.preferredHighlighter);
       }
 
       if (!isCurrentRequest()) {
         return;
       }
 
-      if (this.highlighter != null) {
-        attachResolvedThemes(resolvedThemes, this.highlighter);
-      } else {
-        const highlighter = await getSharedHighlighter({
-          themes: themeNames,
-          langs: ['text'],
-          preferredHighlighter: this.preferredHighlighter,
-        });
+      // Warning: resolvedThemes use the workers' backend. The main-thread
+      // highlighter can be another backend, so it loads its own copies.
+      if (getHighlighterIfLoaded({ theme }) == null) {
+        await this.loadSharedHighlighter(themeNames, ['text']);
         if (!isCurrentRequest()) {
           return;
         }
-        this.highlighter = highlighter;
       }
 
       const workerSetup = this.setRenderOptionsOnWorkers(
@@ -295,7 +293,7 @@ export class WorkerPoolManager {
 
   private async setRenderOptionsOnWorkers(
     renderOptions: WorkerRenderingOptions,
-    resolvedThemes: ThemeRegistrationResolved[]
+    resolvedThemes: DiffsTheme[]
   ): Promise<void> {
     if (this.workersFailed) {
       return;
@@ -402,41 +400,43 @@ export class WorkerPoolManager {
 
   public async initialize(languages: SupportedLanguages[] = []): Promise<void> {
     if (this.initialized === true) {
+      if (getHighlighterIfLoaded({ theme: this.renderOptions.theme }) == null) {
+        await this.loadSharedHighlighter(getThemes(this.renderOptions.theme), [
+          'text',
+          ...languages,
+        ]);
+      }
       return;
     } else if (this.initialized === false) {
       const { lifecycleGeneration } = this;
-      this.initialized = new Promise((resolve, reject) => {
+      const initialization = new Promise<void>((resolve, reject) => {
         void (async () => {
           try {
             const themes = getThemes(this.renderOptions.theme);
-            let resolvedThemes: ThemeRegistrationResolved[] = [];
-            if (hasResolvedThemes(themes)) {
-              resolvedThemes = getResolvedThemes(themes);
-            } else {
-              resolvedThemes = await resolveThemes(themes);
-            }
+            const resolvedThemes = hasResolvedThemes(
+              themes,
+              this.preferredHighlighter
+            )
+              ? getResolvedThemes(themes, this.preferredHighlighter)
+              : await resolveThemes(themes, this.preferredHighlighter);
             if (!this.isCurrentLifecycle(lifecycleGeneration)) {
               resolve();
               return;
             }
 
             let resolvedLanguages: ResolvedLanguage[] = [];
-            if (hasResolvedLanguages(languages)) {
-              resolvedLanguages = getResolvedLanguages(languages);
-            } else {
-              resolvedLanguages = await resolveLanguages(languages);
+            if (this.preferredHighlighter !== 'highlights') {
+              resolvedLanguages = hasResolvedLanguages(languages)
+                ? getResolvedLanguages(languages)
+                : await resolveLanguages(languages);
             }
             if (!this.isCurrentLifecycle(lifecycleGeneration)) {
               resolve();
               return;
             }
 
-            const [highlighter] = await Promise.all([
-              getSharedHighlighter({
-                themes,
-                langs: ['text', ...languages],
-                preferredHighlighter: this.preferredHighlighter,
-              }),
+            await Promise.all([
+              this.loadSharedHighlighter(themes, ['text', ...languages]),
               this.initializeWorkers(resolvedThemes, resolvedLanguages),
             ]);
 
@@ -445,7 +445,6 @@ export class WorkerPoolManager {
               resolve();
               return;
             }
-            this.highlighter = highlighter;
             this.initialized = true;
             this.diffCache.clear();
             this.fileCache.clear();
@@ -475,14 +474,38 @@ export class WorkerPoolManager {
           }
         })();
       });
+      this.initialized = initialization;
       this.queueBroadcastStateChanges();
+      // Return the startup promise so callers can await initialization and the
+      // constructor's error handler can catch startup failures.
+      return initialization;
     } else {
       return this.initialized;
     }
   }
 
+  // Warning: workers never use the main-thread highlighter. If
+  // disposeHighlighter() runs during this load, pool work must not fail; the
+  // next plain render loads the highlighter again.
+  private async loadSharedHighlighter(
+    themes: DiffsThemeNames[],
+    langs: SupportedLanguages[]
+  ): Promise<void> {
+    try {
+      await getSharedHighlighter({
+        themes,
+        langs,
+        preferredHighlighter: this.preferredHighlighter,
+      });
+    } catch (error) {
+      if (!(error instanceof HighlighterDisposedError)) {
+        throw error;
+      }
+    }
+  }
+
   private async initializeWorkers(
-    resolvedThemes: ThemeRegistrationResolved[],
+    resolvedThemes: DiffsTheme[],
     resolvedLanguages: ResolvedLanguage[]
   ): Promise<void> {
     this.workersFailed = false;
@@ -505,7 +528,7 @@ export class WorkerPoolManager {
       };
       worker.addEventListener(
         'message',
-        (event: MessageEvent<WorkerResponse>) => {
+        (event: MessageEvent<WorkerWireResponse>) => {
           this.handleWorkerMessage(managedWorker, event.data);
         }
       );
@@ -516,20 +539,22 @@ export class WorkerPoolManager {
       initPromises.push(
         new Promise<void>((resolve, reject) => {
           const id = this.generateRequestId();
+          const request: InitializeWorkerWireRequest = {
+            type: 'initialize',
+            resultFormat: 'hast-ops-v1',
+            id,
+            renderOptions: this.renderOptions,
+            preferredHighlighter: this.preferredHighlighter,
+            resolvedThemes,
+            resolvedLanguages,
+            customExtensionsVersion:
+              customExtensionMap != null ? customExtensionVersion : undefined,
+            customExtensionMap,
+          };
           const task: InitializeWorkerTask = {
             type: 'initialize',
             id,
-            request: {
-              type: 'initialize',
-              id,
-              renderOptions: this.renderOptions,
-              preferredHighlighter: this.preferredHighlighter,
-              resolvedThemes,
-              resolvedLanguages,
-              customExtensionsVersion:
-                customExtensionMap != null ? customExtensionVersion : undefined,
-              customExtensionMap,
-            },
+            request,
             resolve() {
               managedWorker.initialized = true;
               resolve();
@@ -567,11 +592,28 @@ export class WorkerPoolManager {
     }
   }
 
+  /**
+   * Pass worker errors to onWorkerError, or log them if no callback is set.
+   *
+   * A startup error rejects initialization so components can highlight on the
+   * main thread. Other requests wait for their own responses: worker.ts catches
+   * request errors, so this event may be unrelated to the current request.
+   * A worker that stops responding remains busy and receives no further work.
+   */
   private handleWorkerError(
     managedWorker: ManagedWorker,
-    error: unknown
+    event: ErrorEvent | Event
   ): void {
-    console.error('Worker error:', error, managedWorker);
+    const { onWorkerError } = this.options;
+    if (onWorkerError != null) {
+      try {
+        onWorkerError(event, managedWorker.worker);
+      } catch (hookError) {
+        console.error('WorkerPoolManager: onWorkerError threw:', hookError);
+      }
+    } else {
+      console.error('Worker error:', event, managedWorker);
+    }
     const { pendingSetupRequestId } = managedWorker;
     if (pendingSetupRequestId == null) {
       return;
@@ -580,7 +622,11 @@ export class WorkerPoolManager {
     if (task?.type !== 'initialize') {
       return;
     }
-    task.reject(normalizeWorkerError(error));
+    const error = errorFromWorkerErrorEvent(event);
+    if (onWorkerError != null) {
+      markWorkerErrorReported(error);
+    }
+    task.reject(error);
     this.cleanWorkerAndTask(managedWorker, task);
   }
 
@@ -688,22 +734,20 @@ export class WorkerPoolManager {
     lines?: string[],
     hiddenLineRanges?: readonly LineRange[]
   ): ThemedFileResult | undefined {
-    if (this.highlighter == null) {
+    const highlighter = getHighlighterIfLoaded({
+      theme: this.renderOptions.theme,
+    });
+    if (highlighter == null) {
       this.queueInitialization();
       return undefined;
     }
-    return renderFileWithHighlighter(
-      file,
-      this.highlighter,
-      this.renderOptions,
-      {
-        forcePlainText: true,
-        startingLine,
-        totalLines,
-        lines,
-        hiddenLineRanges,
-      }
-    );
+    return renderFileWithHighlighter(file, highlighter, this.renderOptions, {
+      forcePlainText: true,
+      startingLine,
+      totalLines,
+      lines,
+      hiddenLineRanges,
+    });
   }
 
   public highlightDiffAST(
@@ -783,15 +827,20 @@ export class WorkerPoolManager {
     expandedHunks?: Map<number, HunkExpansionRegion> | true,
     collapsedContextThreshold?: number
   ): ThemedDiffResult | undefined {
-    return this.highlighter != null
-      ? renderDiffWithHighlighter(diff, this.highlighter, this.renderOptions, {
-          forcePlainText: true,
-          startingLine,
-          totalLines,
-          expandedHunks,
-          collapsedContextThreshold,
-        })
-      : undefined;
+    const highlighter = getHighlighterIfLoaded({
+      theme: this.renderOptions.theme,
+    });
+    if (highlighter == null) {
+      this.queueInitialization();
+      return undefined;
+    }
+    return renderDiffWithHighlighter(diff, highlighter, this.renderOptions, {
+      forcePlainText: true,
+      startingLine,
+      totalLines,
+      expandedHunks,
+      collapsedContextThreshold,
+    });
   }
 
   public terminate(): void {
@@ -809,7 +858,6 @@ export class WorkerPoolManager {
     this.queuedTaskByInstance.clear();
     this.taskByHighlightKey.clear();
     this.activeTaskById.clear();
-    this.highlighter = undefined;
     this.initialized = false;
     this.workersFailed = false;
     this.queueBroadcastStateChanges();
@@ -821,6 +869,10 @@ export class WorkerPoolManager {
 
   private queueInitialization(languages?: SupportedLanguages[]): void {
     void this.initialize(languages).catch((error) => {
+      // Skip cancellations and worker errors already passed to onWorkerError.
+      if (isHandledWorkerPoolError(error)) {
+        return;
+      }
       console.error(error);
     });
   }
@@ -992,24 +1044,25 @@ export class WorkerPoolManager {
     langs: SupportedLanguages[]
   ): Promise<void> {
     try {
-      // Lets keep the main thread highlighter in sync with loaded themes so
-      // edits can be more seamless
+      // Preload the same languages on the main thread for editing.
+      const highlighter = getHighlighterIfLoaded();
       const mainThreadLangs = langs.filter(
-        (lang) => !areLanguagesAttached(lang)
+        (lang) =>
+          highlighter == null || !areLanguagesAttached(lang, highlighter)
       );
       if (mainThreadLangs.length > 0) {
-        void getSharedHighlighter({
-          themes: getThemes(this.renderOptions.theme),
-          langs: ['text', ...mainThreadLangs],
-          preferredHighlighter: this.preferredHighlighter,
-        }).catch((error: unknown) => {
+        void this.loadSharedHighlighter(getThemes(this.renderOptions.theme), [
+          'text',
+          ...mainThreadLangs,
+        ]).catch((error: unknown) => {
           console.error(error);
         });
       }
       // Add resolved languages if required
-      const workerMissingLangs = langs.filter(
-        (lang) => !availableWorker.langs.has(lang)
-      );
+      const workerMissingLangs =
+        this.preferredHighlighter === 'highlights'
+          ? []
+          : langs.filter((lang) => !availableWorker.langs.has(lang));
 
       if (workerMissingLangs.length > 0) {
         if (hasResolvedLanguages(workerMissingLangs)) {
@@ -1045,7 +1098,7 @@ export class WorkerPoolManager {
 
   private handleWorkerMessage(
     managedWorker: ManagedWorker,
-    response: WorkerResponse
+    response: WorkerWireResponse
   ): void {
     const task = this.activeTaskById.get(response.id);
     try {
@@ -1093,7 +1146,7 @@ export class WorkerPoolManager {
             if (task.type !== 'file') {
               throw new Error('handleWorkerMessage: task/response dont match');
             }
-            const { result, options } = response;
+            const { options } = response;
             if (
               !this.isCurrentRenderTask(task) ||
               !areFileRenderOptionsEqual(options, this.getFileRenderOptions())
@@ -1101,6 +1154,10 @@ export class WorkerPoolManager {
               throw IGNORE_RESPONSE;
             }
             const { request } = task;
+            const result: ThemedFileResult = {
+              ...response.result,
+              code: decodeHastLines(response.result.code),
+            };
             this.syncCustomExtensionVersion(managedWorker, request);
             if (task.cacheKeyAtDispatch != null) {
               this.fileCache.set(task.cacheKeyAtDispatch, { result, options });
@@ -1113,7 +1170,7 @@ export class WorkerPoolManager {
             if (task.type !== 'diff') {
               throw new Error('handleWorkerMessage: task/response dont match');
             }
-            const { result, options } = response;
+            const { options } = response;
             if (
               !this.isCurrentRenderTask(task) ||
               !areDiffRenderOptionsEqual(options, this.getDiffRenderOptions())
@@ -1121,6 +1178,17 @@ export class WorkerPoolManager {
               throw IGNORE_RESPONSE;
             }
             const { request } = task;
+            const result: ThemedDiffResult = {
+              ...response.result,
+              code: {
+                deletionLines: decodeHastLines(
+                  response.result.code.deletionLines
+                ),
+                additionLines: decodeHastLines(
+                  response.result.code.additionLines
+                ),
+              },
+            };
             this.syncCustomExtensionVersion(managedWorker, request);
             if (task.cacheKeyAtDispatch != null) {
               this.diffCache.set(task.cacheKeyAtDispatch, { result, options });
@@ -1591,4 +1659,25 @@ function normalizeWorkerError(error: unknown): Error {
     }
   }
   return new Error(String(error));
+}
+
+// Convert a worker error event into a startup error, preserving its cause.
+// Script load failures can provide a plain Event without an error or message,
+// so use a default message when no details are available.
+function errorFromWorkerErrorEvent(
+  event: ErrorEvent | Event
+): WorkerPoolWorkerError {
+  const cause: unknown = 'error' in event ? event.error : undefined;
+  const message =
+    'message' in event &&
+    typeof event.message === 'string' &&
+    event.message !== ''
+      ? event.message
+      : cause instanceof Error
+        ? cause.message
+        : 'the worker script failed to load (the error event carries no message)';
+  return new WorkerPoolWorkerError(
+    `WorkerPoolManager: worker failed: ${message}`,
+    cause instanceof Error ? { cause } : undefined
+  );
 }
