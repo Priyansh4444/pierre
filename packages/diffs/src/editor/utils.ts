@@ -21,9 +21,9 @@ export function h<K extends keyof HTMLElementTagNameMap>(
     if (typeof dataset === 'string') {
       el.dataset[dataset] = '';
     } else if (Array.isArray(dataset)) {
-      dataset.forEach((key) => {
+      for (const key of dataset) {
         el.dataset[key] = '';
-      });
+      }
     } else {
       Object.assign(el.dataset, dataset);
     }
@@ -35,15 +35,6 @@ export function h<K extends keyof HTMLElementTagNameMap>(
     parent.appendChild(el);
   }
   return el;
-}
-
-export function isPromise<T>(value: T | Promise<T>): value is Promise<T> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'then' in value &&
-    typeof value.then === 'function'
-  );
 }
 
 export function addEventListener<K extends keyof HTMLElementEventMap>(
@@ -84,15 +75,8 @@ export function getLineNumberAttr(
   el: HTMLElement,
   key = 'line'
 ): number | undefined {
-  const value = el.dataset[key];
-  if (value === undefined) {
-    return undefined;
-  }
-  const lineNumber = parseInt(value, 10);
-  if (Number.isNaN(lineNumber)) {
-    return undefined;
-  }
-  return lineNumber;
+  const lineNumber = parseInt(el.dataset[key] ?? '', 10);
+  return Number.isNaN(lineNumber) ? undefined : lineNumber;
 }
 
 export function clampDomOffset(node: Node, offset: number): number {
@@ -104,10 +88,6 @@ export function clampDomOffset(node: Node, offset: number): number {
     return Math.max(0, Math.min(offset, node.childNodes.length));
   }
   return 0;
-}
-
-export function extend<T extends object>(obj: T, attrs: Partial<T>): T {
-  return Object.assign(obj, attrs);
 }
 
 // oxlint-disable-next-line typescript/no-explicit-any
@@ -166,9 +146,7 @@ export function lookupScrollContainer(
     parentElement !== ownerDocument.documentElement
   ) {
     const overflowY =
-      parentElement.ownerDocument.defaultView?.getComputedStyle(
-        parentElement
-      ).overflowY;
+      ownerDocument.defaultView?.getComputedStyle(parentElement).overflowY;
     if (
       overflowY === 'auto' ||
       overflowY === 'scroll' ||

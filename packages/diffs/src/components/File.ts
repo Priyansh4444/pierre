@@ -174,11 +174,6 @@ interface AnnotationElementCache<LAnnotation> {
   annotation: LineAnnotation<LAnnotation>;
 }
 
-interface ColumnElements {
-  gutter: HTMLElement;
-  content: HTMLElement;
-}
-
 interface HydrationSetup<LAnnotation> {
   file: FileContents;
   lineAnnotations: LineAnnotation<LAnnotation>[] | undefined;
@@ -193,12 +188,6 @@ interface EditSession<LAnnotation> {
    * own document
    */
   externalReplacement: boolean;
-}
-
-function createEditSessionFile(file: FileContents): FileContents {
-  const editSessionFile = { ...file };
-  delete editSessionFile.cacheKey;
-  return editSessionFile;
 }
 
 let instanceId = -1;
@@ -262,7 +251,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.fileRenderer = new FileRenderer<LAnnotation>(
       options,
       this.getAnnotationSlotName,
-      this.handleHighlightRender,
+      () => this.rerender(),
       this.workerManager
     );
     this.resizeManager = new ResizeManager();
@@ -275,17 +264,12 @@ export class File<LAnnotation = undefined, Caret = undefined> {
 
   public getAnnotationSlotName = (
     annotation: LineAnnotation<LAnnotation> | DiffLineAnnotation<LAnnotation>
-  ): string => {
-    return resolveEditSessionSlotName(
+  ): string =>
+    resolveEditSessionSlotName(
       this.editSession?.annotations,
       annotation,
       getLineAnnotationName
     );
-  };
-
-  private handleHighlightRender = (): void => {
-    this.rerender();
-  };
 
   public rerender(): void {
     if (!this.enabled || this.file == null) return;
@@ -330,8 +314,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     lineAnnotations: LineAnnotation<LAnnotation>[]
   ): boolean {
     const session = this.editSession?.annotations;
-    const externalAnnotations = this.lineAnnotations;
-    if (lineAnnotations === externalAnnotations) {
+    if (lineAnnotations === this.lineAnnotations) {
       return false;
     }
     return (
@@ -403,7 +386,8 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       (retainedDocument.name === externalFile.name &&
         retainedDocument.lang === externalFile.lang &&
         retainedDocument.contents === externalFile.contents);
-    const file = createEditSessionFile(retainedDocument ?? externalFile);
+    const file = { ...(retainedDocument ?? externalFile) };
+    delete file.cacheKey;
     this.editSession = {
       file,
       externalReplacement: hostReplacement && usesExternalDocument,
@@ -442,17 +426,11 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.interactionManager.setOptions(pluckInteractionOptions(this.options));
   }
 
-  private mergeOptions(
-    options: Partial<FileOptions<LAnnotation, Caret>>
-  ): void {
-    this.options = { ...this.options, ...options };
-  }
-
   public setThemeType(themeType: ThemeTypes): void {
     if ((this.options.themeType ?? 'system') === themeType) {
       return;
     }
-    this.mergeOptions({ themeType });
+    this.options = { ...this.options, themeType };
     this.applyCachedThemeState(themeType);
   }
 
@@ -477,16 +455,8 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     return true;
   }
 
-  private hasThemeChanged(): boolean {
-    return (
-      this.appliedThemeCSS != null &&
-      !areThemesEqual(this.appliedThemeCSS.theme, this.getTheme())
-    );
-  }
-
-  public getHoveredLine = (): GetHoveredLineResult<'file'> | undefined => {
-    return this.interactionManager.getHoveredLine();
-  };
+  public getHoveredLine = (): GetHoveredLineResult<'file'> | undefined =>
+    this.interactionManager.getHoveredLine();
 
   public setLineAnnotations(
     lineAnnotations: LineAnnotation<LAnnotation>[]
@@ -569,19 +539,16 @@ export class File<LAnnotation = undefined, Caret = undefined> {
   }
 
   public flushManagers(): void {
-    if (!this.managersDirty || this.pre == null) {
-      this.managersDirty = false;
-      return;
+    if (this.managersDirty && this.pre != null) {
+      const { overflow = 'scroll' } = this.options;
+      this.interactionManager.setup(this.pre);
+      this.resizeManager.setup(this.pre, {
+        disableAnnotations: overflow === 'wrap',
+        columnVariables: this.shouldApplyColumnVariables(overflow)
+          ? 'apply'
+          : 'measure',
+      });
     }
-
-    const { overflow = 'scroll' } = this.options;
-    this.interactionManager.setup(this.pre);
-    this.resizeManager.setup(this.pre, {
-      disableAnnotations: overflow === 'wrap',
-      columnVariables: this.shouldApplyColumnVariables(overflow)
-        ? 'apply'
-        : 'measure',
-    });
     this.managersDirty = false;
   }
 
@@ -611,9 +578,6 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     }
     this.fileContainer = undefined;
     this.mounted = false;
-    if (!recycle) {
-      this.lineAnnotations = [];
-    }
     this.clearAuxiliaryNodes();
     this.pre = undefined;
     this.code = undefined;
@@ -629,9 +593,6 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.headerMetadata = undefined;
     this.headerCustom = undefined;
     this.lastRenderedHeaderHTML = undefined;
-    if (!recycle) {
-      this.cachedHeaderHTML = undefined;
-    }
     this.errorWrapper?.remove();
     this.errorWrapper = undefined;
     this.spriteSVG = undefined;
@@ -648,6 +609,8 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     } else {
       this.fileRenderer.cleanUp();
       this.workerManager = undefined;
+      this.lineAnnotations = [];
+      this.cachedHeaderHTML = undefined;
       this.file = undefined;
       this.editSession = undefined;
       this.renderedFile = undefined;
@@ -683,14 +646,12 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     // Render through the private edit session instead of adopting external
     // markup, so the restored document owns the first hydrated paint.
     const forceEditorRender = this.editor != null;
+    const { collapsed, disableFileHeader } = this.options;
     if (
       forceEditorRender ||
-      shouldRenderCode(this.pre, file, this.options.collapsed) ||
-      shouldRenderHeader(
-        this.headerElement,
-        file,
-        this.options.disableFileHeader
-      )
+      (file != null &&
+        ((collapsed !== true && this.pre == null) ||
+          (disableFileHeader !== true && this.headerElement == null)))
     ) {
       this.render({
         ...props,
@@ -715,48 +676,49 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       this.emitPostRender(true);
     }
     prerenderHTMLIfNecessary(fileContainer, prerenderedHTML);
-    for (const element of Array.from(
-      fileContainer.shadowRoot?.children ?? []
-    )) {
+    for (const element of fileContainer.shadowRoot?.children ?? []) {
       if (element instanceof SVGElement) {
         this.spriteSVG = element;
-        continue;
-      }
-      if (!(element instanceof HTMLElement)) {
-        continue;
-      }
-      if (element instanceof HTMLPreElement) {
+      } else if (element instanceof HTMLPreElement) {
         this.pre = element;
         this.appliedPreAttributes = undefined;
-        continue;
-      }
-      if (
+      } else if (
         element instanceof HTMLStyleElement &&
         element.hasAttribute(THEME_CSS_ATTRIBUTE)
       ) {
         this.themeCSSStyle = element;
-        continue;
-      }
-      if (
+      } else if (
         element instanceof HTMLStyleElement &&
         element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)
       ) {
         this.unsafeCSSStyle = element;
         this.appliedUnsafeCSS = element.textContent;
-        continue;
-      }
-      if ('diffsHeader' in element.dataset) {
+      } else if (
+        element instanceof HTMLElement &&
+        'diffsHeader' in element.dataset
+      ) {
         this.headerElement = element;
         this.lastRenderedHeaderHTML = undefined;
-        continue;
       }
     }
     if (this.pre != null) {
-      this.syncCodeNodeFromPre(this.pre);
+      this.code = undefined;
+      for (const child of this.pre.children) {
+        if (child instanceof HTMLElement && child.hasAttribute('data-code')) {
+          this.code = child;
+          break;
+        }
+      }
       this.pre.removeAttribute('data-dehydrated');
     }
     this.fileContainer = fileContainer;
-    this.hydrateMeasuredScrollbar();
+    const { shadowRoot } = fileContainer;
+    if (shadowRoot != null && this.themeCSSStyle != null) {
+      this.themeCSSStyle.textContent = patchScrollbarGutterSize(
+        this.themeCSSStyle.textContent ?? '',
+        getMeasuredScrollbarGutter(shadowRoot)
+      );
+    }
   }
 
   protected hydrationSetup({
@@ -952,13 +914,6 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     editor: Editor<'file', LAnnotation, Caret>,
     mode: 'install' | 'discard'
   ): void {
-    this.settleEditSession(mode === 'install', editor);
-  }
-
-  private settleEditSession(
-    installResult: boolean,
-    editor: Editor<'file', LAnnotation, Caret> | undefined
-  ): void {
     const {
       editSession,
       file: externalFile,
@@ -967,24 +922,16 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     if (editSession == null || externalFile == null) {
       return;
     }
-    const { file: editSessionFile, annotations: editSessionAnnotations } =
-      editSession;
     if (this.editor != null) {
       throw new Error(
         'File.__completeEditSession: detach the editor before completing the session'
       );
     }
 
-    const sessionAnnotationsCurrent = editSessionAnnotations?.current;
-    let acceptedFile: FileContents | undefined;
+    const sessionAnnotationsCurrent = editSession.annotations?.current;
     let failed = false;
     let failure: unknown;
-    if (editor == null) {
-      throw new Error(
-        'File.__completeEditSession: editor is required for completion'
-      );
-    }
-    const completedFile = { ...editSessionFile };
+    const completedFile = { ...editSession.file };
     const event: FileEditCompleteEvent<LAnnotation, Caret> = {
       file: completedFile,
       editor,
@@ -1008,18 +955,16 @@ export class File<LAnnotation = undefined, Caret = undefined> {
             'File.__completeEditSession: an accepted file must not reuse the replaced file cacheKey'
           );
         }
-        acceptedFile = completedFile;
+        if (mode === 'install') {
+          this.file = completedFile;
+          if (sessionAnnotationsCurrent != null) {
+            this.lineAnnotations = sessionAnnotationsCurrent;
+          }
+        }
       }
     } catch (error) {
       failed = true;
       failure = error;
-    }
-
-    if (installResult && acceptedFile != null) {
-      this.file = acceptedFile;
-      if (sessionAnnotationsCurrent != null) {
-        this.lineAnnotations = sessionAnnotationsCurrent;
-      }
     }
     this.editSession = undefined;
     // Ending the session with the settled file lets the renderer adopt it as
@@ -1035,7 +980,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     ) {
       this.renderedFile = settledFile;
     }
-    if (installResult && this.fileContainer != null) {
+    if (mode === 'install' && this.fileContainer != null) {
       this.rerender();
     }
     if (failed) {
@@ -1117,12 +1062,13 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     const { collapsed = false, themeType = 'system' } = this.options;
     const nextRenderRange = collapsed ? undefined : renderRange;
     const previousRenderRange = this.renderRange;
-    const themeChanged = this.hasThemeChanged();
+    const themeChanged =
+      this.appliedThemeCSS != null &&
+      !areThemesEqual(this.appliedThemeCSS.theme, this.getTheme());
     const annotationsChanged =
       lineAnnotations != null &&
-      (lineAnnotations.length > 0 || this.getLatestAnnotations().length > 0)
-        ? this.isNewAnnotations(lineAnnotations)
-        : false;
+      (lineAnnotations.length > 0 || this.getLatestAnnotations().length > 0) &&
+      this.isNewAnnotations(lineAnnotations);
     const didFileChange = !areFileTargetsEqual(this.file, file);
     if (didFileChange) {
       this.updateExternalFile(file, lineAnnotations);
@@ -1157,13 +1103,19 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     const { disableErrorHandling = false, disableFileHeader = false } =
       this.options;
     if (disableFileHeader) {
-      // Remove existing header from DOM
       if (this.headerElement != null) {
         this.headerElement.remove();
         this.headerElement = undefined;
         this.lastRenderedHeaderHTML = undefined;
       }
-      this.clearHeaderSlots();
+      this.headerPrefix?.remove();
+      this.headerFilenameSuffix?.remove();
+      this.headerMetadata?.remove();
+      this.headerCustom?.remove();
+      this.headerPrefix = undefined;
+      this.headerFilenameSuffix = undefined;
+      this.headerMetadata = undefined;
+      this.headerCustom = undefined;
     }
 
     fileContainer = this.getOrCreateFileContainerNode(
@@ -1173,7 +1125,18 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.applyCachedThemeState(themeType);
 
     if (collapsed) {
-      this.removeRenderedCode();
+      this.resizeManager.cleanUp();
+      this.interactionManager.cleanUp();
+      this.bufferBefore?.remove();
+      this.bufferBefore = undefined;
+      this.bufferAfter?.remove();
+      this.bufferAfter = undefined;
+      this.code?.remove();
+      this.code = undefined;
+      this.pre?.remove();
+      this.pre = undefined;
+      this.appliedPreAttributes = undefined;
+      this.lastRowCount = undefined;
       this.clearAuxiliaryNodes();
 
       try {
@@ -1182,30 +1145,12 @@ export class File<LAnnotation = undefined, Caret = undefined> {
           EMPTY_RENDER_RANGE
         );
         if (fileResult != null) {
-          this.applyThemeState(
-            fileContainer,
-            fileResult.themeStyles,
-            themeType,
-            fileResult.baseThemeType
-          );
-        }
-        if (fileResult?.headerAST != null) {
-          this.applyHeaderToDOM(
-            fileResult.headerAST,
-            fileContainer,
-            fileResult.file
-          );
+          this.applyThemeAndHeader(fileResult, fileContainer, themeType);
         }
         this.renderedFile = fileResult?.file ?? latestFile;
         this.injectUnsafeCSS();
       } catch (error: unknown) {
-        if (disableErrorHandling) {
-          throw error;
-        }
-        console.error(error);
-        if (error instanceof Error) {
-          this.applyErrorToDOM(error, fileContainer);
-        }
+        this.applyErrorToDOM(error, fileContainer, disableErrorHandling);
       }
       this.finalizeRender();
       if (!preventEmit) {
@@ -1215,15 +1160,28 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     }
 
     try {
-      const pre = this.getOrCreatePreNode(fileContainer);
+      const shadowRoot =
+        fileContainer.shadowRoot ??
+        fileContainer.attachShadow({ mode: 'open' });
+      if (this.pre == null) {
+        this.pre = document.createElement('pre');
+        this.appliedPreAttributes = undefined;
+        this.code = undefined;
+        shadowRoot.appendChild(this.pre);
+      } else if (this.pre.parentNode !== shadowRoot) {
+        this.editor?.__captureFocusForDOMReplacement();
+        shadowRoot.appendChild(this.pre);
+        this.appliedPreAttributes = undefined;
+      }
+      this.placeHolder?.remove();
+      this.placeHolder = undefined;
+      const { pre } = this;
       if (
-        !this.canPartiallyRender(
-          forceRender,
-          annotationsChanged,
-          didFileChange ||
-            themeChanged ||
-            !areFileTargetsEqual(this.renderedFile, latestFile)
-        ) ||
+        forceRender ||
+        annotationsChanged ||
+        didFileChange ||
+        themeChanged ||
+        !areFileTargetsEqual(this.renderedFile, latestFile) ||
         !this.applyPartialRender(
           latestFile,
           previousRenderRange,
@@ -1246,19 +1204,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
           }
           return false;
         }
-        this.applyThemeState(
-          fileContainer,
-          fileResult.themeStyles,
-          themeType,
-          fileResult.baseThemeType
-        );
-        if (fileResult.headerAST != null) {
-          this.applyHeaderToDOM(
-            fileResult.headerAST,
-            fileContainer,
-            fileResult.file
-          );
-        }
+        this.applyThemeAndHeader(fileResult, fileContainer, themeType);
         this.applyFullRender(fileResult, pre);
         this.renderedFile = fileResult.file;
       }
@@ -1278,13 +1224,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
         this.syncRenderViewToEditor();
       }
     } catch (error: unknown) {
-      if (disableErrorHandling) {
-        throw error;
-      }
-      console.error(error);
-      if (error instanceof Error) {
-        this.applyErrorToDOM(error, fileContainer);
-      }
+      this.applyErrorToDOM(error, fileContainer, disableErrorHandling);
     }
     if (!preventEmit) {
       this.emitPostRender();
@@ -1301,45 +1241,18 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       fileContainer,
       options: { onPostRender },
     } = this;
-
     if (unmount) {
-      if (!this.mounted) {
-        return;
+      if (this.mounted) {
+        this.mounted = false;
+        if (fileContainer != null) {
+          onPostRender?.(fileContainer, this, 'unmount');
+        }
       }
-      this.mounted = false;
-      if (fileContainer == null) {
-        return;
-      }
-      onPostRender?.(fileContainer, this, 'unmount');
-      return;
+    } else if (fileContainer != null) {
+      const phase: PostRenderPhase = this.mounted ? 'update' : 'mount';
+      this.mounted = true;
+      onPostRender?.(fileContainer, this, phase);
     }
-
-    if (fileContainer == null) {
-      return;
-    }
-
-    const phase: PostRenderPhase = this.mounted ? 'update' : 'mount';
-    this.mounted = true;
-    onPostRender?.(fileContainer, this, phase);
-  }
-
-  private removeRenderedCode(): void {
-    this.resizeManager.cleanUp();
-    this.interactionManager.cleanUp();
-
-    this.bufferBefore?.remove();
-    this.bufferBefore = undefined;
-    this.bufferAfter?.remove();
-    this.bufferAfter = undefined;
-
-    this.code?.remove();
-    this.code = undefined;
-
-    this.pre?.remove();
-    this.pre = undefined;
-
-    this.appliedPreAttributes = undefined;
-    this.lastRowCount = undefined;
   }
 
   private clearAuxiliaryNodes(): void {
@@ -1352,74 +1265,11 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.gutterUtilityContent = undefined;
   }
 
-  private canPartiallyRender(
-    forceRender: boolean,
-    annotationsChanged: boolean,
-    didContentChange: boolean
-  ): boolean {
-    if (forceRender || annotationsChanged || didContentChange) {
-      return false;
-    }
-    return true;
-  }
-
   public renderPlaceholder(height: number): boolean {
     if (this.fileContainer == null) {
       return false;
     }
     this.emitPostRender(true);
-    this.cleanChildNodes();
-
-    if (this.placeHolder == null) {
-      const shadowRoot =
-        this.fileContainer.shadowRoot ??
-        this.fileContainer.attachShadow({ mode: 'open' });
-      this.placeHolder = document.createElement('div');
-      this.placeHolder.dataset.placeholder = '';
-      shadowRoot.appendChild(this.placeHolder);
-    }
-    return this.setPlaceholderHeight(height);
-  }
-
-  protected setPlaceholderHeight(height: number): boolean {
-    if (this.placeHolder == null) {
-      return false;
-    }
-    this.placeHolder.style.setProperty('height', `${height}px`);
-    return true;
-  }
-
-  public async primeHighlightCache(
-    file: FileContents | undefined = this.file
-  ): Promise<void> {
-    const { workerManager } = this;
-    if (
-      file == null ||
-      workerManager == null ||
-      !workerManager.isWorkingPool() ||
-      file.cacheKey == null ||
-      isFilePlainText(file)
-    ) {
-      return;
-    }
-    const tokenizeMaxLength =
-      this.options.tokenizeMaxLength ?? DEFAULT_TOKENIZE_MAX_LENGTH;
-    const lines = this.fileRenderer.getOrCreateLineCache(file);
-    if (lines.length > tokenizeMaxLength) {
-      return;
-    }
-
-    await workerManager
-      .primeFileHighlightCache(file)
-      .catch((error: unknown) => {
-        if (isHandledWorkerPoolError(error)) {
-          return;
-        }
-        console.error(error);
-      });
-  }
-
-  private cleanChildNodes() {
     this.resizeManager.cleanUp();
     this.interactionManager.cleanUp();
     this.clearAuxiliaryNodes();
@@ -1459,6 +1309,54 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.lastRowCount = undefined;
 
     this.mounted = false;
+
+    if (this.placeHolder == null) {
+      const shadowRoot =
+        this.fileContainer.shadowRoot ??
+        this.fileContainer.attachShadow({ mode: 'open' });
+      this.placeHolder = document.createElement('div');
+      this.placeHolder.dataset.placeholder = '';
+      shadowRoot.appendChild(this.placeHolder);
+    }
+    return this.setPlaceholderHeight(height);
+  }
+
+  protected setPlaceholderHeight(height: number): boolean {
+    if (this.placeHolder == null) {
+      return false;
+    }
+    this.placeHolder.style.setProperty('height', `${height}px`);
+    return true;
+  }
+
+  public async primeHighlightCache(
+    file: FileContents | undefined = this.file
+  ): Promise<void> {
+    const { workerManager } = this;
+    if (
+      file == null ||
+      workerManager == null ||
+      !workerManager.isWorkingPool() ||
+      file.cacheKey == null ||
+      isFilePlainText(file)
+    ) {
+      return;
+    }
+    if (
+      this.fileRenderer.getOrCreateLineCache(file).length >
+      (this.options.tokenizeMaxLength ?? DEFAULT_TOKENIZE_MAX_LENGTH)
+    ) {
+      return;
+    }
+
+    await workerManager
+      .primeFileHighlightCache(file)
+      .catch((error: unknown) => {
+        if (isHandledWorkerPoolError(error)) {
+          return;
+        }
+        console.error(error);
+      });
   }
 
   private renderAnnotations(): void {
@@ -1472,7 +1370,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     const staleAnnotations = new Map(this.annotationCache);
     const { renderAnnotation } = this.options;
     const lineAnnotations = this.getLatestAnnotations();
-    if (renderAnnotation != null && lineAnnotations.length > 0) {
+    if (renderAnnotation != null) {
       for (const [index, annotation] of lineAnnotations.entries()) {
         const name = this.getAnnotationSlotName(annotation);
         const id = `${index}-${name}`;
@@ -1499,31 +1397,28 @@ export class File<LAnnotation = undefined, Caret = undefined> {
         staleAnnotations.delete(id);
       }
     }
-    for (const [id, { element }] of staleAnnotations.entries()) {
+    for (const [id, { element }] of staleAnnotations) {
       this.annotationCache.delete(id);
       element.remove();
     }
   }
 
   private renderGutterUtility() {
+    const { fileContainer } = this;
     const { renderGutterUtility } = this.options;
-    if (this.fileContainer == null || renderGutterUtility == null) {
+    const element =
+      fileContainer != null
+        ? renderGutterUtility?.(this.interactionManager.getHoveredLine)
+        : undefined;
+    if (element == null) {
       this.gutterUtilityContent?.remove();
       this.gutterUtilityContent = undefined;
-      return;
+    } else if (this.gutterUtilityContent == null && fileContainer != null) {
+      const gutterUtilityContent = createGutterUtilityContentNode();
+      gutterUtilityContent.appendChild(element);
+      fileContainer.appendChild(gutterUtilityContent);
+      this.gutterUtilityContent = gutterUtilityContent;
     }
-    const element = renderGutterUtility(this.interactionManager.getHoveredLine);
-    if (element != null && this.gutterUtilityContent != null) {
-      return;
-    } else if (element == null) {
-      this.gutterUtilityContent?.remove();
-      this.gutterUtilityContent = undefined;
-      return;
-    }
-    const gutterUtilityContent = createGutterUtilityContentNode();
-    gutterUtilityContent.appendChild(element);
-    this.fileContainer.appendChild(gutterUtilityContent);
-    this.gutterUtilityContent = gutterUtilityContent;
   }
 
   private injectUnsafeCSS(): void {
@@ -1535,10 +1430,8 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     }
 
     if (unsafeCSS == null || unsafeCSS === '') {
-      if (this.unsafeCSSStyle != null) {
-        this.unsafeCSSStyle.remove();
-        this.unsafeCSSStyle = undefined;
-      }
+      this.unsafeCSSStyle?.remove();
+      this.unsafeCSSStyle = undefined;
       this.appliedUnsafeCSS = undefined;
       return;
     }
@@ -1550,7 +1443,6 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       return;
     }
 
-    // Create or update the style element
     this.unsafeCSSStyle ??= createUnsafeCSSStyleNode();
     if (this.unsafeCSSStyle.parentNode !== shadowRoot) {
       shadowRoot.appendChild(this.unsafeCSSStyle);
@@ -1582,18 +1474,19 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       this.appliedThemeCSS.theme = theme;
       return;
     }
+    const appliedThemeCSS = {
+      theme,
+      themeStyles,
+      themeType: effectiveThemeType,
+      baseThemeType,
+      scrollbarGutter,
+    };
     if (
       this.hasAdoptedThemeCSS &&
       this.themeCSSStyle?.parentNode === shadowRoot
     ) {
       this.hasAdoptedThemeCSS = false;
-      this.appliedThemeCSS = {
-        theme,
-        themeStyles,
-        themeType: effectiveThemeType,
-        baseThemeType,
-        scrollbarGutter,
-      };
+      this.appliedThemeCSS = appliedThemeCSS;
       return;
     }
     this.themeCSSStyle = upsertHostThemeStyle({
@@ -1602,26 +1495,7 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       themeCSS: wrapThemeCSS(themeStyles, effectiveThemeType, scrollbarGutter),
     });
     this.appliedThemeCSS =
-      this.themeCSSStyle != null
-        ? {
-            theme,
-            themeStyles,
-            themeType: effectiveThemeType,
-            baseThemeType,
-            scrollbarGutter,
-          }
-        : undefined;
-  }
-
-  private hydrateMeasuredScrollbar(): void {
-    const shadowRoot = this.fileContainer?.shadowRoot;
-    if (shadowRoot == null || this.themeCSSStyle == null) {
-      return;
-    }
-    this.themeCSSStyle.textContent = patchScrollbarGutterSize(
-      this.themeCSSStyle.textContent ?? '',
-      getMeasuredScrollbarGutter(shadowRoot)
-    );
+      this.themeCSSStyle != null ? appliedThemeCSS : undefined;
   }
 
   // A boolean check to ensure that edit mode in WebKit doesn't cause potential
@@ -1634,7 +1508,20 @@ export class File<LAnnotation = undefined, Caret = undefined> {
 
   private applyFullRender(result: FileRenderResult, pre: HTMLPreElement): void {
     this.cleanupErrorWrapper();
-    this.applyPreNodeAttributes(pre, result);
+    const { overflow = 'scroll', disableLineNumbers = false } = this.options;
+    const preProperties: PrePropertiesConfig = {
+      type: 'file',
+      split: false,
+      overflow,
+      disableLineNumbers,
+      diffIndicators: 'none',
+      disableBackground: true,
+      totalLines: result.totalLines,
+    };
+    if (!arePrePropertiesEqual(preProperties, this.appliedPreAttributes)) {
+      setPreNodeProperties(pre, preProperties);
+      this.appliedPreAttributes = preProperties;
+    }
     const code = (this.code = getOrCreateCodeNode({ code: this.code }));
     const codeAst = this.fileRenderer.renderCodeAST(result);
     this.editor?.__captureFocusForDOMReplacement();
@@ -1669,80 +1556,87 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     if (previousRenderRange == null || renderRange == null) {
       return false;
     }
-    const { code } = this;
-    const columns = code != null ? this.getColumns(code) : undefined;
-    if (code == null || columns == null) {
+    const gutter = this.code?.children[0];
+    const content = this.code?.children[1];
+    if (
+      !(gutter instanceof HTMLElement) ||
+      !(content instanceof HTMLElement) ||
+      gutter.dataset.gutter == null ||
+      content.dataset.content == null
+    ) {
       return false;
     }
 
-    const previousStart = previousRenderRange.startingLine;
     const nextStart = renderRange.startingLine;
-    const previousEnd =
-      previousRenderRange.totalLines === Infinity
-        ? Number.POSITIVE_INFINITY
-        : previousStart + previousRenderRange.totalLines;
-    const nextEnd =
-      renderRange.totalLines === Infinity
-        ? Number.POSITIVE_INFINITY
-        : nextStart + renderRange.totalLines;
-
-    const overlapStart = Math.max(previousStart, nextStart);
-    const overlapEnd = Math.min(previousEnd, nextEnd);
+    const nextEnd = nextStart + renderRange.totalLines;
+    const overlapStart = Math.max(previousRenderRange.startingLine, nextStart);
+    const overlapEnd = Math.min(
+      previousRenderRange.startingLine + previousRenderRange.totalLines,
+      nextEnd
+    );
     if (overlapEnd <= overlapStart) {
       return false;
     }
 
-    if (
-      !this.trimDOMToOverlap(columns.gutter, overlapStart, overlapEnd) ||
-      !this.trimDOMToOverlap(columns.content, overlapStart, overlapEnd)
-    ) {
-      throw new Error('File.applyPartialRender: failed to trim to overlap');
+    // Trim rows outside the overlap. An overlap starting at line 0 keeps any
+    // leading rows without a line index (file annotations).
+    for (const { children } of [gutter, content]) {
+      let startIndex = overlapStart === 0 ? 0 : undefined;
+      let endIndex = children.length;
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        if (!(child instanceof HTMLElement)) {
+          continue;
+        }
+        const lineIndex = Number(child.dataset.lineIndex);
+        if (startIndex == null && lineIndex >= overlapStart) {
+          startIndex = i;
+        }
+        if (lineIndex >= overlapEnd) {
+          endIndex = i;
+          break;
+        }
+      }
+      for (let i = children.length - 1; i >= endIndex; i--) {
+        children[i].remove();
+      }
+      for (let i = (startIndex ?? children.length) - 1; i >= 0; i--) {
+        children[i].remove();
+      }
     }
 
-    let { length: rowCount } = columns.content.children;
+    let { length: rowCount } = content.children;
 
-    const renderChunk = (
-      startingLine: number,
-      totalLines: number
-    ): FileRenderResult | undefined => {
-      if (totalLines <= 0) {
-        return undefined;
-      }
-      return this.fileRenderer.renderFile(file, {
+    const renderChunk = (startingLine: number, totalLines: number) =>
+      this.fileRenderer.renderFile(file, {
         startingLine,
         totalLines,
         bufferBefore: 0,
         bufferAfter: 0,
       });
-    };
 
-    const prependResult =
-      nextStart < overlapStart
-        ? renderChunk(nextStart, overlapStart - nextStart)
-        : undefined;
-    if (prependResult === undefined && nextStart < overlapStart) {
-      return false;
+    let prependResult: FileRenderResult | undefined;
+    if (nextStart < overlapStart) {
+      prependResult = renderChunk(nextStart, overlapStart - nextStart);
+      if (prependResult == null) {
+        return false;
+      }
     }
-
-    const appendTotalLines =
-      nextEnd === Number.POSITIVE_INFINITY
-        ? Number.POSITIVE_INFINITY
-        : Math.max(0, nextEnd - overlapEnd);
-    const appendResult =
-      nextEnd > overlapEnd
-        ? renderChunk(overlapEnd, appendTotalLines)
-        : undefined;
-    if (appendResult === undefined && nextEnd > overlapEnd) {
-      return false;
+    let appendResult: FileRenderResult | undefined;
+    if (nextEnd > overlapEnd) {
+      appendResult = renderChunk(overlapEnd, nextEnd - overlapEnd);
+      if (appendResult == null) {
+        return false;
+      }
     }
 
     this.cleanupErrorWrapper();
     if (prependResult != null) {
-      columns.gutter.insertAdjacentHTML(
+      gutter.insertAdjacentHTML(
         'afterbegin',
         this.fileRenderer.renderPartialHTML(prependResult.gutterAST)
       );
-      columns.content.insertAdjacentHTML(
+      content.insertAdjacentHTML(
         'afterbegin',
         this.fileRenderer.renderPartialHTML(prependResult.contentAST)
       );
@@ -1750,11 +1644,11 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     }
 
     if (appendResult != null) {
-      columns.gutter.insertAdjacentHTML(
+      gutter.insertAdjacentHTML(
         'beforeend',
         this.fileRenderer.renderPartialHTML(appendResult.gutterAST)
       );
-      columns.content.insertAdjacentHTML(
+      content.insertAdjacentHTML(
         'beforeend',
         this.fileRenderer.renderPartialHTML(appendResult.contentAST)
       );
@@ -1762,108 +1656,12 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     }
 
     if (this.lastRowCount !== rowCount) {
-      columns.gutter.style.setProperty('grid-row', `span ${rowCount}`);
-      columns.content.style.setProperty('grid-row', `span ${rowCount}`);
+      gutter.style.setProperty('grid-row', `span ${rowCount}`);
+      content.style.setProperty('grid-row', `span ${rowCount}`);
       this.lastRowCount = rowCount;
     }
 
     return true;
-  }
-
-  private getColumns(code: HTMLElement): ColumnElements | undefined {
-    const gutter = code.children[0];
-    const content = code.children[1];
-    if (
-      !(gutter instanceof HTMLElement) ||
-      !(content instanceof HTMLElement) ||
-      gutter.dataset.gutter == null ||
-      content.dataset.content == null
-    ) {
-      return undefined;
-    }
-    return { gutter, content };
-  }
-
-  private trimDOMToOverlap(
-    container: HTMLElement,
-    overlapStart: number,
-    overlapEnd: number
-  ): boolean {
-    const boundaryIndices = this.getDOMBoundaryIndices(container, [
-      overlapStart,
-      overlapEnd,
-    ]);
-    const startIndex =
-      boundaryIndices.get(overlapStart) ?? container.children.length;
-    const endIndex =
-      boundaryIndices.get(overlapEnd) ?? container.children.length;
-
-    if (startIndex > endIndex) {
-      return false;
-    }
-
-    for (let i = container.children.length - 1; i >= endIndex; i -= 1) {
-      container.children[i]?.remove();
-    }
-    for (let i = startIndex - 1; i >= 0; i -= 1) {
-      container.children[i]?.remove();
-    }
-    return true;
-  }
-
-  private getDOMBoundaryIndices(
-    container: HTMLElement,
-    boundaries: number[]
-  ): Map<number, number> {
-    const sortedBoundaries = [...new Set(boundaries)].sort((a, b) => a - b);
-    const boundaryIndices = new Map<number, number>();
-    if (sortedBoundaries.length === 0) {
-      return boundaryIndices;
-    }
-    let boundaryIndex = 0;
-    let nextBoundary = sortedBoundaries[boundaryIndex];
-    const { children } = container;
-
-    if (nextBoundary === 0) {
-      boundaryIndices.set(0, 0);
-      boundaryIndex += 1;
-      nextBoundary = sortedBoundaries[boundaryIndex];
-    }
-
-    for (let i = 0; i < children.length; i += 1) {
-      const child = children[i];
-      if (!(child instanceof HTMLElement)) {
-        continue;
-      }
-      const lineIndex = this.getLineIndexFromDOMNode(child);
-      if (lineIndex == null) {
-        continue;
-      }
-      while (nextBoundary != null && lineIndex >= nextBoundary) {
-        boundaryIndices.set(nextBoundary, i);
-        boundaryIndex += 1;
-        nextBoundary = sortedBoundaries[boundaryIndex];
-      }
-      if (boundaryIndex >= sortedBoundaries.length) {
-        break;
-      }
-    }
-
-    for (const boundary of sortedBoundaries) {
-      if (!boundaryIndices.has(boundary)) {
-        boundaryIndices.set(boundary, children.length);
-      }
-    }
-    return boundaryIndices;
-  }
-
-  private getLineIndexFromDOMNode(node: HTMLElement): number | undefined {
-    const lineIndexAttr = node.dataset.lineIndex;
-    if (lineIndexAttr == null) {
-      return undefined;
-    }
-    const parsed = Number(lineIndexAttr);
-    return Number.isNaN(parsed) ? undefined : parsed;
   }
 
   private applyBuffers(
@@ -1871,14 +1669,10 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     renderRange: RenderRange | undefined
   ) {
     if (renderRange == null || this.shouldDisableVirtualizationBuffers()) {
-      if (this.bufferBefore != null) {
-        this.bufferBefore.remove();
-        this.bufferBefore = undefined;
-      }
-      if (this.bufferAfter != null) {
-        this.bufferAfter.remove();
-        this.bufferAfter = undefined;
-      }
+      this.bufferBefore?.remove();
+      this.bufferBefore = undefined;
+      this.bufferAfter?.remove();
+      this.bufferAfter = undefined;
       return;
     }
 
@@ -1893,8 +1687,8 @@ export class File<LAnnotation = undefined, Caret = undefined> {
         `${renderRange.bufferBefore}px`
       );
       this.bufferBefore.style.setProperty('contain', 'strict');
-    } else if (this.bufferBefore != null) {
-      this.bufferBefore.remove();
+    } else {
+      this.bufferBefore?.remove();
       this.bufferBefore = undefined;
     }
 
@@ -1909,8 +1703,8 @@ export class File<LAnnotation = undefined, Caret = undefined> {
         `${renderRange.bufferAfter}px`
       );
       this.bufferAfter.style.setProperty('contain', 'strict');
-    } else if (this.bufferAfter != null) {
-      this.bufferAfter.remove();
+    } else {
+      this.bufferAfter?.remove();
       this.bufferAfter = undefined;
     }
   }
@@ -1919,11 +1713,16 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     return this.options.disableVirtualizationBuffers ?? false;
   }
 
-  private applyHeaderToDOM(
-    headerAST: HASTElement,
+  // Applies the theme styles and header (with its slots) of a render result.
+  private applyThemeAndHeader(
+    { themeStyles, baseThemeType, headerAST, file }: FileRenderResult,
     container: HTMLElement,
-    file: FileContents
+    themeType: ThemeTypes
   ): void {
+    this.applyThemeState(container, themeStyles, themeType, baseThemeType);
+    if (headerAST == null) {
+      return;
+    }
     this.cleanupErrorWrapper();
     this.placeHolder?.remove();
     this.placeHolder = undefined;
@@ -1955,12 +1754,11 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     } = this.options;
 
     if (renderCustomHeader != null) {
-      const content = renderCustomHeader(file) ?? undefined;
       this.headerCustom = this.upsertHeaderSlotElement(
         container,
         this.headerCustom,
         CUSTOM_HEADER_SLOT_ID,
-        content
+        renderCustomHeader(file)
       );
       this.headerPrefix?.remove();
       this.headerFilenameSuffix?.remove();
@@ -1969,9 +1767,9 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       this.headerFilenameSuffix = undefined;
       this.headerMetadata = undefined;
     } else {
-      const prefix = renderHeaderPrefix?.(file) ?? undefined;
-      const suffix = renderHeaderFilenameSuffix?.(file) ?? undefined;
-      const content = renderHeaderMetadata?.(file) ?? undefined;
+      const prefix = renderHeaderPrefix?.(file);
+      const suffix = renderHeaderFilenameSuffix?.(file);
+      const content = renderHeaderMetadata?.(file);
       this.headerPrefix = this.upsertHeaderSlotElement(
         container,
         this.headerPrefix,
@@ -1995,51 +1793,29 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     }
   }
 
-  private clearHeaderSlots(): void {
-    this.headerPrefix?.remove();
-    this.headerFilenameSuffix?.remove();
-    this.headerMetadata?.remove();
-    this.headerCustom?.remove();
-    this.headerPrefix = undefined;
-    this.headerFilenameSuffix = undefined;
-    this.headerMetadata = undefined;
-    this.headerCustom = undefined;
-  }
-
   // Header slot callbacks are presence-based render hooks, not reactive views.
   private upsertHeaderSlotElement(
     container: HTMLElement,
     current: HTMLElement | undefined,
     slot: string,
-    content: Element | string | number | undefined
+    content: ReturnType<RenderFileMetadata>
   ): HTMLElement | undefined {
     if (content == null) {
       current?.remove();
       return undefined;
     }
-    const element = current ?? this.createHeaderSlotElement(slot);
-    if (current == null) {
+    let element = current;
+    if (element == null) {
+      element = document.createElement('div');
+      element.slot = slot;
       container.appendChild(element);
     }
-    this.replaceHeaderSlotContent(element, content);
-    return element;
-  }
-
-  private replaceHeaderSlotContent(
-    element: HTMLElement,
-    content: Element | string | number
-  ): void {
     element.replaceChildren();
     if (content instanceof Element) {
       element.appendChild(content);
     } else {
       element.innerText = `${content}`;
     }
-  }
-
-  private createHeaderSlotElement(slot: string): HTMLElement {
-    const element = document.createElement('div');
-    element.slot = slot;
     return element;
   }
 
@@ -2053,134 +1829,70 @@ export class File<LAnnotation = undefined, Caret = undefined> {
       previousContainer ??
       document.createElement(DIFFS_TAG_NAME);
     const containerChanged = previousContainer !== nextContainer;
-    if (previousContainer != null && containerChanged) {
-      this.editor?.__captureFocusForDOMReplacement();
-    }
     if (containerChanged) {
+      if (previousContainer != null) {
+        this.editor?.__captureFocusForDOMReplacement();
+      }
       this.emitPostRender(true);
-    }
-    this.fileContainer = nextContainer;
-    if (previousContainer != null && containerChanged) {
-      this.lastRenderedHeaderHTML = undefined;
-      this.headerElement = undefined;
-    }
-    if (parentNode != null && this.fileContainer.parentNode !== parentNode) {
-      parentNode.appendChild(this.fileContainer);
-    }
-    if (containerChanged) {
-      this.adoptReusableShellElements(this.fileContainer);
-    }
-    this.ensureSpriteSVG(this.fileContainer);
-    return this.fileContainer;
-  }
-
-  // NOTE(amadeus): Technically this method is not safe for use outside of
-  // the CodeView component, however I don't think in practice it really
-  // should matter, but maybe there's some system we need in place to prevent
-  // this from running outside of that environment?
-  //
-  // It's making very specific assumptions that all the elements will have the
-  // correct content based on CodeView global options
-  private adoptReusableShellElements(fileContainer: HTMLElement): void {
-    const { shadowRoot } = fileContainer;
-    if (shadowRoot == null) {
-      return;
-    }
-
-    for (const element of shadowRoot.children) {
-      if (element instanceof SVGElement) {
-        this.spriteSVG ??= element;
-      } else if (
-        isStyleNode(element) &&
-        element.hasAttribute(THEME_CSS_ATTRIBUTE)
-      ) {
-        this.themeCSSStyle ??= element;
-        this.hasAdoptedThemeCSS = true;
-      } else if (
-        isStyleNode(element) &&
-        element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)
-      ) {
-        this.unsafeCSSStyle ??= element;
-        this.appliedUnsafeCSS ??= this.options.unsafeCSS ?? undefined;
+      if (previousContainer != null) {
+        this.lastRenderedHeaderHTML = undefined;
+        this.headerElement = undefined;
       }
     }
-  }
-
-  private ensureSpriteSVG(fileContainer: HTMLElement): void {
+    this.fileContainer = nextContainer;
+    if (parentNode != null && nextContainer.parentNode !== parentNode) {
+      parentNode.appendChild(nextContainer);
+    }
+    // NOTE(amadeus): Adopting shell elements assumes they already match
+    // CodeView's global options, so it is only strictly safe inside CodeView.
+    if (containerChanged && nextContainer.shadowRoot != null) {
+      for (const element of nextContainer.shadowRoot.children) {
+        if (element instanceof SVGElement) {
+          this.spriteSVG ??= element;
+        } else if (
+          isStyleNode(element) &&
+          element.hasAttribute(THEME_CSS_ATTRIBUTE)
+        ) {
+          this.themeCSSStyle ??= element;
+          this.hasAdoptedThemeCSS = true;
+        } else if (
+          isStyleNode(element) &&
+          element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)
+        ) {
+          this.unsafeCSSStyle ??= element;
+          this.appliedUnsafeCSS ??= this.options.unsafeCSS ?? undefined;
+        }
+      }
+    }
     const shadowRoot =
-      fileContainer.shadowRoot ?? fileContainer.attachShadow({ mode: 'open' });
+      nextContainer.shadowRoot ?? nextContainer.attachShadow({ mode: 'open' });
     if (this.spriteSVG == null) {
       const fragment = document.createElement('div');
       fragment.innerHTML = SVGSpriteSheet;
-      const firstChild = fragment.firstChild;
-      if (firstChild instanceof SVGElement) {
-        this.spriteSVG = firstChild;
+      if (fragment.firstChild instanceof SVGElement) {
+        this.spriteSVG = fragment.firstChild;
       }
     }
     if (this.spriteSVG != null && this.spriteSVG.parentNode !== shadowRoot) {
       shadowRoot.appendChild(this.spriteSVG);
     }
+    return nextContainer;
   }
 
-  private getOrCreatePreNode(container: HTMLElement): HTMLPreElement {
-    const shadowRoot =
-      container.shadowRoot ?? container.attachShadow({ mode: 'open' });
-    // If we haven't created a pre element yet, lets go ahead and do that
-    if (this.pre == null) {
-      this.pre = document.createElement('pre');
-      this.appliedPreAttributes = undefined;
-      this.code = undefined;
-      shadowRoot.appendChild(this.pre);
+  // Rethrows render errors when error handling is disabled, otherwise logs them
+  // and shows them in place of the code.
+  private applyErrorToDOM(
+    error: unknown,
+    container: HTMLElement,
+    disableErrorHandling: boolean
+  ) {
+    if (disableErrorHandling) {
+      throw error;
     }
-    // If we have a new parent container for the pre element, lets go ahead and
-    // move it into the new container
-    else if (this.pre.parentNode !== shadowRoot) {
-      this.editor?.__captureFocusForDOMReplacement();
-      container.shadowRoot?.appendChild(this.pre);
-      this.appliedPreAttributes = undefined;
-    }
-
-    this.placeHolder?.remove();
-    this.placeHolder = undefined;
-
-    return this.pre;
-  }
-
-  private syncCodeNodeFromPre(pre: HTMLPreElement): void {
-    this.code = undefined;
-    for (const child of Array.from(pre.children)) {
-      if (!(child instanceof HTMLElement)) {
-        continue;
-      }
-      if (child.hasAttribute('data-code')) {
-        this.code = child;
-        return;
-      }
-    }
-  }
-
-  private applyPreNodeAttributes(
-    pre: HTMLPreElement,
-    { totalLines }: FileRenderResult
-  ): void {
-    const { overflow = 'scroll', disableLineNumbers = false } = this.options;
-    const preProperties: PrePropertiesConfig = {
-      type: 'file',
-      split: false,
-      overflow,
-      disableLineNumbers,
-      diffIndicators: 'none',
-      disableBackground: true,
-      totalLines,
-    };
-    if (arePrePropertiesEqual(preProperties, this.appliedPreAttributes)) {
+    console.error(error);
+    if (!(error instanceof Error)) {
       return;
     }
-    setPreNodeProperties(pre, preProperties);
-    this.appliedPreAttributes = preProperties;
-  }
-
-  private applyErrorToDOM(error: Error, container: HTMLElement) {
     this.cleanupErrorWrapper();
     this.pre?.remove();
     this.pre = undefined;
@@ -2205,20 +1917,4 @@ export class File<LAnnotation = undefined, Caret = undefined> {
     this.errorWrapper?.remove();
     this.errorWrapper = undefined;
   }
-}
-
-function shouldRenderCode(
-  pre: HTMLPreElement | undefined,
-  file: FileContents | undefined,
-  collapsed = false
-): boolean {
-  return !collapsed && pre == null && file != null;
-}
-
-function shouldRenderHeader(
-  headerElement: HTMLElement | undefined,
-  file: FileContents | undefined,
-  disableFileHeader: boolean = false
-): boolean {
-  return headerElement == null && file != null && !disableFileHeader;
 }

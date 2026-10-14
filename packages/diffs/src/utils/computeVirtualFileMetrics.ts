@@ -16,7 +16,7 @@ export function getVirtualFileHeaderRegion(
 ): number {
   return (
     getVirtualFileHeaderHeight(metrics, disableFileHeader) +
-    getVirtualFilePaddingTop(metrics, disableFileHeader)
+    (metrics.paddingTop ?? (disableFileHeader ? metrics.spacing : 0))
   );
 }
 
@@ -27,13 +27,6 @@ export function getVirtualFileHeaderHeight(
   disableFileHeader: boolean
 ): number {
   return disableFileHeader ? 0 : metrics.diffHeaderHeight;
-}
-
-export function getVirtualFilePaddingTop(
-  metrics: VirtualFileMetrics,
-  disableFileHeader: boolean
-): number {
-  return metrics.paddingTop ?? (disableFileHeader ? metrics.spacing : 0);
 }
 
 export function getVirtualFilePaddingBottom(

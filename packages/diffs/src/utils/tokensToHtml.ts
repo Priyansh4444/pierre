@@ -4,7 +4,7 @@ import type { CodeToHtmlOptions, TokensResult } from '../types';
 import { hastToHtml } from './hastToHtml';
 import { renderTokenLines } from './renderTokenLines';
 
-/** Serialize highlighted tokens without loading a backend's HTML renderer. */
+// Serialize highlighted tokens without loading a backend's HTML renderer.
 export function tokensToHtml(
   source: string,
   result: TokensResult,

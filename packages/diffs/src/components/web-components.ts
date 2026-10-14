@@ -27,8 +27,9 @@ if (
     }
 
     connectedCallback() {
-      const shadowRoot = this.shadowRoot ?? this.attachShadow({ mode: 'open' });
-      getMeasuredScrollbarGutter(shadowRoot);
+      getMeasuredScrollbarGutter(
+        this.shadowRoot ?? this.attachShadow({ mode: 'open' })
+      );
     }
   }
 

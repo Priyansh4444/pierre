@@ -169,14 +169,6 @@ function canHydrateDiff(fileDiff: FileDiffMetadata): boolean {
   );
 }
 
-// Edit sessions incrementally clone the diff as needed while editing,
-// initially we start with a top level fast clone
-function createEditSessionDiff(fileDiff: FileDiffMetadata): FileDiffMetadata {
-  const editSessionDiff = { ...fileDiff };
-  delete editSessionDiff.cacheKey;
-  return editSessionDiff;
-}
-
 function shouldResetUndoState(
   prevDiff: FileDiffMetadata,
   nextDiff: FileDiffMetadata
@@ -186,20 +178,12 @@ function shouldResetUndoState(
       'FileDiff.shouldResetEditorForExternalDiff: diffs must be fully hydrated'
     );
   }
-  const prevLanguage = prevDiff.lang ?? getFiletypeFromFileName(prevDiff.name);
-  const nextLanguage = nextDiff.lang ?? getFiletypeFromFileName(nextDiff.name);
-  const prevHasOldFile = prevDiff.type !== 'new';
-  const nextHasOldFile = nextDiff.type !== 'new';
-  if (
+  return (
     prevDiff.name !== nextDiff.name ||
-    prevLanguage !== nextLanguage ||
-    prevHasOldFile !== nextHasOldFile ||
-    prevDiff.deletionLines.length !== nextDiff.deletionLines.length
-  ) {
-    return true;
-  }
-  return prevDiff.deletionLines.some(
-    (line, index) => line !== nextDiff.deletionLines[index]
+    (prevDiff.lang ?? getFiletypeFromFileName(prevDiff.name)) !==
+      (nextDiff.lang ?? getFiletypeFromFileName(nextDiff.name)) ||
+    (prevDiff.type === 'new') !== (nextDiff.type === 'new') ||
+    !areLinesEqual(prevDiff.deletionLines, nextDiff.deletionLines)
   );
 }
 
@@ -207,25 +191,6 @@ function areLinesEqual(first: string[], second: string[]): boolean {
   return (
     first.length === second.length &&
     first.every((line, index) => line === second[index])
-  );
-}
-
-// There are certain scenarios where if a diff changes in a certain way, we
-// cannot consider the session resumable.  Basically if the old file has
-// changed in any way (name or contents), then our restored diff would be
-// completely invalid
-function canRestoreDiffSession(
-  snapshot: RetainedDiffSessionSnapshot,
-  externalDiff: FileDiffMetadata
-): boolean {
-  const { oldFile } = snapshot;
-  if (oldFile == null) {
-    return externalDiff.type === 'new';
-  }
-  return (
-    externalDiff.type !== 'new' &&
-    oldFile.name === (externalDiff.prevName ?? externalDiff.name) &&
-    areLinesEqual(oldFile.lines, externalDiff.deletionLines)
   );
 }
 
@@ -340,23 +305,12 @@ interface ColumnElements {
   content: HTMLElement;
 }
 
-interface TrimColumnsToOverlapProps {
-  columns:
-    | [ColumnElements | undefined, ColumnElements | undefined]
-    | ColumnElements;
-  diffStyle: 'split' | 'unified';
-  overlapEnd: number;
-  overlapStart: number;
-  previousStart: number;
-  trimEnd: number;
-  trimStart: number;
-}
+type CodeColumn = [
+  columnType: 'unified' | 'deletions' | 'additions',
+  column: ColumnElements | undefined,
+];
 
-interface ApplyPartialRenderProps {
-  fileDiff: FileDiffMetadata;
-  previousRenderRange: RenderRange | undefined;
-  renderRange: RenderRange | undefined;
-}
+type HeaderSlotContent = Element | string | number | null | undefined;
 
 interface PendingFileLoad {
   fileDiff: FileDiffMetadata;
@@ -471,18 +425,24 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.scrollSyncManager = new ScrollSyncManager();
     this.interactionManager = new InteractionManager(
       'diff',
-      pluckInteractionOptions(
-        options,
-        typeof options.hunkSeparators === 'function' ||
-          (options.hunkSeparators ?? 'line-info') === 'line-info' ||
-          options.hunkSeparators === 'line-info-basic'
-          ? this.handleExpandHunk
-          : undefined,
-        this.getLineIndex
-      )
+      this.getInteractionOptions()
     );
     this.workerManager?.subscribeToThemeChanges(this);
-    this.enabled = true;
+  }
+
+  // Hunk expansion clicks only apply to custom and line-info separators.
+  private getInteractionOptions() {
+    const { options } = this;
+    const hunkSeparators = options.hunkSeparators ?? 'line-info';
+    return pluckInteractionOptions<'diff'>(
+      options,
+      typeof hunkSeparators === 'function' ||
+        hunkSeparators === 'line-info' ||
+        hunkSeparators === 'line-info-basic'
+        ? this.handleExpandHunk
+        : undefined,
+      this.getLineIndex
+    );
   }
 
   protected handleHighlightRender = (): void => {
@@ -540,9 +500,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       return undefined;
     }
     const lastHunk = fileDiff.hunks.at(-1);
-    let targetUnifiedIndex: number | undefined;
-    let targetSplitIndex: number | undefined;
-    hunkIterator: for (const hunk of fileDiff.hunks) {
+    for (const hunk of fileDiff.hunks) {
       const hunkStart =
         side === 'deletions' ? hunk.deletionStart : hunk.additionStart;
       const hunkCount =
@@ -556,18 +514,19 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       // we should grab its index here
       if (lineNumber < currentLineNumber) {
         const difference = currentLineNumber - lineNumber;
-        targetUnifiedIndex = Math.max(unifiedIndex - difference, 0);
-        targetSplitIndex = Math.max(splitIndex - difference, 0);
-        break hunkIterator;
+        return [
+          Math.max(unifiedIndex - difference, 0),
+          Math.max(splitIndex - difference, 0),
+        ];
       }
 
       if (lineNumber >= currentLineNumber + hunkCount) {
         if (hunk === lastHunk) {
           const difference = lineNumber - (currentLineNumber + hunkCount);
-          targetUnifiedIndex =
-            unifiedIndex + hunk.unifiedLineCount + difference;
-          targetSplitIndex = splitIndex + hunk.splitLineCount + difference;
-          break hunkIterator;
+          return [
+            unifiedIndex + hunk.unifiedLineCount + difference,
+            splitIndex + hunk.splitLineCount + difference,
+          ];
         }
         continue;
       }
@@ -576,41 +535,32 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         if (content.type === 'context') {
           if (lineNumber < currentLineNumber + content.lines) {
             const difference = lineNumber - currentLineNumber;
-            targetSplitIndex = splitIndex + difference;
-            targetUnifiedIndex = unifiedIndex + difference;
-            break hunkIterator;
-          } else {
-            currentLineNumber += content.lines;
-            splitIndex += content.lines;
-            unifiedIndex += content.lines;
+            return [unifiedIndex + difference, splitIndex + difference];
           }
+          currentLineNumber += content.lines;
+          splitIndex += content.lines;
+          unifiedIndex += content.lines;
         } else {
           const sideCount =
             side === 'deletions' ? content.deletions : content.additions;
           if (lineNumber < currentLineNumber + sideCount) {
-            const indexDifference = lineNumber - currentLineNumber;
-            targetUnifiedIndex =
+            const difference = lineNumber - currentLineNumber;
+            return [
               unifiedIndex +
-              (side === 'additions' ? content.deletions : 0) +
-              indexDifference;
-            targetSplitIndex = splitIndex + indexDifference;
-
-            break hunkIterator;
-          } else {
-            currentLineNumber += sideCount;
-            splitIndex += Math.max(content.deletions, content.additions);
-            unifiedIndex += content.deletions + content.additions;
+                (side === 'additions' ? content.deletions : 0) +
+                difference,
+              splitIndex + difference,
+            ];
           }
+          currentLineNumber += sideCount;
+          splitIndex += Math.max(content.deletions, content.additions);
+          unifiedIndex += content.deletions + content.additions;
         }
       }
 
-      break hunkIterator;
-    }
-
-    if (targetUnifiedIndex == null || targetSplitIndex == null) {
       return undefined;
     }
-    return [targetUnifiedIndex, targetSplitIndex];
+    return undefined;
   }
 
   // FIXME(amadeus): This is a bit of a looming issue that I'll need to resolve:
@@ -631,59 +581,34 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
   }
 
   protected syncInteractionOptions(): void {
-    this.interactionManager.setOptions(
-      pluckInteractionOptions(
-        this.options,
-        typeof this.options.hunkSeparators === 'function' ||
-          (this.options.hunkSeparators ?? 'line-info') === 'line-info' ||
-          this.options.hunkSeparators === 'line-info-basic'
-          ? this.handleExpandHunk
-          : undefined,
-        this.getLineIndex
-      )
-    );
-  }
-
-  private mergeOptions(
-    options: Partial<FileDiffOptions<LAnnotation, Caret>>
-  ): void {
-    this.options = { ...this.options, ...options };
+    this.interactionManager.setOptions(this.getInteractionOptions());
   }
 
   public setThemeType(themeType: ThemeTypes): void {
     if ((this.options.themeType ?? 'system') === themeType) {
       return;
     }
-    this.mergeOptions({ themeType });
+    this.options = { ...this.options, themeType };
     this.applyCachedThemeState(themeType);
   }
 
   private applyCachedThemeState(themeType: ThemeTypes): boolean {
+    const { appliedThemeCSS, fileContainer } = this;
     if (
       typeof this.options.theme === 'string' ||
-      this.fileContainer == null ||
-      this.appliedThemeCSS == null
+      fileContainer == null ||
+      appliedThemeCSS == null ||
+      appliedThemeCSS.themeType === (appliedThemeCSS.baseThemeType ?? themeType)
     ) {
       return false;
     }
-    const effectiveThemeType = this.appliedThemeCSS.baseThemeType ?? themeType;
-    if (this.appliedThemeCSS.themeType === effectiveThemeType) {
-      return false;
-    }
     this.applyThemeState(
-      this.fileContainer,
-      this.appliedThemeCSS.themeStyles,
+      fileContainer,
+      appliedThemeCSS.themeStyles,
       themeType,
-      this.appliedThemeCSS.baseThemeType
+      appliedThemeCSS.baseThemeType
     );
     return true;
-  }
-
-  private hasThemeChanged(): boolean {
-    return (
-      this.appliedThemeCSS != null &&
-      !areThemesEqual(this.appliedThemeCSS.theme, this.getTheme())
-    );
   }
 
   public getHoveredLine = (): GetHoveredLineResult<'diff'> | undefined => {
@@ -715,14 +640,11 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     lineAnnotations: DiffLineAnnotation<LAnnotation>[]
   ): boolean {
     const session = this.editSession?.annotations;
-    const externalAnnotations = this.lineAnnotations;
-    if (lineAnnotations === externalAnnotations) {
-      return false;
-    }
     return (
-      session == null ||
-      (lineAnnotations !== session.provided &&
-        lineAnnotations !== session.current)
+      lineAnnotations !== this.lineAnnotations &&
+      (session == null ||
+        (lineAnnotations !== session.provided &&
+          lineAnnotations !== session.current))
     );
   }
 
@@ -732,21 +654,19 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     const sessionAnnotations = this.editSession?.annotations;
     if (sessionAnnotations == null) {
       this.lineAnnotations = lineAnnotations;
-      return;
+    } else if (this.isNewAnnotations(lineAnnotations)) {
+      // Externally provided annotations are the source of truth: they become
+      // the new external collection and the session renders them at the line
+      // numbers given. The caller owns whether those positions still make
+      // sense after an edit; a revert renders this collection unchanged
+      // rather than moving them.
+      this.lineAnnotations = lineAnnotations;
+      writeEditSessionAnnotations(
+        sessionAnnotations,
+        lineAnnotations,
+        getLineAnnotationName
+      );
     }
-    if (!this.isNewAnnotations(lineAnnotations)) {
-      return;
-    }
-    // Externally provided annotations are the source of truth: they become the
-    // new external collection and the session renders them at the line numbers
-    // given. The caller owns whether those positions still make sense after an
-    // edit; a revert renders this collection unchanged rather than moving them.
-    this.lineAnnotations = lineAnnotations;
-    writeEditSessionAnnotations(
-      sessionAnnotations,
-      lineAnnotations,
-      getLineAnnotationName
-    );
   }
 
   // Takes annotations the editor remapped and makes them what the session
@@ -772,22 +692,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     session.current = lineAnnotations;
     this.hunksRenderer.setLineAnnotations(lineAnnotations);
     this.renderAnnotations();
-    return true;
-  }
-
-  private canPartiallyRender(
-    forceRender: boolean,
-    annotationsChanged: boolean,
-    didContentChange: boolean
-  ): boolean {
-    if (
-      forceRender ||
-      annotationsChanged ||
-      didContentChange ||
-      typeof this.options.hunkSeparators === 'function'
-    ) {
-      return false;
-    }
     return true;
   }
 
@@ -836,27 +740,25 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
   }
 
   public flushManagers(): void {
-    if (!this.managersDirty || this.pre == null) {
-      this.managersDirty = false;
-      return;
-    }
-
-    const { diffStyle = 'split', overflow = 'scroll' } = this.options;
-    this.interactionManager.setup(this.pre);
-    this.resizeManager.setup(this.pre, {
-      disableAnnotations: overflow === 'wrap',
-      columnVariables: this.shouldApplyColumnVariables(overflow)
-        ? 'apply'
-        : 'measure',
-    });
-    if (overflow === 'scroll' && diffStyle === 'split') {
-      this.scrollSyncManager.setup(
-        this.pre,
-        this.codeDeletions,
-        this.codeAdditions
-      );
-    } else {
-      this.scrollSyncManager.cleanUp();
+    const { pre } = this;
+    if (this.managersDirty && pre != null) {
+      const { diffStyle = 'split', overflow = 'scroll' } = this.options;
+      this.interactionManager.setup(pre);
+      this.resizeManager.setup(pre, {
+        disableAnnotations: overflow === 'wrap',
+        columnVariables: this.shouldApplyColumnVariables(overflow)
+          ? 'apply'
+          : 'measure',
+      });
+      if (overflow === 'scroll' && diffStyle === 'split') {
+        this.scrollSyncManager.setup(
+          pre,
+          this.codeDeletions,
+          this.codeAdditions
+        );
+      } else {
+        this.scrollSyncManager.cleanUp();
+      }
     }
     this.managersDirty = false;
   }
@@ -881,14 +783,14 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
   }
 
   public setCodeScrollLeft(position: number): void {
-    if (this.codeUnified != null) {
-      this.codeUnified.scrollLeft = position;
-    }
-    if (this.codeAdditions != null) {
-      this.codeAdditions.scrollLeft = position;
-    }
-    if (this.codeDeletions != null) {
-      this.codeDeletions.scrollLeft = position;
+    for (const code of [
+      this.codeUnified,
+      this.codeAdditions,
+      this.codeDeletions,
+    ]) {
+      if (code != null) {
+        code.scrollLeft = position;
+      }
     }
   }
 
@@ -913,9 +815,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.managersDirty = false;
     this.workerManager?.unsubscribeToThemeChanges(this);
     this.renderRange = undefined;
-    if (!recycle) {
-      this.pendingFiles = undefined;
-    }
 
     // Clean up the elements
     if (!this.isContainerManaged) {
@@ -923,11 +822,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
     this.fileContainer = undefined;
     this.mounted = false;
-    if (!recycle) {
-      this.lineAnnotations = [];
-    }
     this.clearAuxiliaryNodes();
-    this.annotationCache.clear();
     this.pre = undefined;
     this.codeUnified = undefined;
     this.codeDeletions = undefined;
@@ -945,9 +840,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.placeHolder?.remove();
     this.placeHolder = undefined;
     this.headerCache.lastRenderedHTML = undefined;
-    if (!recycle) {
-      this.clearReusableHeader();
-    }
     this.errorWrapper?.remove();
     this.errorWrapper = undefined;
     this.spriteSVG = undefined;
@@ -961,6 +853,9 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     if (recycle) {
       this.hunksRenderer.recycle();
     } else {
+      this.pendingFiles = undefined;
+      this.lineAnnotations = [];
+      this.clearReusableHeader();
       this.hunksRenderer.cleanUp();
       this.workerManager = undefined;
       // Clean up the data
@@ -970,10 +865,8 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       this.deletionFile = undefined;
       this.additionFile = undefined;
     }
-    if (this.refreshViewTimeout != null) {
-      clearTimeout(this.refreshViewTimeout);
-      this.refreshViewTimeout = undefined;
-    }
+    clearTimeout(this.refreshViewTimeout);
+    this.refreshViewTimeout = undefined;
     this.lineStateRefreshPending = false;
     this.deferredEditorActiveLine = undefined;
     this.deferredSelectedLines = undefined;
@@ -1004,25 +897,22 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       );
     }
     const fileInput = getDiffFileInput(fileInputProps, 'FileDiff.hydrate');
-    const oldFile = fileInput?.oldFile;
-    const newFile = fileInput?.newFile;
     this.hydrateElements(fileContainer, prerenderedHTML);
     // An editor attached before hydration may carry a retained keyed document
     // and its session-shaped hunks. Render through that private session instead
     // of adopting external markup, so hydration cannot recompute or flash it.
     const forceEditorRender = this.editor != null;
+    const { collapsed = false, disableFileHeader = false } = this.options;
+    // A file input always carries at least one side.
+    const hasFile = fileInput != null;
     if (
       forceEditorRender ||
-      shouldRenderCode(
-        this.pre,
-        hasDiffContent({ fileDiff, oldFile, newFile }),
-        this.options.collapsed
-      ) ||
-      shouldRenderHeader(
-        this.headerElement,
-        hasDiffHeaderContent({ fileDiff, oldFile, newFile }),
-        this.options.disableFileHeader
-      )
+      (!collapsed &&
+        this.pre == null &&
+        ((fileDiff != null && fileDiff.hunks.length > 0) || hasFile)) ||
+      (!disableFileHeader &&
+        this.headerElement == null &&
+        (fileDiff != null || hasFile))
     ) {
       this.render({
         ...fileInputProps,
@@ -1057,50 +947,20 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     for (const element of fileContainer.shadowRoot?.children ?? []) {
       if (element instanceof SVGElement) {
         this.spriteSVG = element;
-        continue;
-      }
-      if (!(element instanceof HTMLElement)) {
-        continue;
-      }
-      if (element instanceof HTMLPreElement) {
+      } else if (element instanceof HTMLPreElement) {
         this.pre = element;
-        for (const code of element.children) {
-          if (
-            !(code instanceof HTMLElement) ||
-            code.tagName.toLowerCase() !== 'code'
-          ) {
-            continue;
-          }
-          if ('deletions' in code.dataset) {
-            this.codeDeletions = code;
-          }
-          if ('additions' in code.dataset) {
-            this.codeAdditions = code;
-          }
-          if ('unified' in code.dataset) {
-            this.codeUnified = code;
-          }
-        }
-        continue;
-      }
-      if ('diffsHeader' in element.dataset) {
+      } else if (
+        element instanceof HTMLElement &&
+        'diffsHeader' in element.dataset
+      ) {
         this.headerElement = element;
-        continue;
-      }
-      if (
-        element instanceof HTMLStyleElement &&
-        element.hasAttribute(THEME_CSS_ATTRIBUTE)
-      ) {
-        this.themeCSSStyle = element;
-        continue;
-      }
-      if (
-        element instanceof HTMLStyleElement &&
-        element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)
-      ) {
-        this.unsafeCSSStyle = element;
-        this.appliedUnsafeCSS = element.textContent;
-        continue;
+      } else if (element instanceof HTMLStyleElement) {
+        if (element.hasAttribute(THEME_CSS_ATTRIBUTE)) {
+          this.themeCSSStyle = element;
+        } else if (element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)) {
+          this.unsafeCSSStyle = element;
+          this.appliedUnsafeCSS = element.textContent;
+        }
       }
     }
     if (this.pre != null) {
@@ -1108,7 +968,13 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       this.pre.removeAttribute('data-dehydrated');
     }
     this.fileContainer = fileContainer;
-    this.hydrateMeasuredScrollbar();
+    const { shadowRoot } = fileContainer;
+    if (shadowRoot != null && this.themeCSSStyle != null) {
+      this.themeCSSStyle.textContent = patchScrollbarGutterSize(
+        this.themeCSSStyle.textContent ?? '',
+        getMeasuredScrollbarGutter(shadowRoot)
+      );
+    }
   }
 
   protected hydrationSetup({
@@ -1206,19 +1072,30 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       );
     }
 
-    const promise = this.loadFilesForDiff(fileDiff, loadDiffFiles);
+    const promise = (async () => {
+      try {
+        const files = await loadDiffFiles(fileDiff);
+        if (this.fileDiff === fileDiff) {
+          await this.handleFilesLoaded(fileDiff, files);
+        }
+      } catch (error: unknown) {
+        if (this.options.disableErrorHandling === true) {
+          throw error;
+        }
+        console.error(error);
+      }
+    })();
     const pendingFiles: PendingFileLoad = (this.pendingFiles = {
       fileDiff,
       promise,
     });
     // Track the exact request object so an older completion for the same diff
     // cannot clear a newer request.
-    const clearPendingFiles = (): void => {
+    pendingFiles.promise = promise.finally(() => {
       if (this.pendingFiles === pendingFiles) {
         this.pendingFiles = undefined;
       }
-    };
-    pendingFiles.promise = promise.finally(clearPendingFiles);
+    });
   }
 
   /**
@@ -1240,13 +1117,9 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     if (this.__canAttachEditor()) {
       return;
     }
+    // __prepareForEditing already throws for partial diffs that cannot hydrate.
     const pending = this.__prepareForEditing();
     if (pending == null) {
-      if (this.fileDiff?.isPartial === true && !canHydrateDiff(this.fileDiff)) {
-        throw new Error(
-          'FileDiff.prepareForEditing: this partial diff cannot be hydrated; provide a complete diff'
-        );
-      }
       throw new Error(
         'FileDiff.prepareForEditing: a partial diff requires loadDiffFiles'
       );
@@ -1273,25 +1146,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     return this.pendingFiles?.promise;
   }
 
-  private async loadFilesForDiff(
-    fileDiff: FileDiffMetadata,
-    loadDiffFiles: NonNullable<BaseDiffOptions['loadDiffFiles']>
-  ): Promise<void> {
-    try {
-      const files = await loadDiffFiles(fileDiff);
-      if (this.fileDiff !== fileDiff) {
-        return;
-      }
-
-      await this.handleFilesLoaded(fileDiff, files);
-    } catch (error: unknown) {
-      if (this.options.disableErrorHandling === true) {
-        throw error;
-      }
-      console.error(error);
-    }
-  }
-
   protected async handleFilesLoaded(
     expectedDiff: FileDiffMetadata,
     files: LoadedPartialDiffContents
@@ -1301,13 +1155,11 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
     hydratePartialDiff('merge', expectedDiff, files);
     this.setHydratedState(files);
-    if (this.installHydratedSessionDiff(expectedDiff)) {
-      this.rerender();
-      return;
-    }
-    await awaitWithTimeout(() => this.primeHighlightCache(expectedDiff));
-    if (!this.enabled || this.fileDiff !== expectedDiff) {
-      return;
+    if (!this.installHydratedSessionDiff(expectedDiff)) {
+      await awaitWithTimeout(() => this.primeHighlightCache(expectedDiff));
+      if (!this.enabled || this.fileDiff !== expectedDiff) {
+        return;
+      }
     }
     this.rerender();
   }
@@ -1321,14 +1173,14 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         'FileDiff.installHydratedSessionDiff: diffs cannot be partial for editing'
       );
     }
-    if (this.fileDiff !== expectedDiff) {
+    if (
+      this.fileDiff !== expectedDiff ||
+      this.editSession?.outgoingDiff == null
+    ) {
       return false;
     }
-    if (this.editSession?.outgoingDiff != null) {
-      this.installEditSession(expectedDiff);
-      return true;
-    }
-    return false;
+    this.installEditSession(expectedDiff);
+    return true;
   }
 
   // Install a replacement diff from the caller; returns false when it is the
@@ -1380,52 +1232,50 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     retainedDocument?: FileContents,
     retainedSession?: RetainedDiffSessionSnapshot
   ): void {
-    const externalContents = externalDiff.additionLines.join('');
-    const retainedLines =
-      retainedDocument != null
-        ? splitFileContents(retainedDocument.contents)
-        : undefined;
-    const restoreRetainedSession =
+    // A retained session is only resumable while the old file (name and
+    // contents) is unchanged; otherwise the restored hunks would be invalid.
+    const oldFile = retainedSession?.oldFile;
+    if (
       retainedSession != null &&
-      canRestoreDiffSession(retainedSession, externalDiff);
-    if (retainedSession != null && !restoreRetainedSession) {
+      (oldFile == null
+        ? externalDiff.type !== 'new'
+        : externalDiff.type === 'new' ||
+          oldFile.name !== (externalDiff.prevName ?? externalDiff.name) ||
+          !areLinesEqual(oldFile.lines, externalDiff.deletionLines))
+    ) {
       throw new Error(
         'FileDiff: retained session cannot resume against a different old file'
       );
     }
-    if (
-      retainedDocument != null &&
-      retainedDocument.contents !== externalContents &&
-      !restoreRetainedSession
-    ) {
-      throw new Error(
-        'FileDiff: retained edits are missing their diff session state'
-      );
-    }
-    const usesExternalDocument =
-      retainedDocument == null ||
-      (retainedDocument.name === externalDiff.name &&
-        retainedDocument.lang === externalDiff.lang &&
-        retainedDocument.contents === externalContents);
-    const sessionDiff = createEditSessionDiff(externalDiff);
-    if (
-      retainedDocument != null &&
-      retainedLines != null &&
-      !usesExternalDocument
-    ) {
-      sessionDiff.name = retainedDocument.name;
-      sessionDiff.lang = retainedDocument.lang;
-    }
-    if (
-      restoreRetainedSession &&
-      retainedSession != null &&
-      retainedLines != null
-    ) {
-      sessionDiff.additionLines = retainedLines;
-      sessionDiff.type = retainedSession.type;
-      sessionDiff.hunks = retainedSession.hunks;
-      sessionDiff.editSessionDirty = true;
-      recomputeDiffRenderLineCounts(sessionDiff);
+    // Edit sessions incrementally clone the diff as needed while editing,
+    // initially we start with a top level fast clone
+    const sessionDiff = { ...externalDiff };
+    delete sessionDiff.cacheKey;
+    let documentDiff = retainedSession == null ? externalDiff : undefined;
+    if (retainedDocument != null) {
+      const { name, lang, contents } = retainedDocument;
+      const externalContents = externalDiff.additionLines.join('');
+      if (contents !== externalContents && retainedSession == null) {
+        throw new Error(
+          'FileDiff: retained edits are missing their diff session state'
+        );
+      }
+      if (
+        name !== externalDiff.name ||
+        lang !== externalDiff.lang ||
+        contents !== externalContents
+      ) {
+        sessionDiff.name = name;
+        sessionDiff.lang = lang;
+        documentDiff = undefined;
+      }
+      if (retainedSession != null) {
+        sessionDiff.additionLines = splitFileContents(contents);
+        sessionDiff.type = retainedSession.type;
+        sessionDiff.hunks = retainedSession.hunks;
+        sessionDiff.editSessionDirty = true;
+        recomputeDiffRenderLineCounts(sessionDiff);
+      }
     }
     this.editSession = {
       diff: sessionDiff,
@@ -1441,10 +1291,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         ),
       outgoingDiff: this.editSession?.outgoingDiff,
     };
-    this.hunksRenderer.beginEditSession(
-      sessionDiff,
-      usesExternalDocument && !restoreRetainedSession ? externalDiff : undefined
-    );
+    this.hunksRenderer.beginEditSession(sessionDiff, documentDiff);
   }
 
   protected setHydratedState(files: LoadedPartialDiffContents): void {
@@ -1487,7 +1334,9 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       expandUnchanged = false,
     } = this.options;
     const nextRenderRange = collapsed ? undefined : renderRange;
-    const themeChanged = this.hasThemeChanged();
+    const themeChanged =
+      this.appliedThemeCSS != null &&
+      !areThemesEqual(this.appliedThemeCSS.theme, this.getTheme());
     const hasFileInput = fileInput != null;
     const filesDidChange =
       hasFileInput &&
@@ -1497,9 +1346,8 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       fileDiff != null && !areDiffTargetsEqual(fileDiff, this.fileDiff);
     const annotationsChanged =
       lineAnnotations != null &&
-      (lineAnnotations.length > 0 || this.getLatestAnnotations().length > 0)
-        ? this.isNewAnnotations(lineAnnotations)
-        : false;
+      (lineAnnotations.length > 0 || this.getLatestAnnotations().length > 0) &&
+      this.isNewAnnotations(lineAnnotations);
 
     if (
       !collapsed &&
@@ -1521,13 +1369,13 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       return rendered;
     }
 
-    let nextParsedFileDiff: FileDiffMetadata | undefined;
+    let nextFileDiff = diffDidChange ? fileDiff : undefined;
     if (
       fileDiff == null &&
       hasFileInput &&
       (filesDidChange || this.fileDiff == null)
     ) {
-      nextParsedFileDiff = parseDiffFromFile(
+      nextFileDiff = parseDiffFromFile(
         fileInput.oldFile,
         fileInput.newFile,
         this.options.parseDiffOptions
@@ -1548,13 +1396,9 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       this.additionFile = undefined;
     }
 
-    if (fileDiff != null && diffDidChange) {
-      this.updateExternalDiff(fileDiff, lineAnnotations);
-    } else if (nextParsedFileDiff != null) {
+    if (nextFileDiff != null) {
       diffDidChange = true;
-      this.updateExternalDiff(nextParsedFileDiff, lineAnnotations);
-    }
-    if (diffDidChange) {
+      this.updateExternalDiff(nextFileDiff, lineAnnotations);
       this.clearReusableHeader();
     }
 
@@ -1604,7 +1448,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
 
     if (collapsed) {
       this.removeRenderedCode();
-      this.clearAuxiliaryNodes();
 
       try {
         const hunksResult = this.hunksRenderer.renderDiff(
@@ -1618,25 +1461,19 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
             themeType,
             hunksResult.baseThemeType
           );
-        }
-        if (hunksResult?.headerElement != null) {
-          this.applyHeaderToDOM(
-            hunksResult.headerElement,
-            fileContainer,
-            hunksResult.fileDiff
-          );
+          if (hunksResult.headerElement != null) {
+            this.applyHeaderToDOM(
+              hunksResult.headerElement,
+              fileContainer,
+              hunksResult.fileDiff
+            );
+          }
         }
         this.renderSeparators([]);
         this.renderedDiff = hunksResult?.fileDiff ?? latestDiff;
         this.injectUnsafeCSS();
       } catch (error: unknown) {
-        if (disableErrorHandling) {
-          throw error;
-        }
-        console.error(error);
-        if (error instanceof Error) {
-          this.applyErrorToDOM(error, fileContainer);
-        }
+        this.handleRenderError(error, fileContainer, disableErrorHandling);
       }
       this.finalizeRender();
       if (!preventEmit) {
@@ -1648,24 +1485,21 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     try {
       const pre = this.getOrCreatePreNode(fileContainer);
 
-      // Attempt to partially render
-      const didPartiallyRender =
-        this.canPartiallyRender(
-          forceRender,
-          annotationsChanged,
-          filesDidChange ||
-            diffDidChange ||
-            themeChanged ||
-            !areDiffTargetsEqual(this.renderedDiff, latestDiff)
-        ) &&
-        this.applyPartialRender({
-          fileDiff: latestDiff,
+      // Attempt to partially render; if we can't, perform a full render
+      if (
+        forceRender ||
+        annotationsChanged ||
+        filesDidChange ||
+        diffDidChange ||
+        themeChanged ||
+        typeof this.options.hunkSeparators === 'function' ||
+        !areDiffTargetsEqual(this.renderedDiff, latestDiff) ||
+        !this.applyPartialRender(
+          latestDiff,
           previousRenderRange,
-          renderRange: nextRenderRange,
-        });
-
-      // If we were unable to partially render, perform a full render
-      if (!didPartiallyRender) {
+          nextRenderRange
+        )
+      ) {
         const hunksResult = this.hunksRenderer.renderDiff(
           latestDiff,
           nextRenderRange
@@ -1702,7 +1536,13 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
           hunksResult.deletionsContentAST != null ||
           hunksResult.unifiedContentAST != null
         ) {
-          this.applyHunksToDOM(pre, hunksResult);
+          if (this.shouldGuardRebuildScroll()) {
+            guardWebKitScrollDuringRebuild(pre, () =>
+              this.replaceCodeColumns(pre, hunksResult)
+            );
+          } else {
+            this.replaceCodeColumns(pre, hunksResult);
+          }
         } else if (this.pre != null) {
           this.pre.remove();
           this.pre = undefined;
@@ -1725,13 +1565,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         this.syncRenderViewToEditor();
       }
     } catch (error: unknown) {
-      if (disableErrorHandling) {
-        throw error;
-      }
-      console.error(error);
-      if (error instanceof Error) {
-        this.applyErrorToDOM(error, fileContainer);
-      }
+      this.handleRenderError(error, fileContainer, disableErrorHandling);
     }
     if (!preventEmit) {
       this.emitPostRender();
@@ -1742,30 +1576,17 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
   protected finalizeRender(): void {}
 
   protected emitPostRender(unmount = false): void {
-    const {
-      fileContainer,
-      options: { onPostRender },
-    } = this;
-
+    const { fileContainer, mounted, options } = this;
     if (unmount) {
-      if (!this.mounted) {
-        return;
-      }
       this.mounted = false;
-      if (fileContainer == null) {
-        return;
+      if (mounted && fileContainer != null) {
+        options.onPostRender?.(fileContainer, this, 'unmount');
       }
-      this.options.onPostRender?.(fileContainer, this, 'unmount');
-      return;
+    } else if (fileContainer != null) {
+      this.mounted = true;
+      const { onPostRender } = options;
+      onPostRender?.(fileContainer, this, mounted ? 'update' : 'mount');
     }
-
-    if (fileContainer == null) {
-      return;
-    }
-
-    const phase: PostRenderPhase = this.mounted ? 'update' : 'mount';
-    this.mounted = true;
-    onPostRender?.(fileContainer, this, phase);
   }
 
   // Return the newest diff this component intends to display. An active edit
@@ -1784,8 +1605,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
 
   private syncRenderViewToEditor(): void {
     const { editor, fileContainer } = this;
-    const lineAnnotations = this.getLatestAnnotations();
-    const renderRange = this.computeEditorRenderRange(this.renderRange);
     const fileDiff = this.getLatestDiff();
     if (
       editor == null ||
@@ -1794,6 +1613,47 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       fileDiff.isPartial
     ) {
       return;
+    }
+    const lineAnnotations = this.getLatestAnnotations();
+    let { renderRange } = this;
+    // The stored render range is in rendered-row units for the windowed AST
+    // pipeline, but the editor consumes render ranges in document-line units.
+    // Derive the addition-side document window covered by the rendered rows:
+    // startingLine = first addition line with a row in the window, totalLines =
+    // last such line - first + 1, and 0 when the window holds no addition rows
+    // (e.g. a pure-deletion run taller than the viewport).
+    if (renderRange != null && !isDefaultRenderRange(renderRange)) {
+      const {
+        diffStyle = 'split',
+        expandUnchanged = false,
+        collapsedContextThreshold = DEFAULT_COLLAPSED_CONTEXT_THRESHOLD,
+      } = this.options;
+      let firstLineNumber: number | undefined;
+      let lastLineNumber: number | undefined;
+      iterateOverDiff({
+        diff: fileDiff,
+        diffStyle,
+        startingLine: renderRange.startingLine,
+        totalLines: renderRange.totalLines,
+        expandedHunks: expandUnchanged
+          ? true
+          : this.hunksRenderer.getExpandedHunksMap(),
+        collapsedContextThreshold,
+        callback: ({ additionLine }) => {
+          if (additionLine != null) {
+            firstLineNumber ??= additionLine.lineNumber;
+            lastLineNumber = additionLine.lineNumber;
+          }
+        },
+      });
+      renderRange =
+        firstLineNumber == null || lastLineNumber == null
+          ? { ...renderRange, startingLine: 0, totalLines: 0 }
+          : {
+              ...renderRange,
+              startingLine: firstLineNumber - 1,
+              totalLines: lastLineNumber - firstLineNumber + 1,
+            };
     }
     const sync = (highlighter: DiffsHighlighter): void => {
       if (
@@ -1809,9 +1669,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       const externalDocument =
         replacement != null && externalDiff != null && replacement !== fileDiff;
       const resetHistory =
-        externalDocument && replacement != null && externalDiff != null
-          ? shouldResetUndoState(replacement, externalDiff)
-          : false;
+        externalDocument && shouldResetUndoState(replacement, externalDiff);
       editor.__syncRenderView({
         highlighter,
         fileContainer,
@@ -1848,56 +1706,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
           }
         });
     }
-  }
-
-  // The stored render range is in rendered-row units for the windowed AST
-  // pipeline, but the editor consumes render ranges in document-line units.
-  // Derive the addition-side document window covered by the rendered rows:
-  // startingLine = first addition line with a row in the window, totalLines =
-  // last such line - first + 1, and 0 when the window holds no addition rows
-  // (e.g. a pure-deletion run taller than the viewport).
-  private computeEditorRenderRange(
-    renderRange: RenderRange | undefined
-  ): RenderRange | undefined {
-    const fileDiff = this.getLatestDiff();
-    if (
-      renderRange == null ||
-      fileDiff == null ||
-      isDefaultRenderRange(renderRange)
-    ) {
-      return renderRange;
-    }
-    const {
-      diffStyle = 'split',
-      expandUnchanged = false,
-      collapsedContextThreshold = DEFAULT_COLLAPSED_CONTEXT_THRESHOLD,
-    } = this.options;
-    let firstLineNumber: number | undefined;
-    let lastLineNumber: number | undefined;
-    iterateOverDiff({
-      diff: fileDiff,
-      diffStyle,
-      startingLine: renderRange.startingLine,
-      totalLines: renderRange.totalLines,
-      expandedHunks: expandUnchanged
-        ? true
-        : this.hunksRenderer.getExpandedHunksMap(),
-      collapsedContextThreshold,
-      callback: ({ additionLine }) => {
-        if (additionLine != null) {
-          firstLineNumber ??= additionLine.lineNumber;
-          lastLineNumber = additionLine.lineNumber;
-        }
-      },
-    });
-    if (firstLineNumber == null || lastLineNumber == null) {
-      return { ...renderRange, startingLine: 0, totalLines: 0 };
-    }
-    return {
-      ...renderRange,
-      startingLine: firstLineNumber - 1,
-      totalLines: lastLineNumber - firstLineNumber + 1,
-    };
   }
 
   /** @internal The editor applied or edited past the pending external replacement. */
@@ -1984,7 +1792,8 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
     const detach = () => {
       this.editor = undefined;
-      this.finishEditSession();
+      this.hunksRenderer.endEditSession();
+      this.finalizeEditSessionHunks();
     };
     try {
       this.resumeEditorRendering(editor);
@@ -2018,16 +1827,18 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     ) {
       this.installEditSession(externalDiff);
     }
-    const initialExternalDiff =
+    if (
       this.editSession == null &&
       externalDiff != null &&
       !externalDiff.isPartial
-        ? externalDiff
-        : undefined;
-    if (initialExternalDiff != null) {
+    ) {
       this.installEditSession(
-        initialExternalDiff,
-        editor.__getDocumentContents(getAdditionFile(initialExternalDiff)),
+        externalDiff,
+        editor.__getDocumentContents({
+          name: externalDiff.name,
+          lang: externalDiff.lang,
+          contents: externalDiff.additionLines.join(''),
+        }),
         editor.__getDocumentSessionState()
       );
     } else if (this.editSession != null) {
@@ -2059,12 +1870,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
   }
 
-  // Session exit for the live detach path.
-  private finishEditSession(): void {
-    this.hunksRenderer.endEditSession();
-    this.finalizeEditSessionHunks();
-  }
-
   /**
    * @internal
    *
@@ -2082,13 +1887,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
   public __completeEditSession(
     editor: Editor<'file-diff', LAnnotation, Caret>,
     mode: 'install' | 'discard'
-  ): void {
-    this.settleEditSession(mode === 'install', editor);
-  }
-
-  private settleEditSession(
-    installResult: boolean,
-    editor: Editor<'file-diff', LAnnotation, Caret> | undefined
   ): void {
     const {
       editSession,
@@ -2108,17 +1906,10 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.hunksRenderer.endEditSession();
     this.finalizeEditSessionHunks();
 
+    const install = mode === 'install';
     const sessionAnnotationsCurrent = editSessionAnnotations?.current;
-    let acceptedDiff: FileDiffMetadata | undefined;
-    let acceptedOldFile: FileContents | null = null;
-    let acceptedNewFile: FileContents | null = null;
     let failed = false;
     let failure: unknown;
-    if (editor == null) {
-      throw new Error(
-        'FileDiff.__completeEditSession: editor is required for completion'
-      );
-    }
     const completedDiff = cloneFileDiffMetadata(editSessionDiff);
     const newFile: FileContents = {
       name: completedDiff.name,
@@ -2148,8 +1939,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     Object.freeze(event);
     try {
       editor.__emitEditComplete(event);
-      const decision = this.options.onEditComplete?.(event);
-      if (decision === 'accept') {
+      if (this.options.onEditComplete?.(event) === 'accept') {
         if (
           completedDiff.cacheKey != null &&
           completedDiff.cacheKey === externalDiff.cacheKey
@@ -2158,31 +1948,27 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
             'FileDiff.__completeEditSession: an accepted diff must not reuse the replaced diff cacheKey'
           );
         }
-        acceptedDiff = completedDiff;
-        acceptedOldFile = event.oldFile;
-        acceptedNewFile = event.newFile;
+        if (install) {
+          this.fileDiff = completedDiff;
+          // Callers using the oldFile/newFile API get the stored pair
+          // refreshed so their next render with the event's files does not
+          // reparse over the accepted diff. Every editable pair has a new
+          // side (deleted files cannot be edited), so that is the check.
+          if (this.additionFile != null) {
+            this.deletionFile = event.oldFile;
+            this.additionFile = newFile;
+          }
+          if (sessionAnnotationsCurrent != null) {
+            this.lineAnnotations = sessionAnnotationsCurrent;
+          }
+        }
       }
     } catch (error) {
       failed = true;
       failure = error;
     }
-
-    if (installResult && acceptedDiff != null) {
-      this.fileDiff = acceptedDiff;
-      // Callers using the oldFile/newFile API get the stored pair
-      // refreshed so their next render with the event's files does not
-      // reparse over the accepted diff. Every editable pair has a new
-      // side (deleted files cannot be edited), so that is the check.
-      if (this.additionFile != null) {
-        this.deletionFile = acceptedOldFile;
-        this.additionFile = acceptedNewFile;
-      }
-      if (sessionAnnotationsCurrent != null) {
-        this.lineAnnotations = sessionAnnotationsCurrent;
-      }
-    }
     this.editSession = undefined;
-    if (installResult && this.fileContainer != null) {
+    if (install && this.fileContainer != null) {
       this.rerender();
     }
     if (failed) {
@@ -2228,14 +2014,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     textDocument: TextDocument<'file-diff', LAnnotation>,
     newLineAnnotations?: DiffLineAnnotation<LAnnotation>[]
   ): void {
-    const editSessionDiff = this.editSession?.diff;
-    if (editSessionDiff == null) {
-      throw new Error(
-        'FileDiff.applyDocumentChange: requires an active edit session'
-      );
-    }
-    this.detachAdditionLines();
-    this.hunksRenderer.beginEditSession(editSessionDiff);
+    this.beginSessionUpdate('applyDocumentChange');
     this.hunksRenderer.applyDocumentChange(textDocument);
     if (newLineAnnotations != null) {
       this.syncEditSessionAnnotationsFromEditor(newLineAnnotations);
@@ -2258,19 +2037,11 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     themeType: 'dark' | 'light',
     options: UpdateRenderCacheOptions = {}
   ): void {
-    const editSessionDiff = this.editSession?.diff;
-    if (editSessionDiff == null) {
-      throw new Error(
-        'FileDiff.updateRenderCache: requires an active edit session'
-      );
-    }
-    this.detachAdditionLines();
-    this.hunksRenderer.beginEditSession(editSessionDiff);
-    const { shouldRefreshDiffsView, lineCountChangeInFlight } = options;
+    this.beginSessionUpdate('updateRenderCache');
     const regionsChanged = this.hunksRenderer.updateRenderCache(
       dirtyLines,
       themeType,
-      lineCountChangeInFlight,
+      options.lineCountChangeInFlight,
       options.changedDocumentLines,
       options.documentLineCount
     );
@@ -2280,42 +2051,100 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     // re-render — never a synchronous one, since this runs mid-editor-pass
     // and rebuilding rows the editor is about to touch detaches its geometry
     // caches.
+    if (!regionsChanged && options.shouldRefreshDiffsView !== true) {
+      return;
+    }
+    clearTimeout(this.refreshViewTimeout);
+    this.refreshViewTimeout = undefined;
+    this.lineStateRefreshPending = true;
     if (regionsChanged) {
-      if (this.refreshViewTimeout != null) {
-        clearTimeout(this.refreshViewTimeout);
-        this.refreshViewTimeout = undefined;
-      }
-      this.lineStateRefreshPending = true;
       this.escalateEditSessionRender();
       return;
     }
-    if (shouldRefreshDiffsView === true) {
-      if (this.refreshViewTimeout != null) {
-        clearTimeout(this.refreshViewTimeout);
-      }
-      this.lineStateRefreshPending = true;
-      this.refreshViewTimeout = setTimeout(() => {
-        this.refreshViewTimeout = undefined;
-        if (this.options.diffStyle === 'split') {
-          this.refreshSplitDiffView();
+    this.refreshViewTimeout = setTimeout(() => {
+      this.refreshViewTimeout = undefined;
+      const { diffStyle } = this.options;
+      const fileDiff = this.getLatestDiff();
+      const hunksResult =
+        fileDiff != null && (diffStyle === 'split' || diffStyle === 'unified')
+          ? this.hunksRenderer.renderDiff(fileDiff, this.renderRange)
+          : undefined;
+      const columns = hunksResult != null ? this.getCodeColumns() : undefined;
+      if (hunksResult != null && columns != null) {
+        const rebuild = (): void => {
+          for (const [columnType, column] of columns) {
+            if (column == null) {
+              continue;
+            }
+            const ast = this.hunksRenderer.renderCodeAST(
+              columnType,
+              hunksResult
+            );
+            for (const [element, children] of [
+              [column.gutter, getElementChildren(ast?.[0])],
+              [column.content, getElementChildren(ast?.[1])],
+            ] as const) {
+              if (children == null) {
+                continue;
+              }
+              if (diffStyle === 'unified') {
+                element.innerHTML = hastToHtml(children);
+              } else if (element.childElementCount === children.length) {
+                for (let i = 0; i < children.length; i++) {
+                  const row = element.children[i] as HTMLElement;
+                  const lineType = (children[i] as HASTElement).properties[
+                    'data-line-type'
+                  ] as string | undefined;
+                  if (lineType != null && row.dataset.lineType !== lineType) {
+                    row.dataset.lineType = lineType;
+                  }
+                }
+              }
+            }
+            if (
+              diffStyle === 'unified' &&
+              hunksResult.rowCount !== this.lastRowCount
+            ) {
+              this.applyRowSpan(column, hunksResult.rowCount);
+              this.lastRowCount = hunksResult.rowCount;
+            }
+          }
+          this.renderedDiff = hunksResult.fileDiff;
+        };
+        // Split view only patches each row's `data-line-type`; unified view
+        // re-renders its columns.
+        if (diffStyle === 'split') {
+          rebuild();
         } else {
-          this.refreshUnifiedDiffView();
+          if (this.shouldGuardRebuildScroll()) {
+            guardWebKitScrollDuringRebuild(this.pre, rebuild);
+          } else {
+            rebuild();
+          }
+          this.renderSeparators(hunksResult.hunkData);
+          this.managersDirty = true;
+          this.flushManagers();
+          this.syncRenderViewToEditor();
         }
-        this.flushDeferredLineState();
-      }, 150);
-    }
+      }
+      this.flushDeferredLineState();
+    }, 150);
   }
 
-  private detachAdditionLines(): void {
+  // Copy-on-write the session's addition lines (still shared with the
+  // external diff or the old side), then point the renderer at the session.
+  private beginSessionUpdate(caller: string): void {
     const editSessionDiff = this.editSession?.diff;
-    const { fileDiff } = this;
+    if (editSessionDiff == null) {
+      throw new Error(`FileDiff.${caller}: requires an active edit session`);
+    }
     if (
-      editSessionDiff != null &&
-      (editSessionDiff.additionLines === fileDiff?.additionLines ||
-        editSessionDiff.additionLines === editSessionDiff.deletionLines)
+      editSessionDiff.additionLines === this.fileDiff?.additionLines ||
+      editSessionDiff.additionLines === editSessionDiff.deletionLines
     ) {
       editSessionDiff.additionLines = [...editSessionDiff.additionLines];
     }
+    this.hunksRenderer.beginEditSession(editSessionDiff);
   }
 
   // Editor-facing visibility oracle: whether a one-based new-file line has
@@ -2386,7 +2215,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       const [hunkStart, hunkEnd] = getHunkAdditionLineRange(hunk);
       if (lineNumber < hunkStart) {
         const region = getExpandedRegion({
-          isPartial: fileDiff.isPartial,
+          isPartial: false,
           rangeSize: hunk.collapsedBefore,
           expandedHunks,
           hunkIndex,
@@ -2403,19 +2232,12 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         const fromStartDistance =
           lineNumber - (gapStart + region.fromStart) + 1;
         const fromEndDistance = hunkStart - region.fromEnd - lineNumber;
-        if (fromStartDistance <= fromEndDistance) {
-          this.expandHunk(
-            hunkIndex,
-            'up',
-            fromStartDistance + expansionLineCount
-          );
-        } else {
-          this.expandHunk(
-            hunkIndex,
-            'down',
-            fromEndDistance + expansionLineCount
-          );
-        }
+        const expandUp = fromStartDistance <= fromEndDistance;
+        this.expandHunk(
+          hunkIndex,
+          expandUp ? 'up' : 'down',
+          (expandUp ? fromStartDistance : fromEndDistance) + expansionLineCount
+        );
         return true;
       }
       if (lineNumber < hunkEnd) {
@@ -2478,6 +2300,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.resizeManager.cleanUp();
     this.scrollSyncManager.cleanUp();
     this.interactionManager.cleanUp();
+    this.clearAuxiliaryNodes();
 
     this.bufferBefore?.remove();
     this.bufferBefore = undefined;
@@ -2518,7 +2341,22 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       return false;
     }
     this.emitPostRender(true);
-    this.cleanChildNodes();
+    this.removeRenderedCode();
+    this.clearHeaderSlots();
+    this.cleanupErrorWrapper();
+    this.headerElement?.remove();
+    this.spriteSVG?.remove();
+    this.themeCSSStyle?.remove();
+    this.unsafeCSSStyle?.remove();
+    this.headerElement = undefined;
+    this.spriteSVG = undefined;
+    this.themeCSSStyle = undefined;
+    this.appliedThemeCSS = undefined;
+    this.hasAdoptedThemeCSS = false;
+    this.unsafeCSSStyle = undefined;
+    this.appliedUnsafeCSS = undefined;
+    this.headerCache.lastRenderedHTML = undefined;
+    this.mounted = false;
 
     if (this.placeHolder == null) {
       const shadowRoot =
@@ -2548,15 +2386,9 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       workerManager == null ||
       !workerManager.isWorkingPool() ||
       fileDiff.cacheKey == null ||
-      isDiffPlainText(fileDiff)
-    ) {
-      return;
-    }
-    const tokenizeMaxLength =
-      this.options.tokenizeMaxLength ?? DEFAULT_TOKENIZE_MAX_LENGTH;
-    if (
+      isDiffPlainText(fileDiff) ||
       Math.max(fileDiff.additionLines.length, fileDiff.deletionLines.length) >
-      tokenizeMaxLength
+        (this.options.tokenizeMaxLength ?? DEFAULT_TOKENIZE_MAX_LENGTH)
     ) {
       return;
     }
@@ -2564,113 +2396,56 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     await workerManager
       .primeDiffHighlightCache(fileDiff)
       .catch((error: unknown) => {
-        if (isHandledWorkerPoolError(error)) {
-          return;
+        if (!isHandledWorkerPoolError(error)) {
+          console.error(error);
         }
-        console.error(error);
       });
-  }
-
-  private cleanChildNodes() {
-    this.resizeManager.cleanUp();
-    this.scrollSyncManager.cleanUp();
-    this.interactionManager.cleanUp();
-    this.clearAuxiliaryNodes();
-
-    this.bufferAfter?.remove();
-    this.bufferBefore?.remove();
-    this.codeAdditions?.remove();
-    this.codeDeletions?.remove();
-    this.codeUnified?.remove();
-    this.errorWrapper?.remove();
-    this.headerElement?.remove();
-    this.headerPrefix?.remove();
-    this.headerFilenameSuffix?.remove();
-    this.headerMetadata?.remove();
-    this.headerCustom?.remove();
-    this.pre?.remove();
-    this.spriteSVG?.remove();
-    this.themeCSSStyle?.remove();
-    this.unsafeCSSStyle?.remove();
-
-    this.bufferAfter = undefined;
-    this.bufferBefore = undefined;
-    this.codeAdditions = undefined;
-    this.codeDeletions = undefined;
-    this.codeUnified = undefined;
-    this.errorWrapper = undefined;
-    this.headerElement = undefined;
-    this.headerPrefix = undefined;
-    this.headerFilenameSuffix = undefined;
-    this.headerMetadata = undefined;
-    this.headerCustom = undefined;
-    this.pre = undefined;
-    this.spriteSVG = undefined;
-    this.themeCSSStyle = undefined;
-    this.appliedThemeCSS = undefined;
-    this.hasAdoptedThemeCSS = false;
-    this.unsafeCSSStyle = undefined;
-    this.appliedUnsafeCSS = undefined;
-
-    this.headerCache.lastRenderedHTML = undefined;
-    this.lastRowCount = undefined;
-    this.mounted = false;
   }
 
   private renderSeparators(hunkData: HunkData[]): void {
     const { hunkSeparators } = this.options;
-    if (
-      this.isContainerManaged ||
-      this.fileContainer == null ||
-      typeof hunkSeparators !== 'function'
-    ) {
-      for (const { element } of this.separatorCache.values()) {
-        element.remove();
-      }
-      this.separatorCache.clear();
-      return;
-    }
     const staleSeparators = new Map(this.separatorCache);
-    for (const hunk of hunkData) {
-      const id = hunk.slotName;
-      let cache = this.separatorCache.get(id);
-      if (cache == null || !areHunkDataEqual(hunk, cache.hunkData)) {
-        cache?.element.remove();
-        const element = document.createElement('div');
-        element.style.display = 'contents';
-        element.slot = hunk.slotName;
-        const child = hunkSeparators(hunk, this);
-        if (child != null) {
-          element.appendChild(child);
+    if (
+      !this.isContainerManaged &&
+      this.fileContainer != null &&
+      typeof hunkSeparators === 'function'
+    ) {
+      for (const hunk of hunkData) {
+        const id = hunk.slotName;
+        const cache = this.separatorCache.get(id);
+        if (cache == null || !areHunkDataEqual(hunk, cache.hunkData)) {
+          cache?.element.remove();
+          const element = document.createElement('div');
+          element.style.display = 'contents';
+          element.slot = id;
+          const child = hunkSeparators(hunk, this);
+          if (child != null) {
+            element.appendChild(child);
+          }
+          this.fileContainer.appendChild(element);
+          this.separatorCache.set(id, { element, hunkData: hunk });
         }
-        this.fileContainer.appendChild(element);
-        cache = { element, hunkData: hunk };
-        this.separatorCache.set(id, cache);
+        staleSeparators.delete(id);
       }
-      staleSeparators.delete(id);
     }
-    for (const [id, { element }] of staleSeparators.entries()) {
+    for (const [id, { element }] of staleSeparators) {
       this.separatorCache.delete(id);
       element.remove();
     }
   }
 
   protected renderAnnotations(): void {
-    if (this.isContainerManaged || this.fileContainer == null) {
-      for (const { element } of this.annotationCache.values()) {
-        element.remove();
-      }
-      this.annotationCache.clear();
-      return;
-    }
     const staleAnnotations = new Map(this.annotationCache);
     const { renderAnnotation } = this.options;
-    const lineAnnotations = this.getLatestAnnotations();
-    if (renderAnnotation != null && lineAnnotations.length > 0) {
-      for (const [index, annotation] of lineAnnotations.entries()) {
+    if (
+      !this.isContainerManaged &&
+      this.fileContainer != null &&
+      renderAnnotation != null
+    ) {
+      for (const [index, annotation] of this.getLatestAnnotations().entries()) {
         const name = this.getAnnotationSlotName(annotation);
         const id = `${index}-${name}`;
-        let cache = this.annotationCache.get(id);
+        const cache = this.annotationCache.get(id);
         if (
           cache == null ||
           !areDiffLineAnnotationsEqual(annotation, cache.annotation)
@@ -2682,42 +2457,38 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
           if (content == null) {
             continue;
           }
-          cache = {
-            element: createAnnotationWrapperNode(name),
-            annotation,
-          };
-          cache.element.appendChild(content);
-          this.fileContainer.appendChild(cache.element);
-          this.annotationCache.set(id, cache);
+          const element = createAnnotationWrapperNode(name);
+          element.appendChild(content);
+          this.fileContainer.appendChild(element);
+          this.annotationCache.set(id, { element, annotation });
         }
         staleAnnotations.delete(id);
       }
     }
-    for (const [id, { element }] of staleAnnotations.entries()) {
+    for (const [id, { element }] of staleAnnotations) {
       this.annotationCache.delete(id);
       element.remove();
     }
   }
 
   protected renderGutterUtility(): void {
-    const { renderGutterUtility } = this.options;
-    if (this.fileContainer == null || renderGutterUtility == null) {
+    const {
+      fileContainer,
+      options: { renderGutterUtility },
+    } = this;
+    const element =
+      fileContainer != null
+        ? renderGutterUtility?.(this.interactionManager.getHoveredLine)
+        : undefined;
+    if (element == null) {
       this.gutterUtilityContent?.remove();
       this.gutterUtilityContent = undefined;
-      return;
+    } else if (this.gutterUtilityContent == null) {
+      const gutterUtilityContent = createGutterUtilityContentNode();
+      gutterUtilityContent.appendChild(element);
+      fileContainer?.appendChild(gutterUtilityContent);
+      this.gutterUtilityContent = gutterUtilityContent;
     }
-    const element = renderGutterUtility(this.interactionManager.getHoveredLine);
-    if (element != null && this.gutterUtilityContent != null) {
-      return;
-    } else if (element == null) {
-      this.gutterUtilityContent?.remove();
-      this.gutterUtilityContent = undefined;
-      return;
-    }
-    const gutterUtilityContent = createGutterUtilityContentNode();
-    gutterUtilityContent.appendChild(element);
-    this.fileContainer.appendChild(gutterUtilityContent);
-    this.gutterUtilityContent = gutterUtilityContent;
   }
 
   protected getOrCreateFileContainer(
@@ -2730,66 +2501,44 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       previousContainer ??
       document.createElement(DIFFS_TAG_NAME);
     const containerChanged = previousContainer !== nextContainer;
-    if (previousContainer != null && containerChanged) {
-      this.editor?.__captureFocusForDOMReplacement();
-    }
     if (containerChanged) {
+      if (previousContainer != null) {
+        this.editor?.__captureFocusForDOMReplacement();
+      }
       this.emitPostRender(true);
-    }
-    this.fileContainer = nextContainer;
-    if (previousContainer != null && containerChanged) {
-      this.headerCache.lastRenderedHTML = undefined;
-      this.headerElement = undefined;
-    }
-    if (parentNode != null && this.fileContainer.parentNode !== parentNode) {
-      parentNode.appendChild(this.fileContainer);
-    }
-    if (containerChanged) {
-      this.adoptReusableShellElements(this.fileContainer);
-    }
-    this.ensureSpriteSVG(this.fileContainer);
-    return this.fileContainer;
-  }
-
-  // NOTE(amadeus): Technically this method is not safe for use outside of
-  // the CodeView component, however I don't think in practice it really
-  // should matter, but maybe there's some system we need in place to prevent
-  // this from running outside of that environment?
-  //
-  // It's making very specific assumptions that all the elements will have the
-  // correct content based on CodeView global options
-  private adoptReusableShellElements(fileContainer: HTMLElement): void {
-    const { shadowRoot } = fileContainer;
-    if (shadowRoot == null) {
-      return;
-    }
-
-    for (const element of shadowRoot.children) {
-      if (element instanceof SVGElement) {
-        this.spriteSVG ??= element;
-      } else if (
-        isStyleNode(element) &&
-        element.hasAttribute(THEME_CSS_ATTRIBUTE)
-      ) {
-        this.themeCSSStyle ??= element;
-        this.hasAdoptedThemeCSS = true;
-      } else if (
-        isStyleNode(element) &&
-        element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)
-      ) {
-        this.unsafeCSSStyle ??= element;
-        this.appliedUnsafeCSS ??= this.options.unsafeCSS ?? undefined;
+      if (previousContainer != null) {
+        this.headerCache.lastRenderedHTML = undefined;
+        this.headerElement = undefined;
       }
     }
-  }
-
-  private ensureSpriteSVG(fileContainer: HTMLElement): void {
+    this.fileContainer = nextContainer;
+    if (parentNode != null && nextContainer.parentNode !== parentNode) {
+      parentNode.appendChild(nextContainer);
+    }
+    // NOTE(amadeus): Adopting a reused shell is technically not safe outside
+    // of the CodeView component: it assumes all the elements have the correct
+    // content based on CodeView global options.
+    if (containerChanged && nextContainer.shadowRoot != null) {
+      for (const element of nextContainer.shadowRoot.children) {
+        if (element instanceof SVGElement) {
+          this.spriteSVG ??= element;
+        } else if (isStyleNode(element)) {
+          if (element.hasAttribute(THEME_CSS_ATTRIBUTE)) {
+            this.themeCSSStyle ??= element;
+            this.hasAdoptedThemeCSS = true;
+          } else if (element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)) {
+            this.unsafeCSSStyle ??= element;
+            this.appliedUnsafeCSS ??= this.options.unsafeCSS ?? undefined;
+          }
+        }
+      }
+    }
     const shadowRoot =
-      fileContainer.shadowRoot ?? fileContainer.attachShadow({ mode: 'open' });
+      nextContainer.shadowRoot ?? nextContainer.attachShadow({ mode: 'open' });
     if (this.spriteSVG == null) {
       const fragment = document.createElement('div');
       fragment.innerHTML = SVGSpriteSheet;
-      const firstChild = fragment.firstChild;
+      const { firstChild } = fragment;
       if (firstChild instanceof SVGElement) {
         this.spriteSVG = firstChild;
       }
@@ -2797,6 +2546,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     if (this.spriteSVG != null && this.spriteSVG.parentNode !== shadowRoot) {
       shadowRoot.appendChild(this.spriteSVG);
     }
+    return nextContainer;
   }
 
   private getOrCreatePreNode(container: HTMLElement): HTMLPreElement {
@@ -2829,7 +2579,7 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.codeUnified = undefined;
     this.codeDeletions = undefined;
     this.codeAdditions = undefined;
-    for (const child of Array.from(pre.children)) {
+    for (const child of pre.children) {
       if (!(child instanceof HTMLElement)) {
         continue;
       }
@@ -2896,26 +2646,25 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       renderHeaderMetadata,
     } = this.options;
 
+    // Run every slot callback before touching the DOM; a custom header
+    // replaces the prefix, suffix and metadata slots.
+    let custom: HeaderSlotContent;
+    let prefix: HeaderSlotContent;
+    let suffix: HeaderSlotContent;
+    let metadata: HeaderSlotContent;
     if (renderCustomHeader != null) {
-      const content = renderCustomHeader(fileDiff) ?? undefined;
-      this.headerCustom = this.upsertHeaderSlotElement(
-        container,
-        this.headerCustom,
-        CUSTOM_HEADER_SLOT_ID,
-        content
-      );
-      this.headerPrefix?.remove();
-      this.headerFilenameSuffix?.remove();
-      this.headerMetadata?.remove();
-      this.headerPrefix = undefined;
-      this.headerFilenameSuffix = undefined;
-      this.headerMetadata = undefined;
-      return;
+      custom = renderCustomHeader(fileDiff);
+    } else {
+      prefix = renderHeaderPrefix?.(fileDiff);
+      suffix = renderHeaderFilenameSuffix?.(fileDiff);
+      metadata = renderHeaderMetadata?.(fileDiff);
     }
-
-    const prefix = renderHeaderPrefix?.(fileDiff) ?? undefined;
-    const suffix = renderHeaderFilenameSuffix?.(fileDiff) ?? undefined;
-    const content = renderHeaderMetadata?.(fileDiff) ?? undefined;
+    this.headerCustom = this.upsertHeaderSlotElement(
+      container,
+      this.headerCustom,
+      CUSTOM_HEADER_SLOT_ID,
+      custom
+    );
     this.headerPrefix = this.upsertHeaderSlotElement(
       container,
       this.headerPrefix,
@@ -2932,10 +2681,8 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       container,
       this.headerMetadata,
       HEADER_METADATA_SLOT_ID,
-      content
+      metadata
     );
-    this.headerCustom?.remove();
-    this.headerCustom = undefined;
   }
 
   protected clearReusableHeader(): void {
@@ -2959,35 +2706,24 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     container: HTMLElement,
     current: HTMLElement | undefined,
     slot: string,
-    content: Element | string | number | undefined
+    content: HeaderSlotContent
   ): HTMLElement | undefined {
     if (content == null) {
       current?.remove();
       return undefined;
     }
-    const element = current ?? this.createHeaderSlotElement(slot);
-    if (current == null) {
+    let element = current;
+    if (element == null) {
+      element = document.createElement('div');
+      element.slot = slot;
       container.appendChild(element);
     }
-    this.replaceHeaderSlotContent(element, content);
-    return element;
-  }
-
-  private replaceHeaderSlotContent(
-    element: HTMLElement,
-    content: Element | string | number
-  ): void {
     element.replaceChildren();
     if (content instanceof Element) {
       element.appendChild(content);
     } else {
       element.innerText = `${content}`;
     }
-  }
-
-  private createHeaderSlotElement(slot: string): HTMLElement {
-    const element = document.createElement('div');
-    element.slot = slot;
     return element;
   }
 
@@ -3000,10 +2736,8 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     }
 
     if (unsafeCSS == null || unsafeCSS === '') {
-      if (this.unsafeCSSStyle != null) {
-        this.unsafeCSSStyle.remove();
-        this.unsafeCSSStyle = undefined;
-      }
+      this.unsafeCSSStyle?.remove();
+      this.unsafeCSSStyle = undefined;
       this.appliedUnsafeCSS = undefined;
       return;
     }
@@ -3047,25 +2781,23 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       this.appliedThemeCSS.theme = theme;
       return;
     }
+    // An adopted shell already carries matching theme CSS; only record it.
     if (
       this.hasAdoptedThemeCSS &&
       this.themeCSSStyle?.parentNode === shadowRoot
     ) {
       this.hasAdoptedThemeCSS = false;
-      this.appliedThemeCSS = {
-        theme,
-        themeStyles,
-        themeType: effectiveThemeType,
-        baseThemeType,
-        scrollbarGutter,
-      };
-      return;
+    } else {
+      this.themeCSSStyle = upsertHostThemeStyle({
+        shadowRoot,
+        currentNode: this.themeCSSStyle,
+        themeCSS: wrapThemeCSS(
+          themeStyles,
+          effectiveThemeType,
+          scrollbarGutter
+        ),
+      });
     }
-    this.themeCSSStyle = upsertHostThemeStyle({
-      shadowRoot,
-      currentNode: this.themeCSSStyle,
-      themeCSS: wrapThemeCSS(themeStyles, effectiveThemeType, scrollbarGutter),
-    });
     this.appliedThemeCSS =
       this.themeCSSStyle != null
         ? {
@@ -3078,17 +2810,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         : undefined;
   }
 
-  private hydrateMeasuredScrollbar(): void {
-    const shadowRoot = this.fileContainer?.shadowRoot;
-    if (shadowRoot == null || this.themeCSSStyle == null) {
-      return;
-    }
-    this.themeCSSStyle.textContent = patchScrollbarGutterSize(
-      this.themeCSSStyle.textContent ?? '',
-      getMeasuredScrollbarGutter(shadowRoot)
-    );
-  }
-
   // A boolean check to ensure that edit mode in WebKit doesn't cause potential
   // scroll jumps to due bugs with WebKit. The workarounds have performance
   // implications so we avoid running the workarounds on browsers or scenarios
@@ -3097,170 +2818,103 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     return this.editor != null && isSafari();
   }
 
-  private applyHunksToDOM(
-    pre: HTMLPreElement,
-    result: HunksRenderResult
-  ): void {
-    if (this.shouldGuardRebuildScroll()) {
-      guardWebKitScrollDuringRebuild(pre, () =>
-        this.replaceCodeColumns(pre, result)
-      );
-    } else {
-      this.replaceCodeColumns(pre, result);
-    }
-  }
-
-  // Renders a code column's AST into an existing elements without replacing
-  // the gutter and content parents. Identity matters in edit mode: the content
-  // element is the focused contenteditable, and replacing it ends the
-  // browser's editing session — focus tears down and restores, and iOS
-  // answers every session restart with an animated caret reveal.
-  //
-  // Returns false when the element has no column pair yet (initial render,
-  // or a diff-style switch built a fresh element); the caller then assigns
-  // the full innerHTML.
-  private applyCodeColumnsInPlace(
-    code: HTMLElement,
-    ast: ElementContent[],
-    rowCount: number
-  ): boolean {
-    const columns = this.getColumnPair(code);
-    if (columns == null) {
-      return false;
-    }
-    const gutterChildren = getElementChildren(ast[0]);
-    const contentChildren = getElementChildren(ast[1]);
-    if (gutterChildren == null || contentChildren == null) {
-      return false;
-    }
-    columns.gutter.innerHTML = hastToHtml(gutterChildren);
-    columns.content.innerHTML = hastToHtml(contentChildren);
-    if (rowCount !== this.lastRowCount) {
-      columns.gutter.style.setProperty('grid-row', `span ${rowCount}`);
-      columns.content.style.setProperty('grid-row', `span ${rowCount}`);
-    }
-    return true;
-  }
-
   private replaceCodeColumns(
     pre: HTMLPreElement,
     result: HunksRenderResult
   ): void {
     const { overflow = 'scroll' } = this.options;
+    const { rowCount } = result;
     const containerSize =
       (this.options.hunkSeparators ?? 'line-info') === 'line-info';
-    const rowSpan = overflow === 'wrap' ? result.rowCount : undefined;
+    const rowSpan = overflow === 'wrap' ? rowCount : undefined;
     this.cleanupErrorWrapper();
     this.applyPreNodeAttributes(pre, result);
 
-    let shouldReplace = false;
-    // Create code elements and insert HTML content
     const codeElements: HTMLElement[] = [];
+    // Renders a column AST into its code element. An existing gutter/content
+    // pair is filled in place: in edit mode the content element is the
+    // focused contenteditable, and replacing it ends the browser's editing
+    // session (focus tears down and restores, and iOS answers every session
+    // restart with an animated caret reveal).
+    const applyColumn = (
+      code: HTMLElement | undefined,
+      columnType: 'unified' | 'deletions' | 'additions',
+      ast: ElementContent[]
+    ): HTMLElement => {
+      const element = getOrCreateCodeNode({
+        code,
+        columnType,
+        rowSpan,
+        containerSize,
+      });
+      const columns = this.getColumnPair(element);
+      const gutterChildren = getElementChildren(ast[0]);
+      const contentChildren = getElementChildren(ast[1]);
+      if (
+        columns != null &&
+        gutterChildren != null &&
+        contentChildren != null
+      ) {
+        columns.gutter.innerHTML = hastToHtml(gutterChildren);
+        columns.content.innerHTML = hastToHtml(contentChildren);
+        if (rowCount !== this.lastRowCount) {
+          this.applyRowSpan(columns, rowCount);
+        }
+      } else {
+        element.innerHTML = this.hunksRenderer.renderPartialHTML(ast);
+      }
+      codeElements.push(element);
+      return element;
+    };
+
+    let shouldReplace: boolean;
     const unifiedAST = this.hunksRenderer.renderCodeAST('unified', result);
-    const deletionsAST = this.hunksRenderer.renderCodeAST('deletions', result);
-    const additionsAST = this.hunksRenderer.renderCodeAST('additions', result);
     this.editor?.__captureFocusForDOMReplacement();
     if (unifiedAST != null) {
       shouldReplace =
         this.codeUnified == null ||
         this.codeAdditions != null ||
         this.codeDeletions != null;
-
-      // Clean up addition/deletion elements if necessary
       this.codeDeletions?.remove();
       this.codeDeletions = undefined;
       this.codeAdditions?.remove();
       this.codeAdditions = undefined;
-
-      this.codeUnified = getOrCreateCodeNode({
-        code: this.codeUnified,
-        columnType: 'unified',
-        rowSpan,
-        containerSize,
-      });
-      if (
-        !this.applyCodeColumnsInPlace(
-          this.codeUnified,
-          unifiedAST,
-          result.rowCount
-        )
-      ) {
-        this.codeUnified.innerHTML =
-          this.hunksRenderer.renderPartialHTML(unifiedAST);
-      }
-      codeElements.push(this.codeUnified);
-    } else if (deletionsAST != null || additionsAST != null) {
+      this.codeUnified = applyColumn(this.codeUnified, 'unified', unifiedAST);
+    } else {
+      const deletionsAST = this.hunksRenderer.renderCodeAST(
+        'deletions',
+        result
+      );
+      const additionsAST = this.hunksRenderer.renderCodeAST(
+        'additions',
+        result
+      );
+      shouldReplace =
+        this.codeUnified != null ||
+        (deletionsAST != null && this.codeDeletions == null) ||
+        (additionsAST != null && this.codeAdditions == null);
+      this.codeUnified?.remove();
+      this.codeUnified = undefined;
       if (deletionsAST != null) {
-        shouldReplace = this.codeDeletions == null || this.codeUnified != null;
-
-        // Clean up unified column if necessary
-        this.codeUnified?.remove();
-        this.codeUnified = undefined;
-
-        this.codeDeletions = getOrCreateCodeNode({
-          code: this.codeDeletions,
-          columnType: 'deletions',
-          rowSpan,
-          containerSize,
-        });
-        if (
-          !this.applyCodeColumnsInPlace(
-            this.codeDeletions,
-            deletionsAST,
-            result.rowCount
-          )
-        ) {
-          this.codeDeletions.innerHTML =
-            this.hunksRenderer.renderPartialHTML(deletionsAST);
-        }
-        codeElements.push(this.codeDeletions);
+        this.codeDeletions = applyColumn(
+          this.codeDeletions,
+          'deletions',
+          deletionsAST
+        );
       } else {
-        // If we have no deletion column, lets clean it up if it exists
         this.codeDeletions?.remove();
         this.codeDeletions = undefined;
       }
-
       if (additionsAST != null) {
-        shouldReplace =
-          shouldReplace ||
-          this.codeAdditions == null ||
-          this.codeUnified != null;
-
-        // Clean up unified column if necessary
-        this.codeUnified?.remove();
-        this.codeUnified = undefined;
-
-        this.codeAdditions = getOrCreateCodeNode({
-          code: this.codeAdditions,
-          columnType: 'additions',
-          rowSpan,
-          containerSize,
-        });
-        if (
-          !this.applyCodeColumnsInPlace(
-            this.codeAdditions,
-            additionsAST,
-            result.rowCount
-          )
-        ) {
-          this.codeAdditions.innerHTML =
-            this.hunksRenderer.renderPartialHTML(additionsAST);
-        }
-        codeElements.push(this.codeAdditions);
+        this.codeAdditions = applyColumn(
+          this.codeAdditions,
+          'additions',
+          additionsAST
+        );
       } else {
-        // If we have no addition column, lets clean it up if it exists
         this.codeAdditions?.remove();
         this.codeAdditions = undefined;
       }
-    } else {
-      // if we get in here, there's no content to render, so lets just clean
-      // everything up
-      this.codeUnified?.remove();
-      this.codeUnified = undefined;
-      this.codeDeletions?.remove();
-      this.codeDeletions = undefined;
-      this.codeAdditions?.remove();
-      this.codeAdditions = undefined;
     }
 
     if (codeElements.length === 0) {
@@ -3269,40 +2923,29 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       pre.replaceChildren(...codeElements);
     }
 
-    this.lastRowCount = result.rowCount;
+    this.lastRowCount = rowCount;
   }
 
-  private applyPartialRender({
-    fileDiff,
-    previousRenderRange,
-    renderRange,
-  }: ApplyPartialRenderProps): boolean {
-    const {
-      pre,
-      codeUnified,
-      codeAdditions,
-      codeDeletions,
-      options: { diffStyle = 'split' },
-    } = this;
+  private applyPartialRender(
+    fileDiff: FileDiffMetadata,
+    previousRenderRange: RenderRange | undefined,
+    renderRange: RenderRange | undefined
+  ): boolean {
+    const { lastRowCount } = this;
     if (
-      pre == null ||
+      this.pre == null ||
       // We must have a current and previous render range to do a partial render
       previousRenderRange == null ||
       renderRange == null ||
       // Neither render range may be infinite
       !Number.isFinite(previousRenderRange.totalLines) ||
       !Number.isFinite(renderRange.totalLines) ||
-      this.lastRowCount == null
+      lastRowCount == null
     ) {
       return false;
     }
-    const codeElements = this.getCodeColumns(
-      diffStyle,
-      codeUnified,
-      codeDeletions,
-      codeAdditions
-    );
-    if (codeElements == null) {
+    const columns = this.getCodeColumns();
+    if (columns == null) {
       return false;
     }
 
@@ -3317,56 +2960,54 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       return false;
     }
 
-    const trimStart = Math.max(0, overlapStart - previousStart);
-    const trimEnd = Math.max(0, previousEnd - overlapEnd);
-
-    const trimResult = this.trimColumns({
-      columns: codeElements,
-      trimStart,
-      trimEnd,
-      previousStart,
-      overlapStart,
-      overlapEnd,
-      diffStyle,
-    });
-    if (trimResult < 0) {
-      throw new Error('FileDiff.applyPartialRender: failed to trim to overlap');
+    // Trim the rows outside the overlap from both ends of every column.
+    const preTrimCount = overlapStart - previousStart;
+    const postTrimStart =
+      previousEnd > overlapEnd ? overlapEnd - previousStart : -1;
+    let trimmedRows: number | undefined;
+    if (preTrimCount > 0 || postTrimStart >= 0) {
+      for (const [, column] of columns) {
+        if (column == null) {
+          continue;
+        }
+        const removedRows = this.trimColumnRows(
+          column,
+          preTrimCount,
+          postTrimStart
+        );
+        if (trimmedRows != null && trimmedRows !== removedRows) {
+          throw new Error('FileDiff.trimColumns: split columns out of sync');
+        }
+        trimmedRows = removedRows;
+      }
     }
 
-    if (this.lastRowCount < trimResult) {
+    let rowCount = lastRowCount - (trimmedRows ?? 0);
+    if (rowCount < 0) {
       throw new Error(
         'FileDiff.applyPartialRender: trimmed beyond DOM row count'
       );
     }
 
-    let rowCount = this.lastRowCount - trimResult;
     const renderChunk = (
       startingLine: number,
       totalLines: number
-    ): HunksRenderResult | undefined => {
-      if (totalLines <= 0) {
-        return undefined;
-      }
-      return this.hunksRenderer.renderDiff(fileDiff, {
-        startingLine,
-        totalLines,
-        bufferBefore: 0,
-        bufferAfter: 0,
-      });
-    };
+    ): HunksRenderResult | undefined =>
+      totalLines > 0
+        ? this.hunksRenderer.renderDiff(fileDiff, {
+            startingLine,
+            totalLines,
+            bufferBefore: 0,
+            bufferAfter: 0,
+          })
+        : undefined;
 
-    const prependResult = renderChunk(
-      nextStart,
-      Math.max(overlapStart - nextStart, 0)
-    );
+    const prependResult = renderChunk(nextStart, overlapStart - nextStart);
     if (prependResult == null && nextStart < overlapStart) {
       return false;
     }
 
-    const appendResult = renderChunk(
-      overlapEnd,
-      Math.max(nextEnd - overlapEnd, 0)
-    );
+    const appendResult = renderChunk(overlapEnd, nextEnd - overlapEnd);
     if (appendResult == null && nextEnd > overlapEnd) {
       return false;
     }
@@ -3378,13 +3019,11 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
       if (result == null) {
         return;
       }
-      if (diffStyle === 'unified' && !Array.isArray(codeElements)) {
-        this.insertPartialHTML(diffStyle, codeElements, result, insertPosition);
-      } else if (diffStyle === 'split' && Array.isArray(codeElements)) {
-        this.insertPartialHTML(diffStyle, codeElements, result, insertPosition);
-      } else {
-        throw new Error(
-          'FileDiff.applyPartialRender.applyChunk: invalid chunk application'
+      for (const [columnType, column] of columns) {
+        this.renderPartialColumn(
+          column,
+          this.hunksRenderer.renderCodeAST(columnType, result),
+          insertPosition
         );
       }
       rowCount += result.rowCount;
@@ -3395,178 +3034,14 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     applyChunk(prependResult, 'afterbegin');
     applyChunk(appendResult, 'beforeend');
 
-    if (this.lastRowCount !== rowCount) {
-      this.applyRowSpan(diffStyle, codeElements, rowCount);
+    if (lastRowCount !== rowCount) {
+      for (const [, column] of columns) {
+        this.applyRowSpan(column, rowCount);
+      }
       this.lastRowCount = rowCount;
     }
 
     return true;
-  }
-
-  private insertPartialHTML(
-    diffStyle: 'unified',
-    columns: ColumnElements,
-    result: HunksRenderResult,
-    insertPosition: 'afterbegin' | 'beforeend'
-  ): void;
-  private insertPartialHTML(
-    diffStyle: 'split',
-    columns: [ColumnElements | undefined, ColumnElements | undefined],
-    result: HunksRenderResult,
-    insertPosition: 'afterbegin' | 'beforeend'
-  ): void;
-  private insertPartialHTML(
-    diffStyle: 'split' | 'unified',
-    columns:
-      | [ColumnElements | undefined, ColumnElements | undefined]
-      | ColumnElements,
-    result: HunksRenderResult,
-    insertPosition: 'afterbegin' | 'beforeend'
-  ): void {
-    if (diffStyle === 'unified' && !Array.isArray(columns)) {
-      const unifiedAST = this.hunksRenderer.renderCodeAST('unified', result);
-      this.renderPartialColumn(columns, unifiedAST, insertPosition);
-    } else if (diffStyle === 'split' && Array.isArray(columns)) {
-      const deletionsAST = this.hunksRenderer.renderCodeAST(
-        'deletions',
-        result
-      );
-      const additionsAST = this.hunksRenderer.renderCodeAST(
-        'additions',
-        result
-      );
-      this.renderPartialColumn(columns[0], deletionsAST, insertPosition);
-      this.renderPartialColumn(columns[1], additionsAST, insertPosition);
-    } else {
-      throw new Error(
-        'FileDiff.insertPartialHTML: Invalid argument composition'
-      );
-    }
-  }
-
-  // fast refresh diff view via updating the `data-line-type` after an edit.
-  // only for split view.
-  private refreshSplitDiffView(): void {
-    const fileDiff = this.getLatestDiff();
-    if (this.options.diffStyle !== 'split' || fileDiff == null) {
-      return;
-    }
-
-    const hunksResult = this.hunksRenderer.renderDiff(
-      fileDiff,
-      this.renderRange
-    );
-    if (hunksResult == null) {
-      return;
-    }
-
-    const columns = this.getCodeColumns(
-      'split',
-      this.codeUnified,
-      this.codeDeletions,
-      this.codeAdditions
-    );
-    if (!Array.isArray(columns)) {
-      return;
-    }
-
-    const applyLineType = (
-      type: 'deletions' | 'additions',
-      column: ColumnElements | undefined
-    ) => {
-      if (column == null) {
-        return;
-      }
-      const ast = this.hunksRenderer.renderCodeAST(type, hunksResult);
-      const gutterChildren = getElementChildren(ast?.[0]);
-      const contentChildren = getElementChildren(ast?.[1]);
-      for (const [el, astChildren] of [
-        [column.gutter, gutterChildren],
-        [column.content, contentChildren],
-      ] as const) {
-        if (
-          astChildren != null &&
-          el.childElementCount === astChildren.length
-        ) {
-          for (let i = 0; i < astChildren.length; i++) {
-            const gutterElement = el.children[i] as HTMLElement;
-            const gutterChild = astChildren[i] as HASTElement;
-            const lineType = gutterChild.properties['data-line-type'] as
-              | string
-              | undefined;
-            if (
-              lineType != null &&
-              gutterElement.dataset.lineType !== lineType
-            ) {
-              gutterElement.dataset.lineType = lineType;
-            }
-          }
-        }
-      }
-    };
-
-    applyLineType('deletions', columns[0]);
-    applyLineType('additions', columns[1]);
-    this.renderedDiff = hunksResult.fileDiff;
-  }
-
-  // full diff view re-rendering
-  // only for unified view.
-  private refreshUnifiedDiffView(): void {
-    const fileDiff = this.getLatestDiff();
-    if (this.options.diffStyle !== 'unified' || fileDiff == null) {
-      return;
-    }
-
-    const hunksResult = this.hunksRenderer.renderDiff(
-      fileDiff,
-      this.renderRange
-    );
-    if (hunksResult == null) {
-      return;
-    }
-
-    const columns = this.getCodeColumns(
-      'unified',
-      this.codeUnified,
-      this.codeDeletions,
-      this.codeAdditions
-    );
-    if (columns == null || Array.isArray(columns)) {
-      return;
-    }
-
-    const ast = this.hunksRenderer.renderCodeAST('unified', hunksResult);
-    const gutterChildren = getElementChildren(ast?.[0]);
-    const contentChildren = getElementChildren(ast?.[1]);
-    const applyColumns = () => {
-      for (const [el, astChildren] of [
-        [columns.gutter, gutterChildren],
-        [columns.content, contentChildren],
-      ] as const) {
-        if (astChildren != null) {
-          el.innerHTML = hastToHtml(astChildren);
-        }
-      }
-
-      if (hunksResult.rowCount !== this.lastRowCount) {
-        this.applyRowSpan('unified', columns, hunksResult.rowCount);
-        this.lastRowCount = hunksResult.rowCount;
-      }
-      this.renderedDiff = hunksResult.fileDiff;
-    };
-    if (this.shouldGuardRebuildScroll()) {
-      guardWebKitScrollDuringRebuild(this.pre, applyColumns);
-    } else {
-      applyColumns();
-    }
-    this.renderSeparators(hunksResult.hunkData);
-
-    this.managersDirty = true;
-    this.flushManagers();
-
-    // sync the render view to the editor
-    this.syncRenderViewToEditor();
   }
 
   private renderPartialColumn(
@@ -3582,35 +3057,39 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     if (gutterChildren == null || contentChildren == null) {
       throw new Error('FileDiff.insertPartialHTML: Unexpected AST structure');
     }
-    const firstHASTElement = contentChildren.at(0);
+    // A chunk that starts (or ends) with a buffer row next to the existing
+    // edge buffer row grows that row instead of inserting another one.
+    const append = insertPosition === 'beforeend';
+    const edgeHASTElement = contentChildren.at(append ? 0 : -1);
     if (
-      insertPosition === 'beforeend' &&
-      firstHASTElement?.type === 'element' &&
-      typeof firstHASTElement.properties['data-buffer-size'] === 'number'
+      edgeHASTElement?.type === 'element' &&
+      typeof edgeHASTElement.properties['data-buffer-size'] === 'number'
     ) {
-      this.mergeBuffersIfNecessary(
-        firstHASTElement.properties['data-buffer-size'],
-        column.content.children[column.content.children.length - 1],
-        column.gutter.children[column.gutter.children.length - 1],
-        gutterChildren,
-        contentChildren,
-        true
-      );
-    }
-    const lastHASTElement = contentChildren.at(-1);
-    if (
-      insertPosition === 'afterbegin' &&
-      lastHASTElement?.type === 'element' &&
-      typeof lastHASTElement.properties['data-buffer-size'] === 'number'
-    ) {
-      this.mergeBuffersIfNecessary(
-        lastHASTElement.properties['data-buffer-size'],
-        column.content.children[0],
-        column.gutter.children[0],
-        gutterChildren,
-        contentChildren,
-        false
-      );
+      const contentElement = append
+        ? column.content.lastElementChild
+        : column.content.firstElementChild;
+      const gutterElement = append
+        ? column.gutter.lastElementChild
+        : column.gutter.firstElementChild;
+      if (
+        contentElement instanceof HTMLElement &&
+        gutterElement instanceof HTMLElement
+      ) {
+        const currentSize = this.getBufferSize(contentElement.dataset);
+        if (currentSize != null) {
+          if (append) {
+            gutterChildren.shift();
+            contentChildren.shift();
+          } else {
+            gutterChildren.pop();
+            contentChildren.pop();
+          }
+          const size =
+            currentSize + edgeHASTElement.properties['data-buffer-size'];
+          this.updateBufferSize(contentElement, size);
+          this.updateBufferSize(gutterElement, size);
+        }
+      }
     }
 
     column.gutter.insertAdjacentHTML(
@@ -3623,61 +3102,16 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     );
   }
 
-  private mergeBuffersIfNecessary(
-    adjustmentSize: number,
-    contentElement: Element,
-    gutterElement: Element,
-    gutterChildren: ElementContent[],
-    contentChildren: ElementContent[],
-    fromStart: boolean
-  ) {
-    if (
-      !(contentElement instanceof HTMLElement) ||
-      !(gutterElement instanceof HTMLElement)
-    ) {
-      return;
-    }
-    const currentSize = this.getBufferSize(contentElement.dataset);
-    if (currentSize == null) {
-      return;
-    }
-    if (fromStart) {
-      gutterChildren.shift();
-      contentChildren.shift();
-    } else {
-      gutterChildren.pop();
-      contentChildren.pop();
-    }
-    this.updateBufferSize(contentElement, currentSize + adjustmentSize);
-    this.updateBufferSize(gutterElement, currentSize + adjustmentSize);
-  }
-
   private applyRowSpan(
-    diffStyle: 'split' | 'unified',
-    columns:
-      | [ColumnElements | undefined, ColumnElements | undefined]
-      | ColumnElements,
+    column: ColumnElements | undefined,
     rowCount: number
   ): void {
-    const applySpan = (column: ColumnElements | undefined) => {
-      if (column == null) {
-        return;
-      }
-      column.gutter.style.setProperty('grid-row', `span ${rowCount}`);
-      column.content.style.setProperty('grid-row', `span ${rowCount}`);
-    };
-    if (diffStyle === 'unified' && !Array.isArray(columns)) {
-      applySpan(columns);
-    } else if (diffStyle === 'split' && Array.isArray(columns)) {
-      applySpan(columns[0]);
-      applySpan(columns[1]);
-    } else {
-      throw new Error('dun fuuuuked up');
-    }
+    column?.gutter.style.setProperty('grid-row', `span ${rowCount}`);
+    column?.content.style.setProperty('grid-row', `span ${rowCount}`);
   }
 
   private trimColumnRows(
-    columns: ColumnElements | undefined,
+    columns: ColumnElements,
     preTrimCount: number,
     postTrimStart: number
   ): number {
@@ -3687,9 +3121,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     let pendingMetadataTrim = false;
     const hasPostTrim = postTrimStart >= 0;
 
-    if (columns == null) {
-      return 0;
-    }
     const contentChildren = Array.from(columns.content.children);
     const gutterChildren = Array.from(columns.gutter.children);
     if (contentChildren.length !== gutterChildren.length) {
@@ -3727,10 +3158,19 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         }
       }
 
-      // If we found a line element, lets trim it if necessary
-      if (
+      // Line rows count towards line indices; separators, annotations and
+      // noNewline metadata rows are trimmed alongside them but do not.
+      const isLine =
         'lineIndex' in gutterElement.dataset &&
-        'lineIndex' in contentElement.dataset
+        'lineIndex' in contentElement.dataset;
+      if (
+        isLine ||
+        ('separator' in gutterElement.dataset &&
+          'separator' in contentElement.dataset) ||
+        (gutterElement.dataset.gutterBuffer === 'annotation' &&
+          'lineAnnotation' in contentElement.dataset) ||
+        (gutterElement.dataset.gutterBuffer === 'metadata' &&
+          'noNewline' in contentElement.dataset)
       ) {
         if (
           preTrimCount > 0 ||
@@ -3738,61 +3178,14 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         ) {
           gutterElement.remove();
           contentElement.remove();
-          if (preTrimCount > 0) {
+          rowCount++;
+          if (isLine && preTrimCount > 0) {
             preTrimCount--;
-            if (preTrimCount === 0) {
-              pendingMetadataTrim = true;
-            }
+            pendingMetadataTrim = preTrimCount === 0;
           }
-          rowCount++;
         }
-        visibleLineIndex++;
-        continue;
-      }
-
-      // Separators should be removed, but don't count towards line indices
-      if (
-        'separator' in gutterElement.dataset &&
-        'separator' in contentElement.dataset
-      ) {
-        if (
-          preTrimCount > 0 ||
-          (hasPostTrim && visibleLineIndex >= postTrimStart)
-        ) {
-          gutterElement.remove();
-          contentElement.remove();
-          rowCount++;
-        }
-        continue;
-      }
-
-      // Annotations should be removed, but don't count towards line indices
-      if (
-        gutterElement.dataset.gutterBuffer === 'annotation' &&
-        'lineAnnotation' in contentElement.dataset
-      ) {
-        if (
-          preTrimCount > 0 ||
-          (hasPostTrim && visibleLineIndex >= postTrimStart)
-        ) {
-          gutterElement.remove();
-          contentElement.remove();
-          rowCount++;
-        }
-        continue;
-      }
-
-      if (
-        gutterElement.dataset.gutterBuffer === 'metadata' &&
-        'noNewline' in contentElement.dataset
-      ) {
-        if (
-          preTrimCount > 0 ||
-          (hasPostTrim && visibleLineIndex >= postTrimStart)
-        ) {
-          gutterElement.remove();
-          contentElement.remove();
-          rowCount++;
+        if (isLine) {
+          visibleLineIndex++;
         }
         continue;
       }
@@ -3805,39 +3198,29 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
         if (totalRows == null) {
           throw new Error('FileDiff.trimColumnRows: invalid element');
         }
+        // Buffers are never empty, so they shrink until fully trimmed.
+        let rowsToRemove = 0;
         if (preTrimCount > 0) {
-          const rowsToRemove = Math.min(preTrimCount, totalRows);
-          const newSize = totalRows - rowsToRemove;
-          if (newSize > 0) {
-            this.updateBufferSize(gutterElement, newSize);
-            this.updateBufferSize(contentElement, newSize);
-            rowCount += rowsToRemove;
-          } else {
-            gutterElement.remove();
-            contentElement.remove();
-            rowCount += totalRows;
-          }
+          rowsToRemove = Math.min(preTrimCount, totalRows);
           preTrimCount -= rowsToRemove;
-          if (preTrimCount === 0 && newSize === 0) {
-            pendingMetadataTrim = true;
-          }
+          pendingMetadataTrim =
+            preTrimCount === 0 && rowsToRemove === totalRows;
         }
         // If we are in a post clip era...
         else if (hasPostTrim) {
-          const bufferStart = visibleLineIndex;
-          const bufferEnd = visibleLineIndex + totalRows - 1;
-          if (postTrimStart <= bufferStart) {
-            gutterElement.remove();
-            contentElement.remove();
-            rowCount += totalRows;
-          } else if (postTrimStart <= bufferEnd) {
-            const rowsToRemove = bufferEnd - postTrimStart + 1;
-            const newSize = totalRows - rowsToRemove;
-            this.updateBufferSize(gutterElement, newSize);
-            this.updateBufferSize(contentElement, newSize);
-            rowCount += rowsToRemove;
-          }
+          rowsToRemove = Math.min(
+            Math.max(visibleLineIndex + totalRows - postTrimStart, 0),
+            totalRows
+          );
         }
+        if (rowsToRemove >= totalRows) {
+          gutterElement.remove();
+          contentElement.remove();
+        } else if (rowsToRemove > 0) {
+          this.updateBufferSize(gutterElement, totalRows - rowsToRemove);
+          this.updateBufferSize(contentElement, totalRows - rowsToRemove);
+        }
+        rowCount += rowsToRemove;
         visibleLineIndex += totalRows;
         continue;
       }
@@ -3849,67 +3232,8 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     return rowCount;
   }
 
-  private trimColumns({
-    columns,
-    diffStyle,
-    overlapEnd,
-    overlapStart,
-    previousStart,
-    trimEnd,
-    trimStart,
-    // NOTE(amadeus): If we return -1 it means something went wrong
-    // with the trim...
-    // oxlint-disable-next-line no-redundant-type-constituents
-  }: TrimColumnsToOverlapProps): number | -1 {
-    const preTrimCount = Math.max(0, overlapStart - previousStart);
-    const postTrimStart = overlapEnd - previousStart;
-    if (postTrimStart < 0) {
-      throw new Error('FileDiff.trimColumns: overlap ends before previous');
-    }
-    const shouldTrimStart = trimStart > 0;
-    const shouldTrimEnd = trimEnd > 0;
-    if (!shouldTrimStart && !shouldTrimEnd) {
-      return 0;
-    }
-    const effectivePreTrimCount = shouldTrimStart ? preTrimCount : 0;
-    const effectivePostTrimStart = shouldTrimEnd ? postTrimStart : -1;
-
-    if (diffStyle === 'unified' && !Array.isArray(columns)) {
-      const removedRows = this.trimColumnRows(
-        columns,
-        effectivePreTrimCount,
-        effectivePostTrimStart
-      );
-      return removedRows;
-    } else if (diffStyle === 'split' && Array.isArray(columns)) {
-      const deletionsTrim = this.trimColumnRows(
-        columns[0],
-        effectivePreTrimCount,
-        effectivePostTrimStart
-      );
-      const additionsTrim = this.trimColumnRows(
-        columns[1],
-        effectivePreTrimCount,
-        effectivePostTrimStart
-      );
-      // We should avoid the trim validation if we are split but
-      // there's only one side
-      if (
-        columns[0] != null &&
-        columns[1] != null &&
-        deletionsTrim !== additionsTrim
-      ) {
-        throw new Error('FileDiff.trimColumns: split columns out of sync');
-      }
-      return columns[0] != null ? deletionsTrim : additionsTrim;
-    } else {
-      console.error({ diffStyle, columns });
-      throw new Error('FileDiff.trimColumns: Invalid columns for diffType');
-    }
-  }
-
   private getBufferSize(properties: DOMStringMap): number | undefined {
-    const parsed = Number.parseInt(properties?.bufferSize ?? '', 10);
+    const parsed = Number.parseInt(properties.bufferSize ?? '', 10);
     return Number.isNaN(parsed) ? undefined : parsed;
   }
 
@@ -3938,24 +3262,17 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     return { gutter, content };
   }
 
-  private getCodeColumns(
-    diffStyle: 'split' | 'unified',
-    codeUnified: HTMLElement | undefined,
-    codeDeletions: HTMLElement | undefined,
-    codeAdditions: HTMLElement | undefined
-  ):
-    | [ColumnElements | undefined, ColumnElements | undefined]
-    | ColumnElements
-    | undefined {
-    if (diffStyle === 'unified') {
-      return this.getColumnPair(codeUnified);
-    } else {
-      const deletions = this.getColumnPair(codeDeletions);
-      const additions = this.getColumnPair(codeAdditions);
-      return deletions != null || additions != null
-        ? [deletions, additions]
-        : undefined;
-    }
+  // The rendered gutter/content pair of each code column for the current
+  // diff style, or undefined when none exist.
+  private getCodeColumns(): CodeColumn[] | undefined {
+    const columns: CodeColumn[] =
+      this.options.diffStyle === 'unified'
+        ? [['unified', this.getColumnPair(this.codeUnified)]]
+        : [
+            ['deletions', this.getColumnPair(this.codeDeletions)],
+            ['additions', this.getColumnPair(this.codeAdditions)],
+          ];
+    return columns.some(([, column]) => column != null) ? columns : undefined;
   }
 
   protected updateBuffers(renderRange: RenderRange): void {
@@ -3968,50 +3285,42 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     pre: HTMLPreElement,
     renderRange: RenderRange | undefined
   ) {
-    if (renderRange == null || this.shouldDisableVirtualizationBuffers()) {
-      if (this.bufferBefore != null) {
-        this.bufferBefore.remove();
-        this.bufferBefore = undefined;
-      }
-      if (this.bufferAfter != null) {
-        this.bufferAfter.remove();
-        this.bufferAfter = undefined;
-      }
-      return;
-    }
+    const enabled =
+      renderRange != null && !this.shouldDisableVirtualizationBuffers();
     // NOTE(amadeus): A very hacky pass at buffers outside the pre elements...
     // i may need to improve this...
-    if (renderRange.bufferBefore > 0) {
-      if (this.bufferBefore == null) {
-        this.bufferBefore = document.createElement('div');
-        this.bufferBefore.dataset.virtualizerBuffer = 'before';
-        pre.before(this.bufferBefore);
+    const applyBuffer = (
+      buffer: HTMLElement | undefined,
+      side: 'before' | 'after',
+      height: number
+    ): HTMLElement | undefined => {
+      if (enabled && height > 0) {
+        if (buffer == null) {
+          buffer = document.createElement('div');
+          buffer.dataset.virtualizerBuffer = side;
+          if (side === 'before') {
+            pre.before(buffer);
+          } else {
+            pre.after(buffer);
+          }
+        }
+        buffer.style.setProperty('height', `${height}px`);
+        buffer.style.setProperty('contain', 'strict');
+        return buffer;
       }
-      this.bufferBefore.style.setProperty(
-        'height',
-        `${renderRange.bufferBefore}px`
-      );
-      this.bufferBefore.style.setProperty('contain', 'strict');
-    } else if (this.bufferBefore != null) {
-      this.bufferBefore.remove();
-      this.bufferBefore = undefined;
-    }
-
-    if (renderRange.bufferAfter > 0) {
-      if (this.bufferAfter == null) {
-        this.bufferAfter = document.createElement('div');
-        this.bufferAfter.dataset.virtualizerBuffer = 'after';
-        pre.after(this.bufferAfter);
-      }
-      this.bufferAfter.style.setProperty(
-        'height',
-        `${renderRange.bufferAfter}px`
-      );
-      this.bufferAfter.style.setProperty('contain', 'strict');
-    } else if (this.bufferAfter != null) {
-      this.bufferAfter.remove();
-      this.bufferAfter = undefined;
-    }
+      buffer?.remove();
+      return undefined;
+    };
+    this.bufferBefore = applyBuffer(
+      this.bufferBefore,
+      'before',
+      renderRange?.bufferBefore ?? 0
+    );
+    this.bufferAfter = applyBuffer(
+      this.bufferAfter,
+      'after',
+      renderRange?.bufferAfter ?? 0
+    );
   }
 
   protected shouldDisableVirtualizationBuffers(): boolean {
@@ -4050,7 +3359,18 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
     this.appliedPreAttributes = preProperties;
   }
 
-  private applyErrorToDOM(error: Error, container: HTMLElement) {
+  private handleRenderError(
+    error: unknown,
+    container: HTMLElement,
+    disableErrorHandling: boolean
+  ) {
+    if (disableErrorHandling) {
+      throw error;
+    }
+    console.error(error);
+    if (!(error instanceof Error)) {
+      return;
+    }
     this.cleanupErrorWrapper();
     this.pre?.remove();
     this.pre = undefined;
@@ -4077,20 +3397,6 @@ export class FileDiff<LAnnotation = undefined, Caret = undefined> {
   }
 }
 
-interface HasContentProps {
-  fileDiff: FileDiffMetadata | undefined;
-  oldFile: FileContents | null | undefined;
-  newFile: FileContents | null | undefined;
-}
-
-function getAdditionFile(fileDiff: FileDiffMetadata): FileContents {
-  return {
-    name: fileDiff.name,
-    lang: fileDiff.lang,
-    contents: fileDiff.additionLines.join(''),
-  };
-}
-
 function areOptionalFilesEqual(
   fileA: FileContents | null | undefined,
   fileB: FileContents | null | undefined
@@ -4099,42 +3405,6 @@ function areOptionalFilesEqual(
     return fileA == null && fileB == null;
   }
   return areFilesEqual(fileA, fileB);
-}
-
-function hasDiffContent({
-  fileDiff,
-  oldFile,
-  newFile,
-}: HasContentProps): boolean {
-  return (
-    (fileDiff != null && fileDiff.hunks.length > 0) ||
-    oldFile != null ||
-    newFile != null
-  );
-}
-
-function hasDiffHeaderContent({
-  fileDiff,
-  oldFile,
-  newFile,
-}: HasContentProps): boolean {
-  return fileDiff != null || oldFile != null || newFile != null;
-}
-
-function shouldRenderCode(
-  pre: HTMLPreElement | undefined,
-  hasContent: boolean,
-  collapsed = false
-): boolean {
-  return !collapsed && pre == null && hasContent;
-}
-
-function shouldRenderHeader(
-  headerElement: HTMLElement | undefined,
-  hasContent: boolean,
-  disableFileHeader = false
-): boolean {
-  return headerElement == null && hasContent && !disableFileHeader;
 }
 
 function getElementChildren(

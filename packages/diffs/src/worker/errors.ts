@@ -33,10 +33,8 @@ export class WorkerPoolWorkerError extends Error {
 // Track errors passed to onWorkerError without adding fields to the errors.
 const reportedWorkerErrors = new WeakSet<WorkerPoolWorkerError>();
 
-/**
- * Mark a worker error as reported so the pool and its consumers do not log it
- * again. Used internally by the pool; not exported from the package entry.
- */
+// Mark a worker error as reported so the pool and its consumers do not log it
+// again. Used internally by the pool; not exported from the package entry.
 export function markWorkerErrorReported(error: WorkerPoolWorkerError): void {
   reportedWorkerErrors.add(error);
 }

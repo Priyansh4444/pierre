@@ -23,16 +23,12 @@ export function resolveHighlighterType(
   return type ?? activeType ?? DEFAULT_HIGHLIGHTER;
 }
 
-export function assertHighlighterType(type: HighlighterTypes): void {
+export function acquireHighlighterType(type: HighlighterTypes): void {
   if (activeType != null && activeType !== type) {
     throw new Error(
       `Cannot load the "${type}" highlighter while "${activeType}" is in use. Only one highlighter type can be active at a time; dispose every "${activeType}" instance (disposeHighlighter() disposes the shared one) before switching.`
     );
   }
-}
-
-export function acquireHighlighterType(type: HighlighterTypes): void {
-  assertHighlighterType(type);
   activeType = type;
   holds++;
 }

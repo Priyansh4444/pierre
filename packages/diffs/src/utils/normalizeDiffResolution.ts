@@ -12,9 +12,7 @@ export function normalizeDiffResolution(
     | ConflictResolverTypes
     | DiffAcceptRejectHunkConfig
 ): 'deletions' | 'additions' | 'both' {
-  const type = (() => {
-    return typeof options === 'string' ? options : options.type;
-  })();
+  const type = typeof options === 'string' ? options : options.type;
 
   return type === 'accept' || type === 'incoming'
     ? 'additions'

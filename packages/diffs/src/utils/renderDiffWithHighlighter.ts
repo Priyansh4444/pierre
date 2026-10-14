@@ -1,17 +1,15 @@
-import { type ChangeObject, diffChars, diffWordsWithSpace } from 'diff';
+import { diffChars, diffWordsWithSpace } from 'diff';
 
 import { DEFAULT_COLLAPSED_CONTEXT_THRESHOLD } from '../constants';
 import type {
   DecorationItem,
   DiffsHighlighter,
-  FileContents,
   FileDiffMetadata,
   ForceDiffPlainTextOptions,
   LineDiffTypes,
   LineInfo,
   RenderDiffFilesResult,
   RenderDiffOptions,
-  SupportedLanguages,
   ThemedDiffResult,
 } from '../types';
 import { appendItems } from './appendItems';
@@ -27,10 +25,6 @@ import {
 import { renderTokenLines } from './renderTokenLines';
 import { setDeferredArrayItem } from './setDeferredArrayItem';
 
-const DEFAULT_PLAIN_TEXT_OPTIONS: ForceDiffPlainTextOptions = {
-  forcePlainText: false,
-};
-
 export function renderDiffWithHighlighter(
   diff: FileDiffMetadata,
   highlighter: DiffsHighlighter,
@@ -42,7 +36,7 @@ export function renderDiffWithHighlighter(
     totalLines,
     expandedHunks,
     collapsedContextThreshold = DEFAULT_COLLAPSED_CONTEXT_THRESHOLD,
-  }: ForceDiffPlainTextOptions = DEFAULT_PLAIN_TEXT_OPTIONS
+  }: ForceDiffPlainTextOptions = { forcePlainText: false }
 ): ThemedDiffResult {
   if (forcePlainText) {
     startingLine ??= 0;
@@ -79,22 +73,20 @@ export function renderDiffWithHighlighter(
     additionLines: [],
   };
 
-  const { maxLineDiffLength } = options;
+  const {
+    maxLineDiffLength,
+    theme,
+    useTokenTransformer,
+    tokenizeMaxLineLength,
+  } = options;
   const shouldGroupAll = !forcePlainText && !diff.isPartial;
-  const expandedHunksForIteration = forcePlainText ? expandedHunks : undefined;
   const buckets = new Map<number, RenderBucket>();
-  function getBucketForHunk(hunkIndex: number) {
-    const index = shouldGroupAll ? 0 : hunkIndex;
-    const bucket = buckets.get(index) ?? createBucket();
-    buckets.set(index, bucket);
-    return bucket;
-  }
 
   function appendContent(
     lineContent: string,
     lineIndex: number,
     segments: HighlightSegment[],
-    contentWrapper: FakeArrayType
+    contentWrapper: LineContentBuffer
   ) {
     if (isWindowedHighlight) {
       let segment = segments.at(-1);
@@ -119,26 +111,38 @@ export function renderDiffWithHighlighter(
     diffStyle: 'both',
     startingLine,
     totalLines,
-    expandedHunks: isWindowedHighlight ? expandedHunksForIteration : true,
+    // Only plain text renders can be windowed
+    expandedHunks: isWindowedHighlight ? expandedHunks : true,
     collapsedContextThreshold,
     callback: ({ hunkIndex, additionLine, deletionLine, type }) => {
-      const bucket = getBucketForHunk(hunkIndex);
+      const bucketIndex = shouldGroupAll ? 0 : hunkIndex;
+      let bucket = buckets.get(bucketIndex);
+      if (bucket == null) {
+        bucket = {
+          deletionContent: new LineContentBuffer(),
+          additionContent: new LineContentBuffer(),
+          deletionInfo: [],
+          additionInfo: [],
+          deletionDecorations: [],
+          additionDecorations: [],
+          deletionSegments: [],
+          additionSegments: [],
+        };
+        buckets.set(bucketIndex, bucket);
+      }
       const splitLineIndex =
         additionLine != null
           ? additionLine.splitLineIndex
           : deletionLine.splitLineIndex;
 
       if (type === 'change' && additionLine != null && deletionLine != null) {
-        computeLineDiffDecorations({
-          additionLine: diff.additionLines[additionLine.lineIndex],
-          deletionLine: diff.deletionLines[deletionLine.lineIndex],
-          deletionLineIndex: bucket.deletionContent.length,
-          additionLineIndex: bucket.additionContent.length,
-          deletionDecorations: bucket.deletionDecorations,
-          additionDecorations: bucket.additionDecorations,
+        computeLineDiffDecorations(
+          diff.deletionLines[deletionLine.lineIndex],
+          diff.additionLines[additionLine.lineIndex],
+          bucket,
           lineDiffType,
-          maxLineDiffLength,
-        });
+          maxLineDiffLength
+        );
       }
 
       if (deletionLine != null) {
@@ -179,6 +183,33 @@ export function renderDiffWithHighlighter(
     },
   });
 
+  const languageOverride = forcePlainText ? 'text' : diff.lang;
+  const renderFile = (
+    name: string,
+    contents: string,
+    lineInfo: (LineInfo | undefined)[],
+    decorations: DecorationItem[]
+  ): RenderDiffFilesResult['additionLines'] =>
+    contents === ''
+      ? []
+      : renderTokenLines(
+          highlighter.codeToTokens(
+            cleanLastNewline(contents),
+            getTokenOptions(
+              languageOverride ?? getFiletypeFromFileName(name),
+              theme,
+              tokenizeMaxLineLength
+            )
+          ).tokens,
+          {
+            state: { lineInfo },
+            useTokenTransformer,
+            decorations,
+            lazyLineAST,
+            cacheHtmlStyles: highlighter.name === 'highlights',
+          }
+        );
+
   for (const bucket of buckets.values()) {
     if (
       bucket.deletionContent.length === 0 &&
@@ -187,28 +218,18 @@ export function renderDiffWithHighlighter(
       continue;
     }
 
-    const deletionFile = {
-      name: diff.prevName ?? diff.name,
-      contents: bucket.deletionContent.value,
-    };
-    const additionFile = {
-      name: diff.name,
-      contents: bucket.additionContent.value,
-    };
-    const { deletionLines, additionLines } = renderTwoFiles({
-      deletionFile,
-      deletionInfo: bucket.deletionInfo,
-      deletionDecorations: bucket.deletionDecorations,
-
-      additionFile,
-      additionInfo: bucket.additionInfo,
-      additionDecorations: bucket.additionDecorations,
-
-      highlighter,
-      options,
-      languageOverride: forcePlainText ? 'text' : diff.lang,
-      lazyLineAST,
-    });
+    const deletionLines = renderFile(
+      diff.prevName ?? diff.name,
+      bucket.deletionContent.value,
+      bucket.deletionInfo,
+      bucket.deletionDecorations
+    );
+    const additionLines = renderFile(
+      diff.name,
+      bucket.additionContent.value,
+      bucket.additionInfo,
+      bucket.additionDecorations
+    );
 
     if (shouldGroupAll) {
       code.deletionLines = deletionLines;
@@ -241,86 +262,20 @@ export function renderDiffWithHighlighter(
   return { code, themeStyles, baseThemeType };
 }
 
-// The line indexes and decoration arrays a line diff writes its highlights to
-interface LineDiffDecorationTargets {
-  deletionLineIndex: number;
-  additionLineIndex: number;
-  deletionDecorations: DecorationItem[];
-  additionDecorations: DecorationItem[];
-}
-
-interface ProcessLineDiffProps extends LineDiffDecorationTargets {
-  deletionLine: string | undefined;
-  additionLine: string | undefined;
-  lineDiffType: LineDiffTypes;
-  maxLineDiffLength: number;
-}
-
-// Push one decoration per side covering the first through last changed
-// token, so each line only has one highlight. Offsets come straight from the
-// diff items, skipping the span arrays the other word modes build.
-function pushWordLineDecorations(
-  lineDiff: ChangeObject<string>[],
-  {
-    deletionLineIndex,
-    additionLineIndex,
-    deletionDecorations,
-    additionDecorations,
-  }: LineDiffDecorationTargets
+// Adds the inline diff highlights of a changed line pair to the bucket.
+function computeLineDiffDecorations(
+  deletionLine: string | undefined,
+  additionLine: string | undefined,
+  bucket: RenderBucket,
+  lineDiffType: LineDiffTypes,
+  maxLineDiffLength: number
 ): void {
-  let deletionOffset = 0;
-  let additionOffset = 0;
-  let deletionStart = -1;
-  let deletionEnd = 0;
-  let additionStart = -1;
-  let additionEnd = 0;
-  for (const { value, added, removed } of lineDiff) {
-    if (removed) {
-      if (deletionStart === -1) deletionStart = deletionOffset;
-      deletionOffset += value.length;
-      deletionEnd = deletionOffset;
-    } else if (added) {
-      if (additionStart === -1) additionStart = additionOffset;
-      additionOffset += value.length;
-      additionEnd = additionOffset;
-    } else {
-      deletionOffset += value.length;
-      additionOffset += value.length;
-    }
-  }
-  if (deletionStart !== -1) {
-    deletionDecorations.push(
-      createDiffSpanDecoration({
-        line: deletionLineIndex,
-        spanStart: deletionStart,
-        spanLength: deletionEnd - deletionStart,
-      })
-    );
-  }
-  if (additionStart !== -1) {
-    additionDecorations.push(
-      createDiffSpanDecoration({
-        line: additionLineIndex,
-        spanStart: additionStart,
-        spanLength: additionEnd - additionStart,
-      })
-    );
-  }
-}
-
-function computeLineDiffDecorations({
-  deletionLine,
-  additionLine,
-  deletionLineIndex,
-  additionLineIndex,
-  deletionDecorations,
-  additionDecorations,
-  lineDiffType,
-  maxLineDiffLength,
-}: ProcessLineDiffProps) {
   if (deletionLine == null || additionLine == null || lineDiffType === 'none') {
     return;
   }
+  // NOTE(amadeus): Because we visually trim trailing newlines when rendering,
+  // we also gotta make sure the diff parsing doesn't include the newline
+  // character that could be there...
   deletionLine = cleanLastNewline(deletionLine);
   additionLine = cleanLastNewline(additionLine);
   // If we have really long lines, we probably shouldn't compute diffs on them.
@@ -330,22 +285,60 @@ function computeLineDiffDecorations({
   ) {
     return;
   }
-  // NOTE(amadeus): Because we visually trim trailing newlines when rendering,
-  // we also gotta make sure the diff parsing doesn't include the newline
-  // character that could be there...
   const lineDiff =
     lineDiffType === 'char'
       ? diffChars(deletionLine, additionLine)
       : diffWordsWithSpace(deletionLine, additionLine);
+  // The bucket line each highlight lands on
+  const deletionLineIndex = bucket.deletionContent.length;
+  const additionLineIndex = bucket.additionContent.length;
+  const { deletionDecorations, additionDecorations } = bucket;
+
   if (lineDiffType === 'word-line') {
-    pushWordLineDecorations(lineDiff, {
-      deletionLineIndex,
-      additionLineIndex,
-      deletionDecorations,
-      additionDecorations,
-    });
+    // Push one decoration per side covering the first through last changed
+    // token, so each line only has one highlight. Offsets come straight from
+    // the diff items, skipping the span arrays the other word modes build.
+    let deletionOffset = 0;
+    let additionOffset = 0;
+    let deletionStart = -1;
+    let deletionEnd = 0;
+    let additionStart = -1;
+    let additionEnd = 0;
+    for (const { value, added, removed } of lineDiff) {
+      if (removed) {
+        if (deletionStart === -1) deletionStart = deletionOffset;
+        deletionOffset += value.length;
+        deletionEnd = deletionOffset;
+      } else if (added) {
+        if (additionStart === -1) additionStart = additionOffset;
+        additionOffset += value.length;
+        additionEnd = additionOffset;
+      } else {
+        deletionOffset += value.length;
+        additionOffset += value.length;
+      }
+    }
+    if (deletionStart !== -1) {
+      deletionDecorations.push(
+        createDiffSpanDecoration({
+          line: deletionLineIndex,
+          spanStart: deletionStart,
+          spanLength: deletionEnd - deletionStart,
+        })
+      );
+    }
+    if (additionStart !== -1) {
+      additionDecorations.push(
+        createDiffSpanDecoration({
+          line: additionLineIndex,
+          spanStart: additionStart,
+          spanLength: additionEnd - additionStart,
+        })
+      );
+    }
     return;
   }
+
   const deletionSpans: [0 | 1, string][] = [];
   const additionSpans: [0 | 1, string][] = [];
   const enableJoin = lineDiffType === 'word-alt';
@@ -367,37 +360,32 @@ function computeLineDiffDecorations({
         isNeutral: true,
         isLastItem,
       });
-    } else if (item.removed) {
-      pushOrJoinSpan({ item, arr: deletionSpans, enableJoin, isLastItem });
     } else {
-      pushOrJoinSpan({ item, arr: additionSpans, enableJoin, isLastItem });
+      pushOrJoinSpan({
+        item,
+        arr: item.removed ? deletionSpans : additionSpans,
+        enableJoin,
+        isLastItem,
+      });
     }
   }
-  let spanIndex = 0;
-  for (const span of deletionSpans) {
-    if (span[0] === 1) {
-      deletionDecorations.push(
-        createDiffSpanDecoration({
-          line: deletionLineIndex,
-          spanStart: spanIndex,
-          spanLength: span[1].length,
-        })
-      );
+  for (const [spans, line, decorations] of [
+    [deletionSpans, deletionLineIndex, deletionDecorations],
+    [additionSpans, additionLineIndex, additionDecorations],
+  ] as const) {
+    let spanStart = 0;
+    for (const [isChanged, text] of spans) {
+      if (isChanged === 1) {
+        decorations.push(
+          createDiffSpanDecoration({
+            line,
+            spanStart,
+            spanLength: text.length,
+          })
+        );
+      }
+      spanStart += text.length;
     }
-    spanIndex += span[1].length;
-  }
-  spanIndex = 0;
-  for (const span of additionSpans) {
-    if (span[0] === 1) {
-      additionDecorations.push(
-        createDiffSpanDecoration({
-          line: additionLineIndex,
-          spanStart: spanIndex,
-          spanLength: span[1].length,
-        })
-      );
-    }
-    spanIndex += span[1].length;
   }
 }
 
@@ -410,102 +398,23 @@ interface HighlightSegment {
   count: number;
 }
 
-interface FakeArrayType {
-  push(value: string): void;
-  value: string;
-  length: number;
+// Joins line contents into one string while counting the lines.
+class LineContentBuffer {
+  value = '';
+  length = 0;
+  push(value: string): void {
+    this.value += value;
+    this.length++;
+  }
 }
 
 interface RenderBucket {
-  deletionContent: FakeArrayType;
-  additionContent: FakeArrayType;
+  deletionContent: LineContentBuffer;
+  additionContent: LineContentBuffer;
   deletionInfo: (LineInfo | undefined)[];
   additionInfo: (LineInfo | undefined)[];
   deletionDecorations: DecorationItem[];
   additionDecorations: DecorationItem[];
   deletionSegments: HighlightSegment[];
   additionSegments: HighlightSegment[];
-}
-
-function createBucket(): RenderBucket {
-  return {
-    deletionContent: {
-      push(value: string) {
-        this.value += value;
-        this.length++;
-      },
-      value: '',
-      length: 0,
-    },
-    additionContent: {
-      push(value: string) {
-        this.value += value;
-        this.length++;
-      },
-      value: '',
-      length: 0,
-    },
-    deletionInfo: [],
-    additionInfo: [],
-    deletionDecorations: [],
-    additionDecorations: [],
-    deletionSegments: [],
-    additionSegments: [],
-  };
-}
-
-interface RenderTwoFilesProps {
-  lazyLineAST: boolean;
-  deletionFile: FileContents;
-  additionFile: FileContents;
-  deletionInfo: (LineInfo | undefined)[];
-  additionInfo: (LineInfo | undefined)[];
-  deletionDecorations: DecorationItem[];
-  additionDecorations: DecorationItem[];
-  options: RenderDiffOptions;
-  highlighter: DiffsHighlighter;
-  languageOverride: SupportedLanguages | undefined;
-}
-
-function renderTwoFiles({
-  lazyLineAST,
-  deletionFile,
-  additionFile,
-  deletionInfo,
-  additionInfo,
-  highlighter,
-  deletionDecorations,
-  additionDecorations,
-  languageOverride,
-  options: { theme, useTokenTransformer, tokenizeMaxLineLength },
-}: RenderTwoFilesProps): RenderDiffFilesResult {
-  const renderFile = (
-    file: FileContents,
-    lineInfo: (LineInfo | undefined)[],
-    decorations: DecorationItem[]
-  ): RenderDiffFilesResult['additionLines'] => {
-    if (file.contents === '') return [];
-    return renderTokenLines(
-      highlighter.codeToTokens(
-        cleanLastNewline(file.contents),
-        getTokenOptions(
-          languageOverride ?? getFiletypeFromFileName(file.name),
-          theme,
-          tokenizeMaxLineLength
-        )
-      ).tokens,
-      {
-        state: { lineInfo },
-        useTokenTransformer,
-        decorations,
-        lazyLineAST,
-        cacheHtmlStyles: highlighter.name === 'highlights',
-      }
-    );
-  };
-
-  return {
-    deletionLines: renderFile(deletionFile, deletionInfo, deletionDecorations),
-    additionLines: renderFile(additionFile, additionInfo, additionDecorations),
-  };
 }

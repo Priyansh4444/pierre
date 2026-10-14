@@ -18,16 +18,13 @@ export function upsertHostThemeStyle({
     return undefined;
   }
 
-  currentNode ??= createHostThemeStyleNode();
+  if (currentNode == null) {
+    currentNode = document.createElement('style');
+    currentNode.setAttribute(THEME_CSS_ATTRIBUTE, '');
+  }
   currentNode.textContent = themeCSS;
   if (currentNode.parentNode !== shadowRoot) {
     shadowRoot.appendChild(currentNode);
   }
   return currentNode;
-}
-
-export function createHostThemeStyleNode(): HTMLStyleElement {
-  const node = document.createElement('style');
-  node.setAttribute(THEME_CSS_ATTRIBUTE, '');
-  return node;
 }

@@ -27,7 +27,7 @@ export function areObjectsEqual<T extends object>(
 
   // If we got any remaining keys that aren't omitted in objB,
   // then we gotta return false
-  for (const key of Array.from(keysBSet)) {
+  for (const key of keysBSet) {
     if (!omitSet.has(key)) {
       return false;
     }

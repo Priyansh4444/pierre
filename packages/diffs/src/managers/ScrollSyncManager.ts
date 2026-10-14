@@ -32,7 +32,7 @@ export class ScrollSyncManager {
     // If no code elements were provided, lets try to find them in
     // the pre element
     if (codeDeletions == null || codeAdditions == null) {
-      for (const element of pre.children ?? []) {
+      for (const element of pre.children) {
         if (!(element instanceof HTMLElement)) {
           continue;
         }

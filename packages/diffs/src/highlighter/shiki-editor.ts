@@ -17,12 +17,12 @@ import type { DiffsHighlighter } from './types';
 const TOKENIZE_TIME_LIMIT = 0;
 let nextTokenizerId = 0;
 
-/** TextMate state caching and background work for a single editable document. */
+// TextMate state caching and background work for a single editable document.
 export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
   #highlighter: HighlighterCore;
   #grammar: IGrammar | undefined;
   #themeName: string;
-  #colorMap: string[];
+  #colorMap: string[] = [];
   #textDocument: DiffsEditorTokenizerOptions['textDocument'];
   #tokenizeMaxLineLength: number;
   #onDeferTokenize: DiffsEditorTokenizerOptions['onDeferTokenize'];
@@ -45,7 +45,6 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
   #backgroundChangedLineRanges: readonly [number, number][] | undefined;
   #backgroundChangedRangeIndex: number = 0;
   #bracketIgnoredRanges: ([number, number][] | null | undefined)[] = [];
-  #isMessageListenerAttached: boolean = false;
 
   #prebuildStateStack = debounce(async (renderRange?: RenderRange) => {
     // A queued timer may run after the highlighter is disposed.
@@ -73,21 +72,24 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
     this.#scheduleStatePrebuild(endLine);
   }, 500);
 
-  #onMessage = ({ data }: MessageEvent<unknown>) => {
-    if (typeof data !== 'object' || data === null) {
-      return;
-    }
-    const { type, tokenizerId, jobId } = data as {
-      type?: unknown;
-      tokenizerId?: unknown;
-      jobId?: unknown;
-    };
+  // Attached exactly while a background job is not stopped.
+  #onMessage = ({
+    data,
+  }: MessageEvent<
+    | { type?: unknown; tokenizerId?: unknown; jobId?: unknown }
+    | null
+    | undefined
+  >) => {
+    const jobId = this.#backgroundJobId;
     if (
-      type === 'tokenize' &&
-      tokenizerId === this.#tokenizerId &&
-      typeof jobId === 'number' &&
-      jobId === this.#backgroundJobId
+      data?.type === 'tokenize' &&
+      data.tokenizerId === this.#tokenizerId &&
+      data.jobId === jobId &&
+      !this.#isStopped &&
+      !this.#isPaused &&
+      this.#grammar != null
     ) {
+      this.#ensureActiveTheme();
       if (this.#backgroundPrebuildEndLine >= 0) {
         this.#backgroundPrebuild(jobId);
       } else {
@@ -130,7 +132,6 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
     this.#highlighter = highlighter;
     this.#textDocument = options.textDocument;
     this.#themeName = options.theme;
-    this.#colorMap = [];
     // The cutoff must match codeToTokens and Highlights: length >= limit.
     this.#tokenizeMaxLineLength = options.tokenizeMaxLineLength ?? 1000;
     this.#onDeferTokenize = options.onDeferTokenize;
@@ -146,9 +147,7 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
     this.#ensureActiveTheme();
     this.stopBackgroundTokenize();
     this.#stateStack = [INITIAL];
-    this.#comparisonStateStack = [];
-    this.#comparisonStateStackStart = 0;
-    this.#comparisonLineChanges = [];
+    this.#resetComparisonStateStack();
     if (this.#grammar != null && this.#textDocument.lineCount > 0) {
       this.#scheduleBackgroundTokenize(0);
     }
@@ -169,7 +168,6 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
   dispose(): void {
     this.#isCleanedUp = true;
     this.stopBackgroundTokenize();
-    this.#detachMessageListener();
   }
 
   // Prebuild viewport state with prebuildStateStack before the first edit.
@@ -221,9 +219,7 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
       canReuseCachedStates || renderRange == null || dirtyStart >= viewStart;
     const changedLineRanges: readonly [number, number][] =
       change.changedLineRanges ?? [[dirtyStart, change.endLine]];
-    this.#comparisonStateStack = [];
-    this.#comparisonStateStackStart = 0;
-    this.#comparisonLineChanges = [];
+    this.#resetComparisonStateStack();
     let offscreenSyncEnd = -1;
     if (dirtyStart < viewStart) {
       for (const [rangeStart, rangeEnd] of changedLineRanges) {
@@ -249,8 +245,7 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
 
     let changedRangeIndex = 0;
     let currentChangedRangeEnd = changedLineRanges[changedRangeIndex][1];
-    let backgroundStartLine: number | undefined;
-    let backgroundChangedRangeIndex = 0;
+    let backgroundLine: number | undefined;
     let line = canReuseCachedStates
       ? changedLineRanges[changedRangeIndex][0]
       : viewStart;
@@ -317,8 +312,7 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
           break;
         }
         if (nextRange[0] >= renderRangeEndLine) {
-          backgroundStartLine = nextRange[0];
-          backgroundChangedRangeIndex = changedRangeIndex;
+          backgroundLine = nextRange[0];
           break;
         }
         let nextState: StateStack | undefined = this.#stateStack[nextRange[0]];
@@ -357,7 +351,7 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
       }
     }
 
-    if (settled && canReuseShiftedStates && backgroundStartLine == null) {
+    if (settled && canReuseShiftedStates && backgroundLine == null) {
       for (let stateLine = line + 2; stateLine <= lineCount; stateLine++) {
         const previousState = this.#getPreviousEndState(stateLine);
         if (previousState == null) {
@@ -365,34 +359,22 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
         }
         this.#stateStack[stateLine] = previousState;
       }
-      this.#comparisonStateStack = [];
-      this.#comparisonStateStackStart = 0;
-      this.#comparisonLineChanges = [];
+      this.#resetComparisonStateStack();
     }
 
     if (offscreenDirtyLines != null && offscreenDirtyLines.size > 0) {
       this.#onDeferTokenize(offscreenDirtyLines);
     }
 
-    if (backgroundStartLine != null) {
-      if (this.#matchBrackets && canReuseCachedStates) {
-        this.#bracketIgnoredRanges.length = Math.min(
-          this.#bracketIgnoredRanges.length,
-          backgroundStartLine
-        );
-      }
-      this.#scheduleBackgroundTokenize(
-        backgroundStartLine,
-        changedLineRanges,
-        backgroundChangedRangeIndex
-      );
-    } else if (!settled && line < lineCount) {
-      const backgroundLine =
+    if (backgroundLine == null && !settled && line < lineCount) {
+      backgroundLine =
         crossesRenderRangeEnd && dirtyStart >= viewStart
           ? renderRangeEndLine
           : dirtyStart < viewStart && !canReuseCachedStates
             ? dirtyStart
             : line;
+    }
+    if (backgroundLine != null) {
       if (this.#matchBrackets && canReuseCachedStates) {
         this.#bracketIgnoredRanges.length = Math.min(
           this.#bracketIgnoredRanges.length,
@@ -425,10 +407,8 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
     this.#backgroundPrebuildEndLine = -1;
     this.#backgroundChangedLineRanges = undefined;
     this.#backgroundChangedRangeIndex = 0;
-    this.#comparisonStateStack = [];
-    this.#comparisonStateStackStart = 0;
-    this.#comparisonLineChanges = [];
-    this.#detachMessageListener();
+    this.#resetComparisonStateStack();
+    globalThis.removeEventListener('message', this.#onMessage);
   }
 
   pauseBackgroundTokenize(): void {
@@ -475,22 +455,6 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
     }
   }
 
-  #attachMessageListener(): void {
-    if (this.#isMessageListenerAttached) {
-      return;
-    }
-    globalThis.addEventListener('message', this.#onMessage);
-    this.#isMessageListenerAttached = true;
-  }
-
-  #detachMessageListener(): void {
-    if (!this.#isMessageListenerAttached) {
-      return;
-    }
-    globalThis.removeEventListener('message', this.#onMessage);
-    this.#isMessageListenerAttached = false;
-  }
-
   #postTokenizeMessage(jobId: number): void {
     // use `postMessage` instead of `setTimeout(fn, 0)` to avoid 4ms delay
     globalThis.postMessage({
@@ -520,6 +484,9 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
       });
     }
 
+    if (this.#isStopped) {
+      globalThis.addEventListener('message', this.#onMessage);
+    }
     this.#isStopped = false;
     this.#isPaused = false;
     this.#lastLine = startLine;
@@ -532,7 +499,6 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
     this.#backgroundPrebuildEndLine = -1;
     this.#backgroundChangedLineRanges = changedLineRanges;
     this.#backgroundChangedRangeIndex = changedRangeIndex;
-    this.#attachMessageListener();
     this.#postTokenizeMessage(jobId);
   }
 
@@ -557,15 +523,12 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
       return;
     }
 
+    // Stopping already cleared the pause, pending prebuild and changed ranges.
     const jobId = ++this.#backgroundJobId;
     this.#isStopped = false;
-    this.#isPaused = false;
     this.#lastLine = this.#stateStack.length - 1;
     this.#backgroundPrebuildEndLine = endLine;
-    this.#pendingPrebuildEndLine = -1;
-    this.#backgroundChangedLineRanges = undefined;
-    this.#backgroundChangedRangeIndex = 0;
-    this.#attachMessageListener();
+    globalThis.addEventListener('message', this.#onMessage);
     this.#postTokenizeMessage(jobId);
   }
 
@@ -607,6 +570,12 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
     if (this.#matchBrackets) {
       this.#bracketIgnoredRanges[line] = ranges;
     }
+  }
+
+  #resetComparisonStateStack(): void {
+    this.#comparisonStateStack = [];
+    this.#comparisonStateStackStart = 0;
+    this.#comparisonLineChanges = [];
   }
 
   // Preserve old end states as comparison-only sentinels, copying whichever
@@ -700,16 +669,6 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
   }
 
   #backgroundPrebuild(jobId: number): void {
-    if (
-      this.#isStopped ||
-      this.#isPaused ||
-      this.#grammar == null ||
-      jobId !== this.#backgroundJobId
-    ) {
-      return;
-    }
-
-    this.#ensureActiveTheme();
     // State prebuilds intentionally omit rendered tokens and yield between
     // short chunks so a deep viewport does not monopolize the main thread.
     const complete = this.#buildStateStack(this.#backgroundPrebuildEndLine, 1);
@@ -725,17 +684,6 @@ export class ShikiEditorTokenizer implements DiffsEditorTokenizer {
   }
 
   #backgroundTokenize(jobId: number) {
-    if (
-      this.#isStopped ||
-      this.#isPaused ||
-      this.#grammar == null ||
-      jobId !== this.#backgroundJobId
-    ) {
-      return;
-    }
-
-    this.#ensureActiveTheme();
-
     const t = performance.now();
     const lines = new Map<number, Array<HighlightedToken>>();
     const totalLines = this.#textDocument.lineCount;
@@ -812,8 +760,8 @@ function tokenizeLine(
   colorMap: string[],
   lineText: string,
   stateStack: StateStack,
-  timeLimit?: number,
-  collectBracketIgnoredRanges = true,
+  timeLimit: number,
+  collectBracketIgnoredRanges: boolean,
   resolveTokens = true
 ): {
   ruleStack: StateStack;
@@ -830,35 +778,30 @@ function tokenizeLine(
   const tokensLength = rawTokens.length / 2;
   const resolvedTokens: Array<HighlightedToken> = [];
   const bracketIgnoredRanges: [number, number][] = [];
-  if (!resolveTokens && !collectBracketIgnoredRanges) {
-    return {
-      ruleStack: result.ruleStack,
-      resolvedTokens,
-      bracketIgnoredRanges,
-    };
-  }
-  for (let j = 0; j < tokensLength; j++) {
-    const offset = rawTokens[2 * j];
-    const nextOffset =
-      j + 1 < tokensLength ? rawTokens[2 * j + 2] : lineText.length;
-    if (offset === nextOffset) {
-      // should never reach here, skip if happens anyway
-      continue;
-    }
-    const metadata = rawTokens[2 * j + 1];
-    if (resolveTokens) {
-      const fg = EncodedTokenMetadata.getForeground(metadata);
-      resolvedTokens.push([
-        offset,
-        colorMap[fg],
-        lineText.slice(offset, nextOffset),
-      ]);
-    }
-    if (
-      collectBracketIgnoredRanges &&
-      EncodedTokenMetadata.getTokenType(metadata) > 0
-    ) {
-      bracketIgnoredRanges.push([offset, nextOffset]);
+  if (resolveTokens || collectBracketIgnoredRanges) {
+    for (let j = 0; j < tokensLength; j++) {
+      const offset = rawTokens[2 * j];
+      const nextOffset =
+        j + 1 < tokensLength ? rawTokens[2 * j + 2] : lineText.length;
+      if (offset === nextOffset) {
+        // should never reach here, skip if happens anyway
+        continue;
+      }
+      const metadata = rawTokens[2 * j + 1];
+      if (resolveTokens) {
+        const fg = EncodedTokenMetadata.getForeground(metadata);
+        resolvedTokens.push([
+          offset,
+          colorMap[fg],
+          lineText.slice(offset, nextOffset),
+        ]);
+      }
+      if (
+        collectBracketIgnoredRanges &&
+        EncodedTokenMetadata.getTokenType(metadata) > 0
+      ) {
+        bracketIgnoredRanges.push([offset, nextOffset]);
+      }
     }
   }
   return {

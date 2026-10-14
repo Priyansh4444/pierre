@@ -32,18 +32,12 @@ export function createWindowFromScrollPosition({
     };
   }
 
-  const scrollCenter = scrollTop + height / 2;
-  let top = scrollCenter - windowHeight / 2;
-  let bottom = top + windowHeight;
-  if (top < 0) {
-    top = 0;
-  }
-  if (bottom > scrollHeight) {
-    bottom = scrollHeight;
-  }
-  top = Math.floor(Math.max(top, 0));
+  const centeredTop = scrollTop + height / 2 - windowHeight / 2;
+  const top = Math.floor(Math.max(centeredTop, 0));
   return {
     top,
-    bottom: Math.ceil(Math.max(Math.min(bottom, scrollHeight), top)),
+    bottom: Math.ceil(
+      Math.max(Math.min(centeredTop + windowHeight, scrollHeight), top)
+    ),
   };
 }

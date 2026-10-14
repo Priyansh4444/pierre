@@ -95,18 +95,15 @@ export class TextDocument<
     // inserted or pasted text match the rest of the file instead of leaving
     // mixed endings behind and keeps that convention stable as the file is
     // edited. Defaults to Unix `\n` when the initial text has no line break.
-    if (eol != null) {
-      this.#eol = eol;
-    } else {
-      const firstLineBreak = this.#pieceTable.getLineText(0, true);
-      if (firstLineBreak.endsWith('\r\n')) {
-        this.#eol = '\r\n';
-      } else if (firstLineBreak.endsWith('\r')) {
-        this.#eol = '\r';
-      } else {
-        this.#eol = '\n';
-      }
+    if (eol == null) {
+      const firstLine = this.#pieceTable.getLineText(0, true);
+      eol = firstLine.endsWith('\r\n')
+        ? '\r\n'
+        : firstLine.endsWith('\r')
+          ? '\r'
+          : '\n';
     }
+    this.#eol = eol;
   }
 
   get uri(): string {
@@ -151,11 +148,7 @@ export class TextDocument<
   }
 
   positionsAt(offsets: readonly number[]): Position[] {
-    const positions = this.#pieceTable.positionsAt(offsets);
-    for (let i = 0; i < positions.length; i++) {
-      positions[i] = this.normalizePosition(positions[i]);
-    }
-    return positions;
+    return offsets.map((offset) => this.positionAt(offset));
   }
 
   offsetAt(position: Position): number {
@@ -196,10 +189,11 @@ export class TextDocument<
   charAt(offset: number): string;
   charAt(position: Position): string;
   charAt(positionOrOffset: Position | number): string {
-    if (typeof positionOrOffset === 'number') {
-      return this.#pieceTable.charAt(positionOrOffset);
-    }
-    return this.#pieceTable.charAt(this.offsetAt(positionOrOffset));
+    return this.#pieceTable.charAt(
+      typeof positionOrOffset === 'number'
+        ? positionOrOffset
+        : this.offsetAt(positionOrOffset)
+    );
   }
 
   getTextSlice(start: number, end: number): string {
@@ -228,7 +222,7 @@ export class TextDocument<
       return;
     }
     return this.#applyResolvedEdits(
-      this.#sortAndValidateResolvedEdits(this.resolveEdits(edits)),
+      this.resolveEdits(edits),
       updateHistory,
       selectionsBefore,
       selectionsAfter,
@@ -240,7 +234,15 @@ export class TextDocument<
   // uses, including widening invalid boundaries so they cannot split a valid
   // surrogate pair. Editor caret remapping uses the same resolved geometry.
   resolveEdits(edits: readonly TextEdit[]): ResolvedTextEdit[] {
-    return edits.map((edit) => this.#resolveEdit(edit));
+    return edits.map((edit) => {
+      const start = this.offsetAt(edit.range.start);
+      const end = this.offsetAt(edit.range.end);
+      return this.#normalizeResolvedEdit({
+        start: Math.min(start, end),
+        end: Math.max(start, end),
+        text: edit.newText,
+      });
+    });
   }
 
   applyResolvedEdits(
@@ -254,9 +256,7 @@ export class TextDocument<
       return undefined;
     }
     return this.#applyResolvedEdits(
-      this.#sortAndValidateResolvedEdits(
-        edits.map((edit) => this.#normalizeResolvedEdit(edit))
-      ),
+      edits.map((edit) => this.#normalizeResolvedEdit(edit)),
       updateHistory,
       selectionsBefore,
       selectionsAfter,
@@ -281,6 +281,18 @@ export class TextDocument<
     selectionsAfter: EditorSelection[] | undefined,
     undoBoundary: boolean
   ): TextDocumentChange {
+    // Sorts in place; callers pass a fresh array. Zero-width edits go before
+    // ranges at the same start so validation and application do not depend on
+    // the caller's batch order.
+    resolvedEdits.sort((a, b) => {
+      const startDelta = a.start - b.start;
+      return startDelta === 0 ? a.end - b.end : startDelta;
+    });
+    for (let i = 0; i < resolvedEdits.length - 1; i++) {
+      if (resolvedEdits[i].end > resolvedEdits[i + 1].start) {
+        throw new Error('Overlapping text edits are not supported');
+      }
+    }
     const entry = createEditStackEntry(
       this,
       resolvedEdits,
@@ -328,50 +340,48 @@ export class TextDocument<
 
   undo(): TextDocumentHistoryResult<EType, LAnnotation> | undefined {
     const entry = this.#editStack.popUndoToRedo();
-    if (entry === undefined) {
-      return undefined;
-    }
-    const change = this.#applyResolvedEditsToBuffer(entry.inverseEdits);
-    if (change === undefined) {
-      return undefined;
-    }
-    setTextDocumentChangeTransaction(change, {
-      appliedEdits: entry.inverseEdits,
-      inverseEdits: entry.forwardEdits,
-    });
-    this.#version = entry.versionBefore;
-    const selections = entry.selectionsBefore?.slice();
-    return [
-      change,
-      selections,
-      entry.lineAnnotationsBefore?.slice(),
-      selections === undefined
-        ? entry.inverseEdits.map((edit) => ({ ...edit }))
-        : undefined,
-    ];
+    return entry === undefined
+      ? undefined
+      : this.#replay(
+          entry.inverseEdits,
+          entry.forwardEdits,
+          entry.versionBefore,
+          entry.selectionsBefore,
+          entry.lineAnnotationsBefore
+        );
   }
 
   redo(): TextDocumentHistoryResult<EType, LAnnotation> | undefined {
     const entry = this.#editStack.popRedoToUndo();
-    if (entry === undefined) {
-      return undefined;
-    }
-    const change = this.#applyResolvedEditsToBuffer(entry.forwardEdits);
-    if (change === undefined) {
-      return undefined;
-    }
-    setTextDocumentChangeTransaction(change, {
-      appliedEdits: entry.forwardEdits,
-      inverseEdits: entry.inverseEdits,
-    });
-    this.#version = entry.versionAfter;
-    const selections = entry.selectionsAfter?.slice();
+    return entry === undefined
+      ? undefined
+      : this.#replay(
+          entry.forwardEdits,
+          entry.inverseEdits,
+          entry.versionAfter,
+          entry.selectionsAfter,
+          entry.lineAnnotationsAfter
+        );
+  }
+
+  // Writes one side of a history entry to the buffer without recording it;
+  // undo and redo differ only in which side they pass.
+  #replay(
+    appliedEdits: ResolvedTextEdit[],
+    inverseEdits: ResolvedTextEdit[],
+    version: number,
+    selections: EditorSelection[] | undefined,
+    lineAnnotations: EditorLineAnnotation<EType, LAnnotation>[] | undefined
+  ): TextDocumentHistoryResult<EType, LAnnotation> {
+    const change = this.#applyResolvedEditsToBuffer(appliedEdits);
+    setTextDocumentChangeTransaction(change, { appliedEdits, inverseEdits });
+    this.#version = version;
     return [
       change,
-      selections,
-      entry.lineAnnotationsAfter?.slice(),
+      selections?.slice(),
+      lineAnnotations?.slice(),
       selections === undefined
-        ? entry.forwardEdits.map((edit) => ({ ...edit }))
+        ? appliedEdits.map((edit) => ({ ...edit }))
         : undefined,
     ];
   }
@@ -397,21 +407,6 @@ export class TextDocument<
       return 0;
     }
     return Math.max(0, Math.min(Math.floor(value), max));
-  }
-
-  #resolveEdit(edit: TextEdit): ResolvedTextEdit {
-    let start = this.offsetAt(edit.range.start);
-    let end = this.offsetAt(edit.range.end);
-    if (start > end) {
-      const t = start;
-      start = end;
-      end = t;
-    }
-    return this.#normalizeResolvedEdit({
-      start,
-      end,
-      text: edit.newText,
-    });
   }
 
   // Snaps an insertion before a pair and widens replacement boundaries
@@ -443,81 +438,17 @@ export class TextDocument<
     );
   }
 
-  #sortAndValidateResolvedEdits(edits: ResolvedTextEdit[]): ResolvedTextEdit[] {
-    // Put zero-width edits before ranges at the same start so validation and
-    // application do not depend on the caller's batch order.
-    const sortedEdits = [...edits].sort((a, b) => {
-      const startDelta = a.start - b.start;
-      return startDelta === 0 ? a.end - b.end : startDelta;
-    });
-    for (let i = 0; i < sortedEdits.length - 1; i++) {
-      if (sortedEdits[i].end > sortedEdits[i + 1].start) {
-        throw new Error('Overlapping text edits are not supported');
-      }
-    }
-    return sortedEdits;
-  }
-
   #applyResolvedEditsToBuffer(edits: ResolvedTextEdit[]): TextDocumentChange {
-    const previousLineCount = this.#pieceTable.lineCount;
+    const pieceTable = this.#pieceTable;
+    const previousLineCount = pieceTable.lineCount;
+    const previousLastLine = previousLineCount - 1;
+    const previousLastLineLength = pieceTable.getLineLength(previousLastLine);
     const editPositions = this.positionsAt(
       edits.flatMap((edit) => [edit.start, edit.end])
     );
-    const changedLineRange = this.#computeChangedLineRange(
-      edits,
-      editPositions
-    );
-    const startPosition = editPositions[0];
-    const endPosition = editPositions[editPositions.length - 1];
-    const endedAtDocumentEnd =
-      endPosition.line === previousLineCount - 1 &&
-      endPosition.character ===
-        this.#pieceTable.getLineLength(endPosition.line);
-    this.#pieceTable.applyEdits(edits);
-    const lineCount = this.#pieceTable.lineCount;
-    const change: TextDocumentChange = {
-      changes: edits.map((edit, index) => ({
-        ...edit,
-        range: {
-          start: editPositions[index * 2],
-          end: editPositions[index * 2 + 1],
-        },
-      })),
-      startLine: changedLineRange.startLine,
-      startCharacter: startPosition.character,
-      endCharacter: endPosition.character,
-      endLine: Math.min(changedLineRange.endLine, Math.max(0, lineCount - 1)),
-      endedAtDocumentEnd,
-      previousLineCount,
-      lineCount,
-      lineDelta: lineCount - previousLineCount,
-      changedLineRanges: changedLineRange.ranges,
-      changedLineChanges: changedLineRange.changes,
-    };
-    return change;
-  }
-
-  #computeChangedLineRange(
-    edits: ResolvedTextEdit[],
-    editPositions: Position[]
-  ): {
-    startLine: number;
-    endLine: number;
-    ranges: [number, number][];
-    changes: [
-      startLine: number,
-      endLine: number,
-      lineDelta: number,
-      startCharacter: number,
-      endCharacter: number,
-      endedAtDocumentEnd: boolean,
-    ][];
-  } {
-    let startLine = Infinity;
-    let endLine = 0;
-    let lineDeltaBeforeEdit = 0;
-    const ranges: [number, number][] = [];
-    const changes: [
+    const changes: EditorChange[] = [];
+    const changedLineRanges: [number, number][] = [];
+    const changedLineChanges: [
       startLine: number,
       endLine: number,
       lineDelta: number,
@@ -525,49 +456,54 @@ export class TextDocument<
       endCharacter: number,
       endedAtDocumentEnd: boolean,
     ][] = [];
-    const previousLastLine = this.#pieceTable.lineCount - 1;
-    const previousLastLineLength =
-      this.#pieceTable.getLineLength(previousLastLine);
+    let startLine = Infinity;
+    let endLine = 0;
+    let lineDeltaBeforeEdit = 0;
     for (let i = 0; i < edits.length; i++) {
       const edit = edits[i];
-      const editStart = editPositions[i * 2];
-      const editEnd = editPositions[i * 2 + 1];
-      const editStartLine = editStart.line;
-      const editEndLine = editEnd.line;
+      const start = editPositions[i * 2];
+      const end = editPositions[i * 2 + 1];
       const insertedLineSpan = countLineBreaks(edit.text);
-      const changedStartLine = editStartLine + lineDeltaBeforeEdit;
+      const changedStartLine = start.line + lineDeltaBeforeEdit;
       const changedEndLine = changedStartLine + insertedLineSpan;
-      const lineDelta = insertedLineSpan - (editEndLine - editStartLine);
-      startLine = Math.min(startLine, editStartLine);
+      const lineDelta = insertedLineSpan - (end.line - start.line);
+      startLine = Math.min(startLine, start.line);
       endLine = Math.max(endLine, changedEndLine);
-      const lastRange = ranges[ranges.length - 1];
+      const lastRange = changedLineRanges[changedLineRanges.length - 1];
       if (lastRange !== undefined && changedStartLine <= lastRange[1] + 1) {
-        ranges[ranges.length - 1] = [
-          lastRange[0],
-          Math.max(lastRange[1], changedEndLine),
-        ];
+        lastRange[1] = Math.max(lastRange[1], changedEndLine);
       } else {
-        ranges.push([changedStartLine, changedEndLine]);
+        changedLineRanges.push([changedStartLine, changedEndLine]);
       }
-      changes.push([
+      changedLineChanges.push([
         changedStartLine,
         changedEndLine,
         lineDelta,
-        editStart.character,
-        editEnd.character,
-        editEndLine === previousLastLine &&
-          editEnd.character === previousLastLineLength,
+        start.character,
+        end.character,
+        end.line === previousLastLine &&
+          end.character === previousLastLineLength,
       ]);
+      changes.push({ ...edit, range: { start, end } });
       lineDeltaBeforeEdit += lineDelta;
     }
-    if (startLine === Infinity) {
-      return {
-        startLine: 0,
-        endLine: 0,
-        ranges: [[0, 0]],
-        changes: [[0, 0, 0, 0, 0, false]],
-      };
-    }
-    return { startLine, endLine, ranges, changes };
+    const endPosition = editPositions[editPositions.length - 1];
+    pieceTable.applyEdits(edits);
+    const lineCount = pieceTable.lineCount;
+    return {
+      changes,
+      startLine,
+      startCharacter: editPositions[0].character,
+      endCharacter: endPosition.character,
+      endLine: Math.min(endLine, lineCount - 1),
+      endedAtDocumentEnd:
+        endPosition.line === previousLastLine &&
+        endPosition.character === previousLastLineLength,
+      previousLineCount,
+      lineCount,
+      lineDelta: lineCount - previousLineCount,
+      changedLineRanges,
+      changedLineChanges,
+    };
   }
 }

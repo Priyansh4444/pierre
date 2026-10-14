@@ -1,11 +1,6 @@
-import {
-  isLinux,
-  isMacLike,
-  isSafari,
-  resetPlatformDetection,
-} from '../utils/platform';
+import { isMacLike, isSafari } from '../utils/platform';
 
-export { isLinux, isMacLike, isSafari, resetPlatformDetection };
+export { isMacLike, isSafari };
 
 export function isPrimaryModifier(
   { metaKey, ctrlKey }: MouseEvent | KeyboardEvent,
@@ -44,25 +39,27 @@ export function isMoveCursorShortcut(
   }
 
   if (!e.altKey && !e.ctrlKey && !e.metaKey) {
-    if (e.key === 'ArrowUp') {
-      return 'up';
-    } else if (e.key === 'ArrowDown') {
-      return 'down';
-    } else if (e.key === 'ArrowLeft') {
-      return 'left';
-    } else if (e.key === 'ArrowRight') {
-      return 'right';
-    } else if (e.key === 'Home') {
-      return 'start';
-    } else if (e.key === 'End') {
-      return 'end';
+    switch (e.key) {
+      case 'ArrowUp':
+        return 'up';
+      case 'ArrowDown':
+        return 'down';
+      case 'ArrowLeft':
+        return 'left';
+      case 'ArrowRight':
+        return 'right';
+      case 'Home':
+        return 'start';
+      case 'End':
+        return 'end';
     }
   }
 
   if (isPrimaryModifier(e)) {
     if (e.key === 'ArrowLeft') {
       return 'textStart';
-    } else if (e.key === 'ArrowRight') {
+    }
+    if (e.key === 'ArrowRight') {
       return 'end';
     }
   }

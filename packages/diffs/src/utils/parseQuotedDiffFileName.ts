@@ -42,11 +42,20 @@ export function parseQuotedDiffFileName(
 
     const bytes: number[] = [];
     do {
-      const byte = readOctalByte(input, index + 1);
-      if (byte == null) {
+      // Requires three octal digits in the byte range so malformed escapes
+      // cannot be truncated or wrapped when copied into a Uint8Array. Keep
+      // the negated ranges: NaN past the input end must fail them too.
+      const first = input.charCodeAt(index + 1) - 48;
+      const second = input.charCodeAt(index + 2) - 48;
+      const third = input.charCodeAt(index + 3) - 48;
+      if (
+        !(first >= 0 && first <= 3) ||
+        !(second >= 0 && second <= 7) ||
+        !(third >= 0 && third <= 7)
+      ) {
         return undefined;
       }
-      bytes.push(byte);
+      bytes.push(first * 64 + second * 8 + third);
       index += 4;
     } while (
       input[index] === '\\' &&
@@ -54,25 +63,6 @@ export function parseQuotedDiffFileName(
       input[index + 1] <= '7'
     );
     fileName += filenameDecoder.decode(new Uint8Array(bytes));
-  }
-  return undefined;
-}
-
-// Requires three octal digits in the byte range so malformed escapes cannot
-// be truncated or wrapped when copied into a Uint8Array.
-function readOctalByte(input: string, index: number): number | undefined {
-  const first = input.charCodeAt(index) - 48;
-  const second = input.charCodeAt(index + 1) - 48;
-  const third = input.charCodeAt(index + 2) - 48;
-  if (
-    first >= 0 &&
-    first <= 3 &&
-    second >= 0 &&
-    second <= 7 &&
-    third >= 0 &&
-    third <= 7
-  ) {
-    return first * 64 + second * 8 + third;
   }
   return undefined;
 }

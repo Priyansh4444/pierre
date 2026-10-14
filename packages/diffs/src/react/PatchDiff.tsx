@@ -3,7 +3,6 @@
 import { useMemo } from 'react';
 
 import { DIFFS_TAG_NAME } from '../constants';
-import type { FileDiffMetadata } from '../types';
 import { getSingularPatch } from '../utils/getSingularPatch';
 import type { DiffBasePropsReact } from './types';
 import { renderDiffChildren } from './utils/renderDiffChildren';
@@ -40,7 +39,7 @@ export function PatchDiff<LAnnotation = undefined, Caret = undefined>({
   onEditChange,
   onEditComplete,
 }: PatchDiffProps<LAnnotation, Caret>): React.JSX.Element {
-  const fileDiff = usePatch(patch);
+  const fileDiff = useMemo(() => getSingularPatch(patch), [patch]);
   const { ref, getHoveredLine, getAnnotationSlotName } = useFileDiffInstance({
     fileDiff,
     options,
@@ -74,8 +73,4 @@ export function PatchDiff<LAnnotation = undefined, Caret = undefined>({
       {templateRender(children, prerenderedHTML)}
     </DIFFS_TAG_NAME>
   );
-}
-
-function usePatch(patch: string): FileDiffMetadata {
-  return useMemo<FileDiffMetadata>(() => getSingularPatch(patch), [patch]);
 }

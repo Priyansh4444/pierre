@@ -3,15 +3,7 @@ import type { ObservedAnnotationNodes, ObservedGridNodes } from '../types';
 interface CodeColumnUpdate {
   codeInlineSize?: number;
   numberInlineSize?: number;
-  measuredNumberInlineSize?: number;
 }
-
-interface CodeColumnVariableChanges {
-  codeWidthChanged: boolean;
-  numberWidthChanged: boolean;
-}
-
-type CodeUpdateMap = Map<ObservedGridNodes, CodeColumnUpdate>;
 
 export type ResizeManagerColumnVariableMode = 'apply' | 'measure';
 
@@ -20,25 +12,10 @@ export interface ResizeManagerSetupOptions {
   columnVariables?: ResizeManagerColumnVariableMode;
 }
 
-interface AnnotationSetup {
-  child1: HTMLElement;
-  child2: HTMLElement;
-  item: ObservedAnnotationNodes;
-  newHeight: number;
-}
-
 export class ResizeManager {
   // Shared static resizeObserver that all ResizeManagers use
   private static resizeObserver: ResizeObserver | undefined;
   private static managersByElement = new Map<Element, ResizeManager>();
-
-  private static getResizeObserver(): ResizeObserver {
-    const resizeObserver =
-      ResizeManager.resizeObserver ??
-      new ResizeObserver(ResizeManager.handleSharedResizeEntries);
-    ResizeManager.resizeObserver = resizeObserver;
-    return resizeObserver;
-  }
 
   private static handleSharedResizeEntries(entries: ResizeObserverEntry[]) {
     // First we need to batch all elements by manager, so callbacks are
@@ -71,28 +48,23 @@ export class ResizeManager {
     pre: HTMLPreElement,
     { disableAnnotations, columnVariables = 'apply' }: ResizeManagerSetupOptions
   ): void {
-    const annotationUpdates = new Set<AnnotationSetup>();
     const applyColumnVariables = columnVariables === 'apply';
     let columnCount = 0;
     const observedNodes = new Map(this.observedNodes);
     this.observedNodes.clear();
 
-    for (const element of pre.children) {
+    for (const codeElement of pre.children) {
       if (columnCount === 2) {
         break;
       }
-      const codeElement: HTMLElement | undefined = (() => {
-        if (element instanceof HTMLElement && element.tagName === 'CODE') {
-          return element;
-        }
-        return undefined;
-      })();
-      if (codeElement == null) {
+      if (
+        !(codeElement instanceof HTMLElement) ||
+        codeElement.tagName !== 'CODE'
+      ) {
         continue;
       }
       columnCount++;
-      let item: ObservedGridNodes | ObservedAnnotationNodes | undefined =
-        observedNodes.get(codeElement);
+      let item = observedNodes.get(codeElement);
       if (item != null && item.type !== 'code') {
         throw new Error(
           'ResizeManager.setup: somehow a code node is being used for an annotation, should be impossible'
@@ -125,7 +97,14 @@ export class ResizeManager {
         } else {
           item.numberWidth = 0;
         }
-        syncColumnVariableMode(item, applyColumnVariables);
+        if (item.applyColumnVariables !== applyColumnVariables) {
+          item.applyColumnVariables = applyColumnVariables;
+          if (applyColumnVariables) {
+            applyCodeColumnVariables(item, true, true);
+          } else {
+            removeCodeColumnVariables(item);
+          }
+        }
       } else {
         item = {
           type: 'code',
@@ -145,14 +124,12 @@ export class ResizeManager {
     }
 
     if (columnCount > 1 && !disableAnnotations) {
-      const annotationElements = pre.querySelectorAll(
-        '[data-line-annotation*=","]'
-      );
-
       const elementMap = new Map<string, HTMLElement[]>();
       // Iterate through all the matched elements and organize them into pairs
       // based on the data-line-annotation attribute
-      for (const element of annotationElements) {
+      for (const element of pre.querySelectorAll(
+        '[data-line-annotation*=","]'
+      )) {
         if (!(element instanceof HTMLElement)) {
           continue;
         }
@@ -173,6 +150,10 @@ export class ResizeManager {
         pairs.push(element);
       }
 
+      // Measure all annotation heights first, then apply the paired min-height
+      // styles after the read phase so setup does not bounce between layout
+      // reads and writes for every annotation pair.
+      const annotationUpdates: ObservedAnnotationNodes[] = [];
       for (const [key, pair] of elementMap) {
         if (pair.length !== 2) {
           console.error(
@@ -186,16 +167,13 @@ export class ResizeManager {
         const child1 = container1.firstElementChild;
         const child2 = container2.firstElementChild;
         if (
-          !(container1 instanceof HTMLElement) ||
-          !(container2 instanceof HTMLElement) ||
           !(child1 instanceof HTMLElement) ||
           !(child2 instanceof HTMLElement)
         ) {
           continue;
         }
 
-        let item = observedNodes.get(child1);
-
+        const item = observedNodes.get(child1);
         if (item != null) {
           this.observedNodes.set(child1, item);
           this.observedNodes.set(child2, item);
@@ -204,53 +182,50 @@ export class ResizeManager {
           continue;
         }
 
-        const child1Height = child1.getBoundingClientRect().height;
-        const child2Height = child2.getBoundingClientRect().height;
-        item = {
+        annotationUpdates.push({
           type: 'annotations',
           column1: {
             container: container1,
             child: child1,
-            childHeight: child1Height,
+            childHeight: child1.getBoundingClientRect().height,
           },
           column2: {
             container: container2,
             child: child2,
-            childHeight: child2Height,
+            childHeight: child2.getBoundingClientRect().height,
           },
           currentHeight: 'auto',
-        };
-        annotationUpdates.add({
-          child1,
-          child2,
-          item,
-          newHeight: Math.max(child1Height, child2Height),
         });
       }
 
-      // Measure all annotation heights first, then apply the paired min-height
-      // styles after the read phase so setup does not bounce between layout
-      // reads and writes for every annotation pair.
-      for (const pendingUpdate of annotationUpdates) {
-        this.applyNewHeight(pendingUpdate.item, pendingUpdate.newHeight);
-        this.observedNodes.set(pendingUpdate.child1, pendingUpdate.item);
-        this.observedNodes.set(pendingUpdate.child2, pendingUpdate.item);
-        this.observe(pendingUpdate.child1);
-        this.observe(pendingUpdate.child2);
+      for (const item of annotationUpdates) {
+        const { column1, column2 } = item;
+        this.applyNewHeight(
+          item,
+          Math.max(column1.childHeight, column2.childHeight)
+        );
+        this.observedNodes.set(column1.child, item);
+        this.observedNodes.set(column2.child, item);
+        this.observe(column1.child);
+        this.observe(column2.child);
       }
-      annotationUpdates.clear();
     }
 
     // Cleanup any old nodes that might still be observed
     for (const [element, item] of observedNodes) {
       this.unobserve(element);
       if (item.type === 'code') {
-        cleanupStaleCodeItem(item);
+        if (item.codeElement.isConnected) {
+          removeCodeColumnVariables(item);
+        }
       } else {
-        cleanupStaleAnnotationItem(item);
+        for (const { container } of [item.column1, item.column2]) {
+          if (container.isConnected) {
+            container.style.removeProperty('--diffs-annotation-min-height');
+          }
+        }
       }
     }
-    observedNodes.clear();
   }
 
   cleanUp(): void {
@@ -269,13 +244,15 @@ export class ResizeManager {
     }
     // If we've already somehow registered with another manager, we in for a
     // world of pain, so complain loudly
-    else if (owner != null && owner !== this) {
+    if (owner != null) {
       throw new Error(
         'ResizeManager.observe: element is already owned by another ResizeManager'
       );
     }
     managersByElement.set(element, this);
-    ResizeManager.getResizeObserver().observe(element);
+    (ResizeManager.resizeObserver ??= new ResizeObserver(
+      ResizeManager.handleSharedResizeEntries
+    )).observe(element);
   }
 
   private unobserve(element: HTMLElement): void {
@@ -283,7 +260,8 @@ export class ResizeManager {
     const owner = managersByElement.get(element);
     if (owner == null) {
       return;
-    } else if (owner !== this) {
+    }
+    if (owner !== this) {
       throw new Error(
         'ResizeManager.unobserve: element is owned by another ResizeManager'
       );
@@ -298,10 +276,10 @@ export class ResizeManager {
   }
 
   private handleResizeEntries(entries: ResizeObserverEntry[]) {
-    const codeUpdates: CodeUpdateMap = new Map();
-    const annotationUpdates: Set<ObservedAnnotationNodes> = new Set();
+    const codeUpdates = new Map<ObservedGridNodes, CodeColumnUpdate>();
+    const annotationUpdates = new Set<ObservedAnnotationNodes>();
     for (const entry of entries) {
-      const { target, borderBoxSize, contentBoxSize } = entry;
+      const { target } = entry;
       if (!(target instanceof HTMLElement)) {
         console.error(
           'ResizeManager.handleResizeEntries: Invalid element for ResizeObserver',
@@ -318,16 +296,12 @@ export class ResizeManager {
         continue;
       }
       if (item.type === 'annotations') {
-        const column = (() => {
-          if (target === item.column1.child) {
-            return item.column1;
-          }
-          if (target === item.column2.child) {
-            return item.column2;
-          }
-          return undefined;
-        })();
-
+        const column =
+          target === item.column1.child
+            ? item.column1
+            : target === item.column2.child
+              ? item.column2
+              : undefined;
         if (column == null) {
           console.error(
             `ResizeManager.handleResizeEntries: Couldn't find a column for`,
@@ -335,12 +309,11 @@ export class ResizeManager {
           );
           continue;
         }
-
-        column.childHeight = borderBoxSize[0].blockSize;
+        column.childHeight = entry.borderBoxSize[0].blockSize;
         annotationUpdates.add(item);
-      } else if (item.type === 'code') {
+      } else {
         const update = codeUpdates.get(item) ?? {};
-        const inlineSize = contentBoxSize[0].inlineSize;
+        const { inlineSize } = entry.contentBoxSize[0];
         if (target === item.codeElement) {
           update.codeInlineSize = inlineSize;
         } else if (target === item.numberElement) {
@@ -349,51 +322,34 @@ export class ResizeManager {
         codeUpdates.set(item, update);
       }
     }
-    this.applyAnnotationUpdates(annotationUpdates);
-    annotationUpdates.clear();
-    this.applyColumnUpdates(codeUpdates);
-    codeUpdates.clear();
-  }
-
-  private applyAnnotationUpdates(
-    annotationUpdates: Set<ObservedAnnotationNodes>
-  ) {
     for (const item of annotationUpdates) {
       this.applyNewHeight(
         item,
         Math.max(item.column1.childHeight, item.column2.childHeight)
       );
     }
-  }
-
-  private applyColumnUpdates = (queuedUpdates: CodeUpdateMap) => {
-    for (const [item, update] of queuedUpdates) {
-      const nextCodeWidth =
-        update.codeInlineSize != null
-          ? resolveCodeWidth(update.codeInlineSize)
-          : item.codeWidth;
-      const nextNumberWidth =
-        update.numberInlineSize != null
-          ? resolveNumberWidth(update.numberInlineSize)
+    for (const [item, { codeInlineSize, numberInlineSize }] of codeUpdates) {
+      let codeWidth = item.codeWidth;
+      if (codeInlineSize != null) {
+        const width = Math.max(Math.floor(codeInlineSize), 0);
+        codeWidth = width === 0 ? 'auto' : width;
+      }
+      const numberWidth =
+        numberInlineSize != null
+          ? Math.max(Math.ceil(numberInlineSize), 0)
           : item.numberWidth;
-      const codeWidthChanged = nextCodeWidth !== item.codeWidth;
-      const numberWidthChanged = nextNumberWidth !== item.numberWidth;
-
+      const codeWidthChanged = codeWidth !== item.codeWidth;
+      const numberWidthChanged = numberWidth !== item.numberWidth;
       if (!codeWidthChanged && !numberWidthChanged) {
         continue;
       }
-
-      item.codeWidth = nextCodeWidth;
-      item.numberWidth = nextNumberWidth;
-
+      item.codeWidth = codeWidth;
+      item.numberWidth = numberWidth;
       if (item.applyColumnVariables) {
-        applyCodeColumnVariables(item, {
-          codeWidthChanged,
-          numberWidthChanged,
-        });
+        applyCodeColumnVariables(item, codeWidthChanged, numberWidthChanged);
       }
     }
-  };
+  }
 
   private applyNewHeight(item: ObservedAnnotationNodes, newHeight: number) {
     if (newHeight !== item.currentHeight) {
@@ -410,50 +366,23 @@ export class ResizeManager {
   }
 }
 
-function resolveCodeWidth(inlineSize: number): number | 'auto' {
-  const width = Math.max(Math.floor(inlineSize), 0);
-  return width === 0 ? 'auto' : width;
-}
-
-function resolveNumberWidth(inlineSize: number): number {
-  return Math.max(Math.ceil(inlineSize), 0);
-}
-
-function syncColumnVariableMode(
-  item: ObservedGridNodes,
-  applyColumnVariables: boolean
-): void {
-  if (item.applyColumnVariables === applyColumnVariables) {
-    return;
-  }
-
-  item.applyColumnVariables = applyColumnVariables;
-  if (applyColumnVariables) {
-    applyCodeColumnVariables(item, {
-      codeWidthChanged: true,
-      numberWidthChanged: true,
-    });
-  } else {
-    removeCodeColumnVariables(item);
-  }
-}
-
 function applyCodeColumnVariables(
   item: ObservedGridNodes,
-  { codeWidthChanged, numberWidthChanged }: CodeColumnVariableChanges
+  codeWidthChanged: boolean,
+  numberWidthChanged: boolean
 ): void {
   const { codeElement, codeWidth, numberWidth } = item;
   if (codeWidthChanged) {
     codeElement.style.setProperty(
       '--diffs-column-width',
-      `${typeof codeWidth === 'number' ? `${codeWidth}px` : 'auto'}`
+      typeof codeWidth === 'number' ? `${codeWidth}px` : 'auto'
     );
   }
 
   if (numberWidthChanged) {
     codeElement.style.setProperty(
       '--diffs-column-number-width',
-      `${numberWidth === 0 ? 'auto' : `${numberWidth}px`}`
+      numberWidth === 0 ? 'auto' : `${numberWidth}px`
     );
   }
 
@@ -462,7 +391,7 @@ function applyCodeColumnVariables(
       typeof codeWidth === 'number' ? Math.max(codeWidth - numberWidth, 0) : 0;
     codeElement.style.setProperty(
       '--diffs-column-content-width',
-      `${targetWidth > 0 ? `${targetWidth}px` : 'auto'}`
+      targetWidth > 0 ? `${targetWidth}px` : 'auto'
     );
   }
 }
@@ -471,23 +400,4 @@ function removeCodeColumnVariables(item: ObservedGridNodes): void {
   item.codeElement.style.removeProperty('--diffs-column-content-width');
   item.codeElement.style.removeProperty('--diffs-column-number-width');
   item.codeElement.style.removeProperty('--diffs-column-width');
-}
-
-function cleanupStaleCodeItem(item: ObservedGridNodes): void {
-  if (item.codeElement.isConnected) {
-    removeCodeColumnVariables(item);
-  }
-}
-
-function cleanupStaleAnnotationItem(item: ObservedAnnotationNodes): void {
-  if (item.column1.container.isConnected) {
-    item.column1.container.style.removeProperty(
-      '--diffs-annotation-min-height'
-    );
-  }
-  if (item.column2.container.isConnected) {
-    item.column2.container.style.removeProperty(
-      '--diffs-annotation-min-height'
-    );
-  }
 }

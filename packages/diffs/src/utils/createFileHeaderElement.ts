@@ -7,7 +7,6 @@ import {
   HEADER_PREFIX_SLOT_ID,
 } from '../constants';
 import type {
-  ChangeTypes,
   FileContents,
   FileDiffMetadata,
   FileHeaderRenderMode,
@@ -36,39 +35,33 @@ export function createFileHeaderElement({
     'data-change-type': fileDiff?.type,
     'data-sticky': stickyHeader ? '' : undefined,
   };
+  if (mode === 'custom') {
+    return createHastElement({
+      tagName: 'div',
+      children: [
+        createHastElement({
+          tagName: 'slot',
+          properties: { name: CUSTOM_HEADER_SLOT_ID },
+        }),
+      ],
+      properties,
+    });
+  }
 
-  return createHastElement({
-    tagName: 'div',
-    children: [
-      mode === 'custom'
-        ? createHastElement({
-            tagName: 'slot',
-            properties: { name: CUSTOM_HEADER_SLOT_ID },
-          })
-        : createHeaderElement({
-            name: fileOrDiff.name,
-            prevName:
-              'prevName' in fileOrDiff ? fileOrDiff.prevName : undefined,
-            iconType: fileDiff?.type ?? 'file',
-          }),
-      ...(mode === 'custom' ? [] : [createMetadataElement(fileDiff)]),
-    ],
-    properties,
-  });
-}
-
-interface CreateHeaderElementOptions {
-  name: string;
-  prevName?: string;
-  iconType: ChangeTypes | 'file';
-}
-
-function createHeaderElement({
-  name,
-  prevName,
-  iconType,
-}: CreateHeaderElementOptions): HASTElement {
-  const children: ElementContent[] = [
+  const createNameElement = (name: string, attribute: string) =>
+    createHastElement({
+      tagName: 'div',
+      children: [
+        createHastElement({
+          tagName: 'bdi',
+          children: [createTextNodeElement(name)],
+        }),
+      ],
+      properties: { [attribute]: '' },
+    });
+  const iconType = fileDiff?.type ?? 'file';
+  const prevName = 'prevName' in fileOrDiff ? fileOrDiff.prevName : undefined;
+  const headerChildren: ElementContent[] = [
     createHastElement({
       tagName: 'slot',
       properties: { name: HEADER_PREFIX_SLOT_ID },
@@ -79,58 +72,23 @@ function createHeaderElement({
     }),
   ];
   if (prevName != null) {
-    children.push(
-      createHastElement({
-        tagName: 'div',
-        children: [
-          createHastElement({
-            tagName: 'bdi',
-            children: [createTextNodeElement(prevName)],
-          }),
-        ],
-        properties: {
-          'data-prev-name': '',
-        },
-      })
-    );
-    children.push(
+    headerChildren.push(
+      createNameElement(prevName, 'data-prev-name'),
       createIconElement({
         name: 'diffs-icon-arrow-right-short',
-        properties: {
-          'data-rename-icon': '',
-        },
+        properties: { 'data-rename-icon': '' },
       })
     );
   }
-  children.push(
-    createHastElement({
-      tagName: 'div',
-      children: [
-        createHastElement({
-          tagName: 'bdi',
-          children: [createTextNodeElement(name)],
-        }),
-      ],
-      properties: { 'data-title': '' },
-    })
-  );
-  children.push(
+  headerChildren.push(
+    createNameElement(fileOrDiff.name, 'data-title'),
     createHastElement({
       tagName: 'slot',
       properties: { name: HEADER_FILENAME_SUFFIX_SLOT_ID },
     })
   );
-  return createHastElement({
-    tagName: 'div',
-    children,
-    properties: { 'data-header-content': '' },
-  });
-}
 
-function createMetadataElement(
-  fileDiff: FileDiffMetadata | undefined
-): HASTElement {
-  const children: ElementContent[] = [];
+  const metadataChildren: ElementContent[] = [];
   if (fileDiff != null) {
     let additions = 0;
     let deletions = 0;
@@ -139,7 +97,7 @@ function createMetadataElement(
       deletions += hunk.deletionLines;
     }
     if (deletions > 0 || additions === 0) {
-      children.push(
+      metadataChildren.push(
         createHastElement({
           tagName: 'span',
           children: [createTextNodeElement(`-${deletions}`)],
@@ -148,7 +106,7 @@ function createMetadataElement(
       );
     }
     if (additions > 0 || deletions === 0) {
-      children.push(
+      metadataChildren.push(
         createHastElement({
           tagName: 'span',
           children: [createTextNodeElement(`+${additions}`)],
@@ -157,15 +115,27 @@ function createMetadataElement(
       );
     }
   }
-  children.push(
+  metadataChildren.push(
     createHastElement({
       tagName: 'slot',
       properties: { name: HEADER_METADATA_SLOT_ID },
     })
   );
+
   return createHastElement({
     tagName: 'div',
-    children,
-    properties: { 'data-metadata': '' },
+    children: [
+      createHastElement({
+        tagName: 'div',
+        children: headerChildren,
+        properties: { 'data-header-content': '' },
+      }),
+      createHastElement({
+        tagName: 'div',
+        children: metadataChildren,
+        properties: { 'data-metadata': '' },
+      }),
+    ],
+    properties,
   });
 }

@@ -48,7 +48,7 @@ interface EditStateManagerSession<K extends EditorType> {
   session: ManagedEditSession<K>;
 }
 
-/** Owns dormant edit state and active-key exclusion for one editor type. */
+// Owns dormant edit state and active-key exclusion for one editor type.
 class EditStateManagerNamespace<EType extends EditorType> {
   #states = new LRUMapPkg.LRUMap<string, EditState<EType>>(
     DEFAULT_EDIT_STATE_CAPACITY
@@ -63,24 +63,23 @@ class EditStateManagerNamespace<EType extends EditorType> {
     initialState?: ManagedEditSession<EType, LAnnotation>
   ): ManagedEditSession<EType, LAnnotation> {
     const activeSession = this.#sessions.get(editStateKey);
-    if (activeSession != null && activeSession.owner !== owner) {
-      throw new Error(
-        `Editor: editStateKey "${editStateKey}" is already attached to another editor`
-      );
-    }
     if (activeSession != null) {
+      if (activeSession.owner !== owner) {
+        throw new Error(
+          `Editor: editStateKey "${editStateKey}" is already attached to another editor`
+        );
+      }
       if (initialState != null) {
         activeSession.session = initialState;
       }
       return activeSession.session as ManagedEditSession<EType, LAnnotation>;
     }
     const retainedState = this.#states.delete(editStateKey);
-    const emptyState = {
-      type: this.type,
-    } as ManagedEditSession<EType>;
     const state = (initialState ??
-      retainedState ??
-      emptyState) as ManagedEditSession<EType, LAnnotation>;
+      retainedState ?? { type: this.type }) as ManagedEditSession<
+      EType,
+      LAnnotation
+    >;
     this.#sessions.set(editStateKey, {
       owner: owner as Editor<EType, unknown>,
       session: state,
@@ -112,19 +111,16 @@ class EditStateManagerNamespace<EType extends EditorType> {
   ): EditState<EType, LAnnotation> | undefined {
     const activeSession = this.#sessions.get(editStateKey);
     if (activeSession != null) {
-      const state = toManagedEditState(
+      return toManagedEditState(
         activeSession.session as ManagedEditSession<EType, LAnnotation>
       );
-      if (state == null) {
-        return undefined;
-      }
-      return state;
     }
-    const state = this.#states.find(editStateKey);
-    return state as EditState<EType, LAnnotation> | undefined;
+    return this.#states.find(editStateKey) as
+      | EditState<EType, LAnnotation>
+      | undefined;
   }
 
-  /** Clear dormant state for a key. Omit `parts` to clear everything. */
+  // Clears dormant state for a key. Omit `parts` to clear everything.
   clear(editStateKey: string, parts?: ClearEditStateOptions): boolean {
     if (this.#sessions.has(editStateKey)) {
       return false;
@@ -136,8 +132,18 @@ class EditStateManagerNamespace<EType extends EditorType> {
     }
     if (parts == null || parts.document === true) {
       this.#states.delete(editStateKey);
-    } else {
-      applyClearEditStateOptions(state, parts);
+      return true;
+    }
+    if (parts.history === true) {
+      state.document?.clearHistory();
+    }
+    if (state.editor != null) {
+      if (parts.editor === true || parts.selections === true) {
+        state.editor.selections = undefined;
+      }
+      if (parts.editor === true || parts.view === true) {
+        state.editor.view = undefined;
+      }
     }
     return true;
   }
@@ -172,18 +178,10 @@ class EditStateManagerClass {
     initialState?: ManagedEditSession<EType, LAnnotation>
   ): ManagedEditSession<EType, LAnnotation> {
     return (
-      type === 'file'
-        ? this.#files.activate(
-            editStateKey,
-            owner as Editor<'file', LAnnotation, Caret>,
-            initialState as ManagedFileEditSession<LAnnotation> | undefined
-          )
-        : this.#diffs.activate(
-            editStateKey,
-            owner as Editor<'file-diff', LAnnotation, Caret>,
-            initialState as ManagedFileDiffEditSession<LAnnotation> | undefined
-          )
-    ) as ManagedEditSession<EType, LAnnotation>;
+      (type === 'file'
+        ? this.#files
+        : this.#diffs) as EditStateManagerNamespace<EType>
+    ).activate(editStateKey, owner, initialState);
   }
 
   /**
@@ -216,10 +214,10 @@ class EditStateManagerClass {
     editStateKey: string
   ): EditState<EType, LAnnotation> | undefined {
     return (
-      type === 'file'
-        ? this.#files.get<LAnnotation>(editStateKey)
-        : this.#diffs.get<LAnnotation>(editStateKey)
-    ) as EditState<EType, LAnnotation> | undefined;
+      (type === 'file'
+        ? this.#files
+        : this.#diffs) as EditStateManagerNamespace<EType>
+    ).get<LAnnotation>(editStateKey);
   }
 
   /** Clear a dormant session, returning false when it is active or missing. */
@@ -228,9 +226,10 @@ class EditStateManagerClass {
     editStateKey: string,
     parts?: ClearEditStateOptions
   ): boolean {
-    return type === 'file'
-      ? this.#files.clear(editStateKey, parts)
-      : this.#diffs.clear(editStateKey, parts);
+    return (type === 'file' ? this.#files : this.#diffs).clear(
+      editStateKey,
+      parts
+    );
   }
 
   /** Clear all dormant sessions without affecting active editors. */
@@ -267,38 +266,15 @@ export function cloneEditorViewState(state: EditorViewState): EditorViewState {
 export function toManagedEditState<EType extends EditorType, LAnnotation>(
   session: ManagedEditSession<EType, LAnnotation>
 ): EditState<EType, LAnnotation> | undefined {
-  if (session.document == null || session.fileInfo == null) {
-    return undefined;
-  }
-  if (session.type === 'file') {
-    session.editor ??= {};
-    return session as EditState<EType, LAnnotation>;
-  }
-  if (session.diffSession == null) {
+  if (
+    session.document == null ||
+    session.fileInfo == null ||
+    (session.type !== 'file' && session.diffSession == null)
+  ) {
     return undefined;
   }
   session.editor ??= {};
   return session as EditState<EType, LAnnotation>;
-}
-
-function applyClearEditStateOptions(
-  session: ManagedEditSession | undefined,
-  parts: ClearEditStateOptions
-): void {
-  if (session == null) {
-    return;
-  }
-  if (parts.history === true) {
-    session.document?.clearHistory();
-  }
-  if (session.editor != null) {
-    if (parts.editor === true || parts.selections === true) {
-      session.editor.selections = undefined;
-    }
-    if (parts.editor === true || parts.view === true) {
-      session.editor.view = undefined;
-    }
-  }
 }
 
 export const EditStateManager: EditStateManagerClass =

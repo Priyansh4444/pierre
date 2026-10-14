@@ -9,7 +9,6 @@ import {
 
 import {
   UnresolvedFile,
-  UnresolvedFile as UnresolvedFileClass,
   type UnresolvedFileOptions,
 } from '../../components/UnresolvedFile';
 import type { GetHoveredLineResult } from '../../managers/InteractionManager';
@@ -18,7 +17,6 @@ import type {
   FileContents,
   FileDiffMetadata,
   MergeConflictActionPayload,
-  MergeConflictMarkerRow,
   SelectedLineRange,
 } from '../../types';
 import { areOptionsEqual } from '../../utils/areOptionsEqual';
@@ -49,7 +47,6 @@ interface UseUnresolvedFileInstanceProps<LAnnotation> {
 interface UseUnresolvedFileInstanceReturn<LAnnotation> {
   fileDiff: FileDiffMetadata;
   actions: (MergeConflictDiffAction | undefined)[];
-  markerRows: MergeConflictMarkerRow[];
   ref(node: HTMLElement | null): void;
   getHoveredLine(): GetHoveredLineResult<'diff'> | undefined;
   getInstance(): UnresolvedFile<LAnnotation> | undefined;
@@ -90,15 +87,14 @@ export function useUnresolvedFileInstance<LAnnotation>({
           ) ?? {};
         if (fileDiff == null || actions == null || markerRows == null) {
           return prevState;
-        } else {
-          return { fileDiff, actions, markerRows };
         }
+        return { fileDiff, actions, markerRows };
       });
     }
   );
   const controlledSelection = selectedLines !== undefined;
   const poolManager = useContext(WorkerPoolContext);
-  const instanceRef = useRef<UnresolvedFileClass<LAnnotation> | null>(null);
+  const instanceRef = useRef<UnresolvedFile<LAnnotation> | null>(null);
   const ref = useStableCallback((fileContainer: HTMLElement | null) => {
     if (fileContainer != null) {
       if (instanceRef.current != null) {
@@ -106,7 +102,7 @@ export function useUnresolvedFileInstance<LAnnotation>({
           'useUnresolvedFileInstance: An instance should not already exist when a node is created'
         );
       }
-      instanceRef.current = new UnresolvedFileClass(
+      instanceRef.current = new UnresolvedFile(
         mergeUnresolvedOptions({
           controlledSelection,
           hasConflictUtility,
@@ -138,8 +134,8 @@ export function useUnresolvedFileInstance<LAnnotation>({
   });
 
   useIsomorphicLayoutEffect(() => {
-    if (instanceRef.current == null) return;
-    const instance = instanceRef.current;
+    const { current: instance } = instanceRef;
+    if (instance == null) return;
     const newOptions = mergeUnresolvedOptions({
       controlledSelection,
       hasConflictUtility,
@@ -167,17 +163,15 @@ export function useUnresolvedFileInstance<LAnnotation>({
     }
   });
 
-  const getHoveredLine = useCallback(():
-    | GetHoveredLineResult<'diff'>
-    | undefined => {
-    return instanceRef.current?.getHoveredLine();
-  }, []);
+  const getHoveredLine = useCallback(
+    (): GetHoveredLineResult<'diff'> | undefined =>
+      instanceRef.current?.getHoveredLine(),
+    []
+  );
 
-  const getInstance = useCallback(() => {
-    return instanceRef.current ?? undefined;
-  }, []);
+  const getInstance = useCallback(() => instanceRef.current ?? undefined, []);
 
-  return { ref, getHoveredLine, fileDiff, actions, markerRows, getInstance };
+  return { ref, getHoveredLine, fileDiff, actions, getInstance };
 }
 
 interface MergeUnresolvedOptionsProps<LAnnotation> {

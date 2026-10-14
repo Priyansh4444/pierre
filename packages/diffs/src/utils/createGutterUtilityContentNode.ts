@@ -1,11 +1,12 @@
 export function createGutterUtilityContentNode(): HTMLElement {
   const gutterUtilityContent = document.createElement('div');
   gutterUtilityContent.slot = 'gutter-utility-slot';
-  gutterUtilityContent.style.position = 'absolute';
-  gutterUtilityContent.style.top = '0';
-  gutterUtilityContent.style.bottom = '0';
-  gutterUtilityContent.style.textAlign = 'center';
-  gutterUtilityContent.style.whiteSpace = 'normal';
-  gutterUtilityContent.style.touchAction = 'none';
+  const { style } = gutterUtilityContent;
+  style.position = 'absolute';
+  style.top = '0';
+  style.bottom = '0';
+  style.textAlign = 'center';
+  style.whiteSpace = 'normal';
+  style.touchAction = 'none';
   return gutterUtilityContent;
 }

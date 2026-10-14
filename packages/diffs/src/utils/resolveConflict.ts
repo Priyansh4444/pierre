@@ -11,24 +11,19 @@ export function resolveConflict(
   conflict: ProcessFileConflictData,
   type: ConflictResolverTypes
 ): FileDiffMetadata {
+  const resolution = normalizeDiffResolution(type);
+  const indexesToDelete = new Set<number>();
+  if (conflict.baseContentIndex != null) {
+    indexesToDelete.add(conflict.baseContentIndex);
+  }
+  if (conflict.endMarkerContentIndex !== conflict.endContentIndex) {
+    indexesToDelete.add(conflict.endMarkerContentIndex);
+  }
   return resolveRegion(diff, {
-    resolution: normalizeDiffResolution(type),
+    resolution,
     hunkIndex: conflict.hunkIndex,
     startContentIndex: conflict.startContentIndex,
     endContentIndex: conflict.endContentIndex,
-    indexesToDelete: getConflictDeleteContentIndexes(conflict),
+    indexesToDelete,
   });
-}
-
-function getConflictDeleteContentIndexes(
-  conflict: ProcessFileConflictData
-): Set<number> {
-  const indexes: Set<number> = new Set();
-  if (conflict.baseContentIndex != null) {
-    indexes.add(conflict.baseContentIndex);
-  }
-  if (conflict.endMarkerContentIndex !== conflict.endContentIndex) {
-    indexes.add(conflict.endMarkerContentIndex);
-  }
-  return indexes;
 }

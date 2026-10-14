@@ -28,7 +28,7 @@ export interface EditorTokenizerProps {
   __debug?: boolean;
 }
 
-/** Applies editor theme CSS and delegates tokenization to the selected backend. */
+// Applies editor theme CSS and delegates tokenization to the selected backend.
 export class EditorTokenizer {
   #highlighter: DiffsHighlighter;
   #tokenizer: DiffsEditorTokenizer;
@@ -63,20 +63,24 @@ export class EditorTokenizer {
       tokenizeMaxLineLength = 1000,
     } = codeOptions;
     this.#mediaQueryList = window.matchMedia('(prefers-color-scheme: dark)');
-    let themeType: 'light' | 'dark' | undefined;
-    if (themeTypeOption === 'system') {
-      // Prefer the host document's computed color-scheme (page CSS/classes can
-      // force light/dark while the OS media query differs) over matchMedia.
-      themeType = this.#resolveSystemThemeType();
-    } else {
-      themeType = themeTypeOption;
-    }
+    // Prefer the host document's computed color-scheme (page CSS/classes can
+    // force light/dark while the OS media query differs) over matchMedia.
+    const themeType =
+      themeTypeOption === 'system'
+        ? this.#resolveSystemThemeType()
+        : themeTypeOption;
     // Only track the document/system color scheme when the surface follows it
     // (`themeType: 'system'`). A surface pinned to an explicit 'dark'/'light'
     // theme keeps that theme regardless of the page, so re-tokenizing after an
     // edit must emit the same `--diffs-token-{theme}` variable the SSR markup
     // used; otherwise the edited tokens fall back to the default foreground.
     if (typeof theme !== 'string' && themeTypeOption === 'system') {
+      // Re-read computed color-scheme so a host-forced scheme still wins when
+      // the OS preference changes underneath it.
+      const followSystemTheme = () => {
+        const themeType = this.#resolveSystemThemeType();
+        this.#emitThemeChange(theme[themeType], themeType);
+      };
       const observer = new MutationObserver((mutations) => {
         for (const { type, attributeName } of mutations) {
           if (
@@ -84,8 +88,7 @@ export class EditorTokenizer {
             attributeName !== null &&
             (attributeName === 'class' || attributeName.startsWith('data-'))
           ) {
-            const themeType = this.#resolveSystemThemeType();
-            this.#emitThemeChange(theme[themeType], themeType);
+            followSystemTheme();
             break;
           }
         }
@@ -93,12 +96,7 @@ export class EditorTokenizer {
       observer.observe(document.documentElement, { attributes: true });
       observer.observe(document.body, { attributes: true });
       this.#disposes = [
-        addEventListener(this.#mediaQueryList, 'change', () => {
-          // Re-read computed color-scheme so a host-forced scheme still wins
-          // when the OS preference changes underneath it.
-          const themeType = this.#resolveSystemThemeType();
-          this.#emitThemeChange(theme[themeType], themeType);
-        }),
+        addEventListener(this.#mediaQueryList, 'change', followSystemTheme),
         () => observer.disconnect(),
       ];
     }
@@ -173,69 +171,37 @@ export class EditorTokenizer {
     // A single pinned theme does not follow the themeType option or system
     // scheme flips; its own classification stays authoritative.
     if (typeof theme === 'string') {
-      const pinnedThemeType = this.#highlighter.getTheme(theme).type;
-      if (theme === this.#themeName && pinnedThemeType === this.#themeType) {
-        return;
-      }
-      this.#emitThemeChange(theme, pinnedThemeType);
+      this.#emitThemeChange(theme, this.#highlighter.getTheme(theme).type);
       return;
     }
     const nextThemeType =
       themeType === 'system' ? this.#resolveSystemThemeType() : themeType;
-    const nextThemeName = theme[nextThemeType];
-    if (
-      nextThemeType === this.#themeType &&
-      nextThemeName === this.#themeName
-    ) {
-      return;
-    }
-    this.#emitThemeChange(nextThemeName, nextThemeType);
+    this.#emitThemeChange(theme[nextThemeType], nextThemeType);
   }
 
   #setTheme(themeName: string, themeType?: 'light' | 'dark') {
     const theme = this.#highlighter.getTheme(themeName);
     const { colors = {} } = theme;
-    const selectionBackground = colors['editor.selectionBackground'];
-    const themeLineHighlightBackground =
-      colors['editor.lineHighlightBackground'];
-    const lineHighlightBackground =
-      themeLineHighlightBackground != null &&
-      themeLineHighlightBackground.trim() !== '' &&
-      !colorUtils.isFullyTransparent(themeLineHighlightBackground)
-        ? themeLineHighlightBackground
-        : undefined;
+    const lineHighlightBackground = colors['editor.lineHighlightBackground'];
     // A usable theme background opts into the semantic active-line mix.
     // Missing backgrounds retain the resolved row color and rely on a border.
-    const lineHighlightBorder =
-      colors['editor.lineHighlightBorder'] ??
-      (lineHighlightBackground == null
-        ? 'color-mix(in lab, var(--diffs-bg) 70%, var(--diffs-fg))'
-        : 'transparent');
-    const activeLineSourceMix =
-      lineHighlightBackground == null ? '100%' : '85%';
-    const cursorForeground = colors['editorCursor.foreground'];
-    const findMatchBackground = colors['editor.findMatchBackground'];
-    const findMatchHighlightBackground =
-      colors['editor.findMatchHighlightBackground'];
-    const bracketMatchBackground = colors['editorBracketMatch.background'];
-    const bracketMatchBorder = colors['editorBracketMatch.border'];
-    const hintForeground = colors['editorHint.foreground'];
-    const infoForeground = colors['editorInfo.foreground'];
-    const warningForeground = colors['editorWarning.foreground'];
-    const errorForeground = colors['editorError.foreground'];
+    const hasLineHighlightBackground =
+      lineHighlightBackground != null &&
+      lineHighlightBackground.trim() !== '' &&
+      !colorUtils.isFullyTransparent(lineHighlightBackground);
     this.#setStyle(`:host {
-      --diffs-editor-selection-bg: ${selectionBackground ?? 'var(--diffs-line-bg)'};
-      --diffs-editor-line-highlight-border: ${lineHighlightBorder};
-      --diffs-editor-active-line-source-mix: ${activeLineSourceMix};
-      --diffs-editor-match-bg: ${findMatchBackground ?? 'initial'};
-      --diffs-editor-match-highlight-bg: ${findMatchHighlightBackground ?? 'initial'};
-      --diffs-editor-bracket-match-bg: ${bracketMatchBackground ?? 'initial'};
-      --diffs-editor-bracket-match-border: ${bracketMatchBorder ?? 'initial'};
-      --diffs-editor-cursor-fg: ${cursorForeground ?? 'initial'};
-      --diffs-editor-hint-fg: ${hintForeground ?? 'initial'};
-      --diffs-editor-info-fg: ${infoForeground ?? 'initial'};
-      --diffs-editor-warning-fg: ${warningForeground ?? 'initial'};
-      --diffs-editor-error-fg: ${errorForeground ?? 'initial'};
+      --diffs-editor-selection-bg: ${colors['editor.selectionBackground'] ?? 'var(--diffs-line-bg)'};
+      --diffs-editor-line-highlight-border: ${colors['editor.lineHighlightBorder'] ?? (hasLineHighlightBackground ? 'transparent' : 'color-mix(in lab, var(--diffs-bg) 70%, var(--diffs-fg))')};
+      --diffs-editor-active-line-source-mix: ${hasLineHighlightBackground ? '85%' : '100%'};
+      --diffs-editor-match-bg: ${colors['editor.findMatchBackground'] ?? 'initial'};
+      --diffs-editor-match-highlight-bg: ${colors['editor.findMatchHighlightBackground'] ?? 'initial'};
+      --diffs-editor-bracket-match-bg: ${colors['editorBracketMatch.background'] ?? 'initial'};
+      --diffs-editor-bracket-match-border: ${colors['editorBracketMatch.border'] ?? 'initial'};
+      --diffs-editor-cursor-fg: ${colors['editorCursor.foreground'] ?? 'initial'};
+      --diffs-editor-hint-fg: ${colors['editorHint.foreground'] ?? 'initial'};
+      --diffs-editor-info-fg: ${colors['editorInfo.foreground'] ?? 'initial'};
+      --diffs-editor-warning-fg: ${colors['editorWarning.foreground'] ?? 'initial'};
+      --diffs-editor-error-fg: ${colors['editorError.foreground'] ?? 'initial'};
     }`);
     this.#themeName = themeName;
     this.#themeType = themeType ?? theme.type;
@@ -281,17 +247,12 @@ export function renderLineTokens(
 ): (HTMLElement | string)[] {
   return tokens.map(([char, fg, textContent]) => {
     if (char === 0 && fg === '') {
-      if (textContent === '') {
-        return h('br');
-      }
-      return textContent;
+      return textContent === '' ? h('br') : textContent;
     }
     return h('span', {
-      dataset: {
-        char: char.toString(),
-      },
+      dataset: { char: char.toString() },
       style: `color:${fg};`,
-      textContent: textContent,
+      textContent,
     });
   });
 }

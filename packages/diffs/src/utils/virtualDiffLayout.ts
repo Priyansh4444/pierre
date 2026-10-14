@@ -38,7 +38,7 @@ export interface GetTrailingExpandedRegionProps extends GetTrailingContextRangeS
   collapsedContextThreshold: number;
 }
 
-/** One-based new-file line range covered by a hunk, as `[start, end)`. */
+// One-based new-file line range covered by a hunk, as `[start, end)`.
 export function getHunkAdditionLineRange(hunk: Hunk): [number, number] {
   return [
     getHunkSideStartBoundary(hunk.additionStart, hunk.additionCount) + 1,
@@ -116,15 +116,19 @@ export function getExpandedRegion({
   };
 }
 
-export function hasTrailingContext(fileDiff: FileDiffMetadata): boolean {
-  const lastHunk = fileDiff.hunks[fileDiff.hunks.length - 1];
+// Unchanged [addition, deletion] line counts after the final hunk, or undefined
+// when neither side has any.
+function getTrailingContextRemaining(
+  fileDiff: FileDiffMetadata
+): [number, number] | undefined {
+  const lastHunk = fileDiff.hunks.at(-1);
   if (
     lastHunk == null ||
     fileDiff.isPartial ||
     fileDiff.additionLines.length === 0 ||
     fileDiff.deletionLines.length === 0
   ) {
-    return false;
+    return undefined;
   }
 
   const additionRemaining =
@@ -133,36 +137,17 @@ export function hasTrailingContext(fileDiff: FileDiffMetadata): boolean {
   const deletionRemaining =
     fileDiff.deletionLines.length -
     getHunkSideEndBoundary(lastHunk.deletionStart, lastHunk.deletionCount);
-
-  return additionRemaining > 0 || deletionRemaining > 0;
+  return additionRemaining > 0 || deletionRemaining > 0
+    ? [additionRemaining, deletionRemaining]
+    : undefined;
 }
 
 // Returns true when trailing-context line counts disagree between sides.
 export function hasTrailingContextMismatch(
   fileDiff: FileDiffMetadata
 ): boolean {
-  const lastHunk = fileDiff.hunks[fileDiff.hunks.length - 1];
-  if (
-    lastHunk == null ||
-    fileDiff.isPartial ||
-    fileDiff.additionLines.length === 0 ||
-    fileDiff.deletionLines.length === 0
-  ) {
-    return false;
-  }
-
-  const additionRemaining =
-    fileDiff.additionLines.length -
-    getHunkSideEndBoundary(lastHunk.additionStart, lastHunk.additionCount);
-  const deletionRemaining =
-    fileDiff.deletionLines.length -
-    getHunkSideEndBoundary(lastHunk.deletionStart, lastHunk.deletionCount);
-
-  if (additionRemaining <= 0 && deletionRemaining <= 0) {
-    return false;
-  }
-
-  return additionRemaining !== deletionRemaining;
+  const remaining = getTrailingContextRemaining(fileDiff);
+  return remaining != null && remaining[0] !== remaining[1];
 }
 
 // Measures the unchanged tail after the final hunk. Both sides must have the
@@ -171,33 +156,17 @@ export function getTrailingContextRangeSize({
   fileDiff,
   errorPrefix,
 }: GetTrailingContextRangeSizeProps): number {
-  const lastHunk = fileDiff.hunks[fileDiff.hunks.length - 1];
-  if (
-    lastHunk == null ||
-    fileDiff.isPartial ||
-    fileDiff.additionLines.length === 0 ||
-    fileDiff.deletionLines.length === 0
-  ) {
+  const remaining = getTrailingContextRemaining(fileDiff);
+  if (remaining == null) {
     return 0;
   }
-
-  const additionRemaining =
-    fileDiff.additionLines.length -
-    getHunkSideEndBoundary(lastHunk.additionStart, lastHunk.additionCount);
-  const deletionRemaining =
-    fileDiff.deletionLines.length -
-    getHunkSideEndBoundary(lastHunk.deletionStart, lastHunk.deletionCount);
-
-  if (additionRemaining <= 0 && deletionRemaining <= 0) {
-    return 0;
-  }
-
+  const [additionRemaining, deletionRemaining] = remaining;
   if (additionRemaining !== deletionRemaining) {
     throw new Error(
       `${errorPrefix}: trailing context mismatch (additions=${additionRemaining}, deletions=${deletionRemaining}) for ${fileDiff.name}`
     );
   }
-  return Math.min(additionRemaining, deletionRemaining);
+  return additionRemaining;
 }
 
 export function getTrailingExpandedRegion({
@@ -256,14 +225,12 @@ export interface IsAdditionLineRenderableProps {
   collapsedContextThreshold: number;
 }
 
-/**
- * Whether a one-based new-file line currently has (or will have on scroll) a
- * rendered row under the given expansion state — the editor-facing
- * visibility oracle. False only for lines hidden inside a collapsed
- * unchanged region; lines outside the diff's modeled range report true so
- * callers keep their existing missing-row handling. Computed from the same
- * inputs as `iterateOverDiff` so layout math and the oracle cannot diverge.
- */
+// Whether a one-based new-file line currently has (or will have on scroll) a
+// rendered row under the given expansion state — the editor-facing visibility
+// oracle. False only for lines hidden inside a collapsed unchanged region;
+// lines outside the diff's modeled range report true so callers keep their
+// existing missing-row handling. Computed from the same inputs as
+// `iterateOverDiff` so layout math and the oracle cannot diverge.
 export function isAdditionLineRenderable({
   fileDiff,
   lineNumber,
@@ -320,13 +287,11 @@ export interface GetNearestRenderableAdditionLineProps extends IsAdditionLineRen
   direction: 'up' | 'down';
 }
 
-/**
- * The nearest renderable new-file line at or beyond `lineNumber` in the
- * given direction (one-based), or undefined when every line that way is
- * hidden inside collapsed regions. Sequential caret motion uses this to skip
- * over collapsed regions like code folds; it walks the hunk metadata once
- * instead of probing line by line across a gap.
- */
+// The nearest renderable new-file line at or beyond `lineNumber` in the given
+// direction (one-based), or undefined when every line that way is hidden
+// inside collapsed regions. Sequential caret motion uses this to skip over
+// collapsed regions like code folds; it walks the hunk metadata once instead
+// of probing line by line across a gap.
 export function getNearestRenderableAdditionLine({
   fileDiff,
   lineNumber,
@@ -403,43 +368,6 @@ export function getNearestRenderableAdditionLine({
   return undefined;
 }
 
-export function getHunkSeparatorHeight({
-  type,
-  metrics,
-}: HunkSeparatorBaseProps): number {
-  return metrics.hunkSeparatorHeight ?? getDefaultHunkSeparatorHeight(type);
-}
-
-export function getHunkSeparatorGap({
-  type,
-  metrics,
-}: HunkSeparatorBaseProps): number {
-  return type === 'simple' || type === 'metadata' || type === 'line-info-basic'
-    ? 0
-    : metrics.spacing;
-}
-
-export function hasLeadingHunkSeparator({
-  type,
-  hunkIndex,
-  hunkSpecs,
-}: Omit<LeadingHunkSeparatorLayoutProps, 'metrics'>): boolean {
-  switch (type) {
-    case 'simple':
-      return hunkIndex > 0;
-    case 'metadata':
-      return hunkSpecs != null;
-    case 'line-info':
-    case 'line-info-basic':
-    case 'custom':
-      return true;
-  }
-}
-
-export function hasTrailingHunkSeparator(type: HunkSeparators): boolean {
-  return type !== 'simple' && type !== 'metadata';
-}
-
 // Mirrors the renderer/CSS spacing rules for the separator shown before a hunk.
 export function getLeadingHunkSeparatorLayout({
   type,
@@ -447,19 +375,25 @@ export function getLeadingHunkSeparatorLayout({
   hunkIndex,
   hunkSpecs,
 }: LeadingHunkSeparatorLayoutProps): HunkSeparatorLayout | undefined {
-  if (!hasLeadingHunkSeparator({ type, hunkIndex, hunkSpecs })) {
+  if (
+    (type === 'simple' && hunkIndex <= 0) ||
+    (type === 'metadata' && hunkSpecs == null)
+  ) {
     return undefined;
   }
 
-  const height = getHunkSeparatorHeight({ type, metrics });
-  const gap = getHunkSeparatorGap({ type, metrics });
+  const height =
+    metrics.hunkSeparatorHeight ?? getDefaultHunkSeparatorHeight(type);
+  const gap =
+    type === 'simple' || type === 'metadata' || type === 'line-info-basic'
+      ? 0
+      : metrics.spacing;
   const gapBefore = hunkIndex > 0 ? gap : 0;
-  const gapAfter = gap;
   return {
     height,
     gapBefore,
-    gapAfter,
-    totalHeight: gapBefore + height + gapAfter,
+    gapAfter: gap,
+    totalHeight: gapBefore + height + gap,
   };
 }
 
@@ -469,12 +403,13 @@ export function getTrailingHunkSeparatorLayout({
   type,
   metrics,
 }: HunkSeparatorBaseProps): HunkSeparatorLayout | undefined {
-  if (!hasTrailingHunkSeparator(type)) {
+  if (type === 'simple' || type === 'metadata') {
     return undefined;
   }
 
-  const height = getHunkSeparatorHeight({ type, metrics });
-  const gapBefore = getHunkSeparatorGap({ type, metrics });
+  const height =
+    metrics.hunkSeparatorHeight ?? getDefaultHunkSeparatorHeight(type);
+  const gapBefore = type === 'line-info-basic' ? 0 : metrics.spacing;
   return {
     height,
     gapBefore,

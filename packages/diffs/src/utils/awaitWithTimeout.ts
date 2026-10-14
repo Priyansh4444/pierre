@@ -11,8 +11,6 @@ export async function awaitWithTimeout(
       }),
     ]);
   } finally {
-    if (timeoutId != null) {
-      clearTimeout(timeoutId);
-    }
+    clearTimeout(timeoutId);
   }
 }

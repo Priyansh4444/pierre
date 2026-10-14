@@ -20,27 +20,17 @@ export function getHighlighterThemeStyles({
   highlighter,
   prefix,
 }: GetHighlighterThemeStylesProps): string {
-  let styles = '';
+  const globalPrefix = formatCSSVariablePrefix('global');
   if (typeof theme === 'string') {
     const themeData = highlighter.getTheme(theme);
-    const normalized = getThemeColors(themeData, highlighter);
-    styles += `color:${normalized.fg};`;
-    styles += `background-color:${normalized.bg};`;
-    styles += `${formatCSSVariablePrefix('global')}fg:${normalized.fg};`;
-    styles += `${formatCSSVariablePrefix('global')}bg:${normalized.bg};`;
-    styles += getGitVariables(themeData, prefix);
-  } else {
-    let themeData = highlighter.getTheme(theme.dark);
-    let normalized = getThemeColors(themeData, highlighter);
-    styles += `${formatCSSVariablePrefix('global')}dark:${normalized.fg};`;
-    styles += `${formatCSSVariablePrefix('global')}dark-bg:${normalized.bg};`;
-    styles += getGitVariables(themeData, 'dark');
-
-    themeData = highlighter.getTheme(theme.light);
-    normalized = getThemeColors(themeData, highlighter);
-    styles += `${formatCSSVariablePrefix('global')}light:${normalized.fg};`;
-    styles += `${formatCSSVariablePrefix('global')}light-bg:${normalized.bg};`;
-    styles += getGitVariables(themeData, 'light');
+    const { fg, bg } = getThemeColors(themeData, highlighter);
+    return `color:${fg};background-color:${bg};${globalPrefix}fg:${fg};${globalPrefix}bg:${bg};${getGitVariables(themeData, prefix)}`;
+  }
+  let styles = '';
+  for (const mode of ['dark', 'light'] as const) {
+    const themeData = highlighter.getTheme(theme[mode]);
+    const { fg, bg } = getThemeColors(themeData, highlighter);
+    styles += `${globalPrefix}${mode}:${fg};${globalPrefix}${mode}-bg:${bg};${getGitVariables(themeData, mode)}`;
   }
   return styles;
 }
@@ -57,26 +47,20 @@ function getThemeColors(theme: DiffsTheme, highlighter: DiffsHighlighter) {
 
 // Keep the gitDecoration → terminal.ansi fallback; adding editorGutter colors
 // here would change diff backgrounds for existing themes.
+const GIT_COLOR_KEYS = [
+  ['addition', 'gitDecoration.addedResourceForeground', 'terminal.ansiGreen'],
+  ['deletion', 'gitDecoration.deletedResourceForeground', 'terminal.ansiRed'],
+  ['modified', 'gitDecoration.modifiedResourceForeground', 'terminal.ansiBlue'],
+] as const;
+
 function getGitVariables(themeData: DiffsTheme, modePrefix?: string) {
-  modePrefix = modePrefix != null ? `${modePrefix}-` : '';
+  const variablePrefix = `${formatCSSVariablePrefix('global')}${modePrefix != null ? `${modePrefix}-` : ''}`;
   let styles = '';
-  const additionGreen =
-    themeData.colors?.['gitDecoration.addedResourceForeground'] ??
-    themeData.colors?.['terminal.ansiGreen'];
-  if (additionGreen != null) {
-    styles += `${formatCSSVariablePrefix('global')}${modePrefix}addition-color:${additionGreen};`;
-  }
-  const deletionRed =
-    themeData.colors?.['gitDecoration.deletedResourceForeground'] ??
-    themeData.colors?.['terminal.ansiRed'];
-  if (deletionRed != null) {
-    styles += `${formatCSSVariablePrefix('global')}${modePrefix}deletion-color:${deletionRed};`;
-  }
-  const modifiedBlue =
-    themeData.colors?.['gitDecoration.modifiedResourceForeground'] ??
-    themeData.colors?.['terminal.ansiBlue'];
-  if (modifiedBlue != null) {
-    styles += `${formatCSSVariablePrefix('global')}${modePrefix}modified-color:${modifiedBlue};`;
+  for (const [name, gitKey, ansiKey] of GIT_COLOR_KEYS) {
+    const color = themeData.colors?.[gitKey] ?? themeData.colors?.[ansiKey];
+    if (color != null) {
+      styles += `${variablePrefix}${name}-color:${color};`;
+    }
   }
   return styles;
 }

@@ -24,9 +24,6 @@ export interface SelectionActionContext<
   close: () => void;
 }
 
-/**
- * Selection action widget.
- */
 export class SelectionActionWidget {
   #root: HTMLElement;
   // Cached border-box height, refreshed only when the popover's own size
@@ -59,14 +56,7 @@ export class SelectionActionWidget {
     this.#resizeObserver.observe(this.#root);
   }
 
-  /**
-   * Repositions the selection action widget.
-   * @param left - The left position of the selection action widget.
-   * @param top - The top position of the selection action widget.
-   * @param gutterWidth - The width of the gutter.
-   * @param placeAbove - Whether the selection action widget should be placed above the anchor.
-   * @param visible - Whether the selection intersects the viewport.
-   */
+  // `visible` is whether the selection intersects the viewport.
   reposition(
     left: number,
     top: number,
@@ -85,17 +75,10 @@ export class SelectionActionWidget {
     });
   }
 
-  /**
-   * Gets the height of the selection action widget.
-   * @returns The height of the selection action widget.
-   */
   get height(): number {
     return this.#height;
   }
 
-  /**
-   * Cleans up the selection action widget.
-   */
   cleanup(): void {
     this.#resizeObserver.disconnect();
     this.#root.remove();

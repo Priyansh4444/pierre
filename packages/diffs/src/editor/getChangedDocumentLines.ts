@@ -22,15 +22,18 @@ export function getChangedDocumentLines(
     }
     // Read a whole range at once to avoid searching the piece table for every
     // line. Single-line edits above keep the cheaper direct lookup.
-    const endPosition =
-      lastLine + 1 < document.lineCount
-        ? { line: lastLine + 1, character: 0 }
-        : { line: lastLine, character: document.getLineText(lastLine).length };
-    const contents = document.getText({
-      start: { line: start, character: 0 },
-      end: endPosition,
-    });
-    const rangeLines = linesFromFileContents(contents);
+    const rangeLines = linesFromFileContents(
+      document.getText({
+        start: { line: start, character: 0 },
+        end:
+          lastLine + 1 < document.lineCount
+            ? { line: lastLine + 1, character: 0 }
+            : {
+                line: lastLine,
+                character: document.getLineText(lastLine).length,
+              },
+      })
+    );
     for (let line = start; line <= lastLine; line++) {
       lines.set(line, rangeLines[line - start]);
     }

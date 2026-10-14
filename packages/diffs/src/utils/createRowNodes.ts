@@ -12,7 +12,6 @@ export function createRowNodes(line: number): {
   const content = document.createElement('div');
   content.dataset.columnContent = '';
 
-  row.appendChild(lineColumn);
-  row.appendChild(content);
+  row.append(lineColumn, content);
   return { row, content };
 }

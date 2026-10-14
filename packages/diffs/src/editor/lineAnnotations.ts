@@ -16,12 +16,6 @@ interface LineAnnotationChange {
   readonly lineDelta: number;
 }
 
-function getDefaultLineAnnotationName(
-  annotation: LineAnnotationPosition
-): string {
-  return getLineAnnotationName(annotation);
-}
-
 export function applyDocumentChangeToLineAnnotations<
   TLineAnnotation extends LineAnnotationPosition,
 >(
@@ -47,48 +41,53 @@ export function applyDocumentChangeToLineAnnotations<
 
     let line: number | undefined = annotation.lineNumber - 1;
     let lineCount = change.previousLineCount;
-    let annotationChanged = false;
-    for (const lineChange of annotationChanges) {
-      const nextLineCount = Math.max(1, lineCount + lineChange.lineDelta);
-      const nextLine = mapLineThroughLineChange(
-        line,
-        lineChange,
-        nextLineCount
-      );
-      if (nextLine === undefined) {
-        annotationChanged = true;
+    for (const {
+      startLine,
+      startCharacter,
+      endLine,
+      deletesEndLine,
+      insertedLineBreaks,
+      lineDelta,
+    } of annotationChanges) {
+      lineCount = Math.max(1, lineCount + lineDelta);
+      if (line < startLine) {
+        continue;
+      }
+      // Every line change has a non-zero lineDelta, so a change at or above
+      // the annotation always moves or touches it.
+      changed = true;
+      if (
+        line > endLine ||
+        (endLine > startLine && line === endLine && !deletesEndLine)
+      ) {
+        line += lineDelta;
+      } else if (startLine === endLine) {
+        if (startCharacter === 0) {
+          line += insertedLineBreaks;
+        }
+      } else if (lineDelta < 0 && (line !== startLine || startCharacter <= 0)) {
+        // The annotation's line was deleted.
         line = undefined;
         break;
+      } else {
+        line = Math.min(
+          startLine + Math.min(line - startLine, insertedLineBreaks),
+          lineCount - 1
+        );
       }
-      if (
-        nextLine !== line ||
-        lineChangeTouchesAnnotationLine(line, lineChange)
-      ) {
-        annotationChanged = true;
-      }
-      line = nextLine;
-      lineCount = nextLineCount;
     }
 
     if (line === undefined) {
-      changed = true;
       continue;
     }
-
     const lineNumber = line + 1;
-    if (annotationChanged) {
-      if (lineNumber === annotation.lineNumber) {
-        nextLineAnnotations.push(annotation);
-      } else {
-        const moved = { ...annotation, lineNumber };
-        recordLineAnnotationSource(moved, getLineAnnotationSource(annotation));
-        nextLineAnnotations.push(moved);
-      }
-      changed = true;
-      continue;
+    if (lineNumber === annotation.lineNumber) {
+      nextLineAnnotations.push(annotation);
+    } else {
+      const moved = { ...annotation, lineNumber };
+      recordLineAnnotationSource(moved, getLineAnnotationSource(annotation));
+      nextLineAnnotations.push(moved);
     }
-
-    nextLineAnnotations.push(annotation);
   }
 
   return changed ? nextLineAnnotations : undefined;
@@ -104,7 +103,7 @@ function getLineAnnotationChanges(
         changedEndLine,
         lineDelta,
         startCharacter = 0,
-        _endCharacter = 0,
+        _endCharacter,
         endedAtDocumentEnd = false,
       ]) => {
         if (lineDelta === 0) {
@@ -160,93 +159,13 @@ function getLineAnnotationChanges(
   ];
 }
 
-function mapLineThroughLineChange(
-  line: number,
-  lineChange: LineAnnotationChange,
-  nextLineCount: number
-): number | undefined {
-  if (line < lineChange.startLine) {
-    return line;
-  }
-
-  if (
-    line > lineChange.endLine ||
-    (lineChange.endLine > lineChange.startLine &&
-      line === lineChange.endLine &&
-      !lineChange.deletesEndLine)
-  ) {
-    return line + lineChange.lineDelta;
-  }
-
-  if (lineChange.startLine === lineChange.endLine) {
-    if (lineChange.startCharacter === 0) {
-      return line + lineChange.insertedLineBreaks;
-    }
-    return line;
-  }
-
-  if (lineChangeDeletesAnnotationLine(line, lineChange)) {
-    return undefined;
-  }
-
-  const replacementLineOffset = Math.min(
-    Math.max(0, line - lineChange.startLine),
-    lineChange.insertedLineBreaks
-  );
-  return clampLine(lineChange.startLine + replacementLineOffset, nextLineCount);
-}
-
-function lineChangeDeletesAnnotationLine(
-  line: number,
-  lineChange: LineAnnotationChange
-): boolean {
-  if (
-    lineChange.lineDelta >= 0 ||
-    line < lineChange.startLine ||
-    line > lineChange.endLine
-  ) {
-    return false;
-  }
-  if (line === lineChange.startLine && lineChange.startCharacter > 0) {
-    return false;
-  }
-  if (line === lineChange.endLine && !lineChange.deletesEndLine) {
-    return false;
-  }
-  return true;
-}
-
-function lineChangeTouchesAnnotationLine(
-  line: number,
-  lineChange: LineAnnotationChange
-): boolean {
-  if (
-    lineChange.lineDelta === 0 ||
-    line < lineChange.startLine ||
-    line > lineChange.endLine
-  ) {
-    return false;
-  }
-  return !(
-    lineChange.endLine > lineChange.startLine &&
-    line === lineChange.endLine &&
-    !lineChange.deletesEndLine
-  );
-}
-
-function clampLine(line: number, lineCount: number): number {
-  return Math.max(0, Math.min(line, Math.max(0, lineCount - 1)));
-}
-
 export function renderLineAnnotations<
   TLineAnnotation extends LineAnnotationPosition,
 >(
   lineAnnotations: TLineAnnotation[],
   contentEl: HTMLElement,
   gutterEl?: HTMLElement,
-  getName: (
-    annotation: TLineAnnotation
-  ) => string = getDefaultLineAnnotationName
+  getName: (annotation: TLineAnnotation) => string = getLineAnnotationName
 ): void {
   const additionAnnotations = new Map<number, string[]>();
   const deletionAnnotations = new Map<number, string[]>();
@@ -269,7 +188,6 @@ export function renderLineAnnotations<
   let leftGutterElement: HTMLElement | undefined;
   let leftContentElement: HTMLElement | undefined;
   if (
-    leftCodeElement != null &&
     leftCodeElement instanceof HTMLElement &&
     leftCodeElement.dataset.deletions !== undefined
   ) {
@@ -305,11 +223,36 @@ export function renderLineAnnotations<
   );
 
   requestAnimationFrame(() => {
-    syncPairedLineAnnotationHeights(
+    // An empty side takes the content height of its paired annotation on the
+    // other side so both rows stay aligned.
+    const offsetHeights = new Map<number, number>();
+    for (const [annotations, pairedElements] of [
+      [additionAnnotations, deletionsAnnotationElements],
+      [deletionAnnotations, additionsAnnotationElements],
+    ] as const) {
+      for (const [lineNumber, names] of annotations) {
+        if (names.length > 0) {
+          continue;
+        }
+        const content = pairedElements.get(lineNumber)?.firstElementChild;
+        const height =
+          content instanceof HTMLElement
+            ? content.getBoundingClientRect().height
+            : 0;
+        if (height > 0) {
+          offsetHeights.set(lineNumber, height);
+        }
+      }
+    }
+    applyLineAnnotationMinHeights(
       additionAnnotations,
-      deletionAnnotations,
       additionsAnnotationElements,
-      deletionsAnnotationElements
+      offsetHeights
+    );
+    applyLineAnnotationMinHeights(
+      deletionAnnotations,
+      deletionsAnnotationElements,
+      offsetHeights
     );
   });
 }
@@ -344,11 +287,8 @@ function createLineAnnotationElements(
     if (lineNumber !== undefined) {
       const annotations = lineAnnotations.get(lineNumber);
       if (annotations !== undefined) {
-        const lineIndex = lineNumber - 1;
         const annotationElement = h('div', {
-          dataset: {
-            lineAnnotation: '0,' + lineIndex,
-          },
+          dataset: { lineAnnotation: '0,' + (lineNumber - 1) },
           children: [
             h('div', {
               dataset: 'annotationContent',
@@ -366,16 +306,12 @@ function createLineAnnotationElements(
     for (const el of gutterEl.children) {
       const lineNumber = getLineNumberAttr(el as HTMLElement, 'columnNumber');
       if (lineNumber !== undefined && lineAnnotations.has(lineNumber)) {
-        const bufferEl = h('div', {
-          dataset: {
-            gutterBuffer: 'annotation',
-            bufferSize: '1',
-          },
-          style: {
-            gridRow: 'span 1',
-          },
-        });
-        el.after(bufferEl);
+        el.after(
+          h('div', {
+            dataset: { gutterBuffer: 'annotation', bufferSize: '1' },
+            style: { gridRow: 'span 1' },
+          })
+        );
       }
     }
   }
@@ -383,57 +319,12 @@ function createLineAnnotationElements(
   return annotationElements;
 }
 
-function syncPairedLineAnnotationHeights(
-  additionAnnotations: Map<number, string[]>,
-  deletionAnnotations: Map<number, string[]>,
-  additionAnnotationElements: Map<number, HTMLElement>,
-  deletionAnnotationElements: Map<number, HTMLElement>
-): void {
-  const offsetHeights = new Map<number, number>();
-  for (const [lineNumber, annotations] of additionAnnotations.entries()) {
-    const annotationElement = deletionAnnotationElements.get(lineNumber);
-    if (annotations.length === 0 && annotationElement !== undefined) {
-      const height = measureAnnotationContentHeight(annotationElement);
-      if (height > 0) {
-        offsetHeights.set(lineNumber, height);
-      }
-    }
-  }
-  for (const [lineNumber, annotations] of deletionAnnotations.entries()) {
-    const annotationElement = additionAnnotationElements.get(lineNumber);
-    if (annotations.length === 0 && annotationElement !== undefined) {
-      const height = measureAnnotationContentHeight(annotationElement);
-      if (height > 0) {
-        offsetHeights.set(lineNumber, height);
-      }
-    }
-  }
-  applyLineAnnotationMinHeights(
-    additionAnnotations,
-    additionAnnotationElements,
-    offsetHeights
-  );
-  applyLineAnnotationMinHeights(
-    deletionAnnotations,
-    deletionAnnotationElements,
-    offsetHeights
-  );
-}
-
-function measureAnnotationContentHeight(lineAnnotationEl: HTMLElement): number {
-  const content = lineAnnotationEl.firstElementChild;
-  if (!(content instanceof HTMLElement)) {
-    return 0;
-  }
-  return content.getBoundingClientRect().height;
-}
-
 function applyLineAnnotationMinHeights(
   lineAnnotations: Map<number, string[]>,
   annotationElements: Map<number, HTMLElement>,
   offsetHeights: Map<number, number>
 ): void {
-  for (const [lineNumber, annotationElement] of annotationElements.entries()) {
+  for (const [lineNumber, annotationElement] of annotationElements) {
     const annotations = lineAnnotations.get(lineNumber);
     const offsetHeight = offsetHeights.get(lineNumber);
     if (annotations?.length === 0 && offsetHeight !== undefined) {

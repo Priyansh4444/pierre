@@ -177,9 +177,7 @@ export class FileRenderer<LAnnotation = undefined> {
   ): void {
     this.lineAnnotations = {};
     for (const annotation of lineAnnotations) {
-      const arr = this.lineAnnotations[annotation.lineNumber] ?? [];
-      this.lineAnnotations[annotation.lineNumber] = arr;
-      arr.push(annotation);
+      (this.lineAnnotations[annotation.lineNumber] ??= []).push(annotation);
     }
   }
 
@@ -215,27 +213,21 @@ export class FileRenderer<LAnnotation = undefined> {
     if (wasAlreadyActive && renderCache.file === file) {
       return;
     }
-    if (wasAlreadyActive) {
-      this.clearRenderCache();
-      this.lineCache = undefined;
-      this.textDocumentCache = new WeakMap();
-      return;
-    }
-    const { options } = this.getRenderOptions(file);
     const cacheBelongsToSession = renderCache.file === file;
-    const cacheBelongsToExternal =
-      externalFile != null &&
-      areFileTargetsEqual(renderCache.file, externalFile);
     const { result } = renderCache;
     if (
+      wasAlreadyActive ||
       !renderCache.highlighted ||
       result == null ||
-      !areFileRenderOptionsEqual(renderCache.options, options) ||
-      (!cacheBelongsToSession && !cacheBelongsToExternal)
+      !areFileRenderOptionsEqual(
+        renderCache.options,
+        this.getRenderOptions(file).options
+      ) ||
+      (!cacheBelongsToSession &&
+        (externalFile == null ||
+          !areFileTargetsEqual(renderCache.file, externalFile)))
     ) {
-      this.clearRenderCache();
-      this.lineCache = undefined;
-      this.textDocumentCache = new WeakMap();
+      this.clearAllCaches();
       return;
     }
     if (cacheBelongsToSession) {
@@ -277,21 +269,17 @@ export class FileRenderer<LAnnotation = undefined> {
     this.editSessionActive = false;
     this.pendingHighlightResult = undefined;
     if (this.file == null) {
-      this.clearRenderCache();
-      this.lineCache = undefined;
-      this.textDocumentCache = new WeakMap();
+      this.clearAllCaches();
       return;
     }
     const { renderCache } = this;
     if (
-      settledFile == null ||
-      renderCache == null ||
-      renderCache.file === settledFile ||
-      !areFileTargetsEqual(renderCache.file, settledFile)
+      settledFile != null &&
+      renderCache != null &&
+      areFileTargetsEqual(renderCache.file, settledFile)
     ) {
-      return;
+      renderCache.file = settledFile;
     }
-    renderCache.file = settledFile;
   }
 
   /**
@@ -315,9 +303,7 @@ export class FileRenderer<LAnnotation = undefined> {
       this.pendingHighlightResult = undefined;
       this.pendingStructuralRows = undefined;
     } else {
-      this.clearRenderCache();
-      this.lineCache = undefined;
-      this.textDocumentCache = new WeakMap();
+      this.clearAllCaches();
     }
     this.highlighter = undefined;
     this.workerManager?.cleanUpTasks(this);
@@ -330,27 +316,33 @@ export class FileRenderer<LAnnotation = undefined> {
     this.pendingHighlightResult = undefined;
   }
 
+  // Also drops the split-line and text document caches.
+  private clearAllCaches(): void {
+    this.clearRenderCache();
+    this.lineCache = undefined;
+    this.textDocumentCache = new WeakMap();
+  }
+
   public hydrate(file: FileContents): void {
     this.file = file;
     this.highlighter = getHighlighterIfLoaded({
       theme: this.getLocalHighlightTheme(),
     });
     const { options } = this.getRenderOptions(file);
-    const lines = this.getOrCreateLineCache(file);
-    const massiveFile = isFileMassive(
-      lines.length,
-      this.getTokenizeMaxLength()
-    );
-    let cache = this.workerManager?.getFileResultCache(file);
-    if (cache != null && !areFileRenderOptionsEqual(options, cache.options)) {
-      cache = undefined;
-    }
+    const massiveFile =
+      this.getOrCreateLineCache(file).length > this.getTokenizeMaxLength();
+    const cache = this.workerManager?.getFileResultCache(file);
     this.renderCache ??= {
       file,
       hydrated: true,
       options,
       highlighted: !massiveFile && !isFilePlainText(file),
-      result: massiveFile ? undefined : cache?.result,
+      result:
+        massiveFile ||
+        cache == null ||
+        !areFileRenderOptionsEqual(options, cache.options)
+          ? undefined
+          : cache.result,
       // FIXME(amadeus): Add support for renderRanges
       renderRange: undefined,
     };
@@ -420,16 +412,13 @@ export class FileRenderer<LAnnotation = undefined> {
       };
     })();
     const { renderCache } = this;
-    if (renderCache?.result == null) {
-      return { options, forceHighlight: true };
-    }
-    if (
-      !areFileTargetsEqual(file, renderCache.file) ||
-      !areFileRenderOptionsEqual(options, renderCache.options)
-    ) {
-      return { options, forceHighlight: true };
-    }
-    return { options, forceHighlight: false };
+    return {
+      options,
+      forceHighlight:
+        renderCache?.result == null ||
+        !areFileTargetsEqual(file, renderCache.file) ||
+        !areFileRenderOptionsEqual(options, renderCache.options),
+    };
   }
 
   /**
@@ -439,24 +428,20 @@ export class FileRenderer<LAnnotation = undefined> {
    */
   public getFileForNextRender(file: FileContents): FileContents {
     const { options } = this.getRenderOptions(file);
-    if (this.getReadyRenderResult(file, options) != null) {
-      return file;
-    }
-
     const { renderCache } = this;
-    if (renderCache == null) {
+    if (
+      renderCache == null ||
+      this.getReadyRenderResult(file, options) != null
+    ) {
       return file;
     }
     if (areFileTargetsEqual(renderCache.file, file)) {
       return renderCache.file;
     }
-
-    const lines = linesFromFileContents(file.contents);
     const forcePlainText =
       file.contents.length === 0 ||
       isFilePlainText(file) ||
-      isFileMassive(lines.length, this.getTokenizeMaxLength());
-
+      linesFromFileContents(file.contents).length > this.getTokenizeMaxLength();
     return this.canRenderFile(file, options, forcePlainText)
       ? file
       : renderCache.file;
@@ -621,7 +606,8 @@ export class FileRenderer<LAnnotation = undefined> {
       this.lineCache != null && isLineCacheForFile(this.lineCache, file)
         ? this.lineCache.lines
         : linesFromFileContents(file.contents);
-    const nextLines = linesFromFileContents(textDocument.getText());
+    const contents = textDocument.getText();
+    const nextLines = linesFromFileContents(contents);
     if (result != null && previousLines.length !== nextLines.length) {
       const maxShared = Math.min(previousLines.length, nextLines.length);
       let prefix = 0;
@@ -649,7 +635,7 @@ export class FileRenderer<LAnnotation = undefined> {
         result.code[nextLines.length - 1 - i] =
           previousCode[previousLines.length - 1 - i];
       }
-      if (pendingStructuralRows !== undefined) {
+      if (pendingStructuralRows != null) {
         for (const [line, row] of pendingStructuralRows) {
           if (line < nextLines.length) {
             result.code[line] = row;
@@ -694,7 +680,6 @@ export class FileRenderer<LAnnotation = undefined> {
       }
     }
     // Replace the old split-line cache with the authoritative edited document.
-    const contents = textDocument.getText();
     this.lineCache = {
       cacheKey: file.cacheKey,
       file,
@@ -725,24 +710,23 @@ export class FileRenderer<LAnnotation = undefined> {
       };
       forceHighlight = false;
     }
-    this.renderCache ??= {
+    const renderCache = (this.renderCache ??= {
       file,
       highlighted: false,
       options,
       result: undefined,
       renderRange: undefined,
-    };
+    });
     const lines = this.getOrCreateLineCache(file);
-    const hasContent = file.contents.length > 0;
     const forcePlainText =
-      !hasContent ||
+      file.contents.length === 0 ||
       isFilePlainText(file) ||
-      isFileMassive(lines.length, this.getTokenizeMaxLength());
+      lines.length > this.getTokenizeMaxLength();
     this.highlighter = getHighlighterIfLoaded();
     const canRenderFile = this.canRenderFile(file, options, forcePlainText);
-    const newContent = !areFileTargetsEqual(file, this.renderCache.file);
+    const newContent = !areFileTargetsEqual(file, renderCache.file);
     const newRenderRange = !areRenderRangesEqual(
-      this.renderCache.renderRange,
+      renderCache.renderRange,
       renderRange
     );
     if (
@@ -752,8 +736,8 @@ export class FileRenderer<LAnnotation = undefined> {
       // Hydration has highlighted DOM but no local AST. Keep that DOM until
       // its corresponding worker result is ready.
       const preserveHydratedContent =
-        this.renderCache.result == null &&
-        this.renderCache.highlighted &&
+        renderCache.result == null &&
+        renderCache.highlighted &&
         !forcePlainText &&
         !newContent &&
         isDefaultRenderRange(renderRange);
@@ -761,33 +745,29 @@ export class FileRenderer<LAnnotation = undefined> {
         canRenderFile &&
         !preserveHydratedContent &&
         (forcePlainText ||
-          this.renderCache.result == null ||
-          (!this.renderCache.highlighted && (newContent || newRenderRange)))
+          renderCache.result == null ||
+          (!renderCache.highlighted && (newContent || newRenderRange)))
       ) {
-        this.renderCache.file = file;
-        this.renderCache.options = options;
-        this.renderCache.highlighted = false;
+        renderCache.file = file;
+        renderCache.options = options;
+        renderCache.highlighted = false;
         if (
-          this.renderCache.result == null ||
+          renderCache.result == null ||
           newContent ||
           newRenderRange ||
           forceHighlight
         ) {
-          this.renderCache.result = this.workerManager.getPlainFileAST(
+          renderCache.result = this.workerManager.getPlainFileAST(
             file,
             renderRange.startingLine,
             renderRange.totalLines,
             lines
           );
         }
-        this.renderCache.renderRange = renderRange;
+        renderCache.renderRange = renderRange;
       }
 
-      if (
-        !forcePlainText &&
-        hasContent &&
-        (!this.renderCache.highlighted || forceHighlight)
-      ) {
+      if (!forcePlainText && (!renderCache.highlighted || forceHighlight)) {
         this.workerManager.highlightFileAST(this, file);
       }
     } else {
@@ -807,8 +787,8 @@ export class FileRenderer<LAnnotation = undefined> {
         hasThemes &&
         (forceHighlight ||
           forcePlainText ||
-          (!this.renderCache.highlighted && canHighlight) ||
-          this.renderCache.result == null)
+          (!renderCache.highlighted && canHighlight) ||
+          renderCache.result == null)
       ) {
         const { result, options } = this.renderFileWithHighlighter(
           file,
@@ -863,11 +843,8 @@ export class FileRenderer<LAnnotation = undefined> {
     file: FileContents,
     lazyLineAST = false
   ): Promise<RenderFileResult> {
-    const lines = this.getOrCreateLineCache(file);
-    const forcePlainText = isFileMassive(
-      lines.length,
-      this.getTokenizeMaxLength()
-    );
+    const forcePlainText =
+      this.getOrCreateLineCache(file).length > this.getTokenizeMaxLength();
     this.computedLang = forcePlainText
       ? 'text'
       : (file.lang ?? getFiletypeFromFileName(file.name));
@@ -911,31 +888,41 @@ export class FileRenderer<LAnnotation = undefined> {
     { code, themeStyles, baseThemeType }: ThemedFileResult
   ): FileRenderResult {
     const totalLines = this.getLineCount(file);
-    const { disableFileHeader = false } = this.options;
     const contentArray: ElementContent[] = [];
-    const gutter = createGutterWrapper();
+    const gutterAST: ElementContent[] = [];
     const endLine = Math.min(
       renderRange.startingLine + renderRange.totalLines,
       totalLines
     );
     let rowCount = 0;
-
-    const fileLevelAnnotations = shouldRenderFileAnnotations(renderRange)
-      ? getFileAnnotations(this.lineAnnotations)
-      : undefined;
-    if (fileLevelAnnotations != null) {
-      gutter.children.push(createGutterGap('context', 'annotation', 1));
+    const pushAnnotations = (
+      hunkIndex: number,
+      lineIndex: number,
+      annotations: LineAnnotation<LAnnotation>[]
+    ) => {
+      gutterAST.push(createGutterGap('context', 'annotation', 1));
       contentArray.push(
         createAnnotationElement({
           type: 'annotation',
-          hunkIndex: FILE_ANNOTATION_HUNK_INDEX,
-          lineIndex: FILE_ANNOTATION_LINE_INDEX,
-          annotations: fileLevelAnnotations.map((annotation) =>
+          hunkIndex,
+          lineIndex,
+          annotations: annotations.map((annotation) =>
             this.annotationSlotName(annotation)
           ),
         })
       );
       rowCount++;
+    };
+
+    const fileLevelAnnotations = shouldRenderFileAnnotations(renderRange)
+      ? getFileAnnotations(this.lineAnnotations)
+      : undefined;
+    if (fileLevelAnnotations != null) {
+      pushAnnotations(
+        FILE_ANNOTATION_HUNK_INDEX,
+        FILE_ANNOTATION_LINE_INDEX,
+        fileLevelAnnotations
+      );
     }
 
     for (
@@ -957,56 +944,52 @@ export class FileRenderer<LAnnotation = undefined> {
         throw new Error(message);
       }
 
-      // Add gutter line number
-      gutter.children.push(
-        createGutterItem('context', lineNumber, `${lineIndex}`)
-      );
+      gutterAST.push(createGutterItem('context', lineNumber, `${lineIndex}`));
       contentArray.push(line);
       rowCount++;
 
       // Check annotations using ACTUAL line number from file
       const annotations = this.lineAnnotations[lineNumber];
       if (annotations != null) {
-        gutter.children.push(createGutterGap('context', 'annotation', 1));
-        contentArray.push(
-          createAnnotationElement({
-            type: 'annotation',
-            hunkIndex: 0,
-            lineIndex: lineNumber,
-            annotations: annotations.map((annotation) =>
-              this.annotationSlotName(annotation)
-            ),
-          })
-        );
-        rowCount++;
+        pushAnnotations(0, lineNumber, annotations);
       }
     }
 
-    // Finalize: wrap gutter and content
-    gutter.properties.style = `grid-row: span ${rowCount}`;
+    const {
+      disableFileHeader = false,
+      disableLineNumbers = false,
+      headerRenderMode = 'default',
+      overflow = 'scroll',
+      stickyHeader = false,
+    } = this.options;
     return {
       file,
-      gutterAST: gutter.children ?? [],
+      gutterAST,
       contentAST: contentArray,
-      preAST: this.createPreElement(totalLines),
-      headerAST: !disableFileHeader ? this.renderHeader(file) : undefined,
-      totalLines: totalLines,
+      preAST: createPreElement({
+        type: 'file',
+        diffIndicators: 'none',
+        disableBackground: true,
+        disableLineNumbers,
+        overflow,
+        split: false,
+        totalLines,
+      }),
+      headerAST: disableFileHeader
+        ? undefined
+        : createFileHeaderElement({
+            fileOrDiff: file,
+            mode: headerRenderMode,
+            stickyHeader,
+          }),
+      totalLines,
       rowCount,
-      themeStyles: themeStyles,
+      themeStyles,
       baseThemeType,
       bufferBefore: renderRange.bufferBefore,
       bufferAfter: renderRange.bufferAfter,
       css: '',
     };
-  }
-
-  private renderHeader(file: FileContents) {
-    const { headerRenderMode = 'default', stickyHeader = false } = this.options;
-    return createFileHeaderElement({
-      fileOrDiff: file,
-      mode: headerRenderMode,
-      stickyHeader,
-    });
   }
 
   public renderFullHTML(result: FileRenderResult): string {
@@ -1028,8 +1011,7 @@ export class FileRenderer<LAnnotation = undefined> {
   }
 
   public renderCodeAST(result: FileRenderResult): ElementContent[] {
-    const gutter = createGutterWrapper();
-    gutter.children = result.gutterAST;
+    const gutter = createGutterWrapper(result.gutterAST);
     gutter.properties.style = `grid-row: span ${result.rowCount}`;
     const contentColumn = createContentColumn(
       result.contentAST,
@@ -1083,27 +1065,19 @@ export class FileRenderer<LAnnotation = undefined> {
     file: FileContents,
     result: ThemedFileResult,
     options: RenderFileOptions,
-    highlighted = true
+    highlighted: boolean
   ): void {
-    const { file: currentFile, renderCache } = this;
+    const { file: currentFile } = this;
     if (
       currentFile == null ||
-      renderCache == null ||
+      this.renderCache == null ||
       !areFileTargetsEqual(file, currentFile) ||
       !areFileRenderOptionsEqual(
         options,
         this.getRenderOptions(currentFile).options
-      )
+      ) ||
+      this.hasHighlightedRenderCache(currentFile, options)
     ) {
-      return;
-    }
-
-    const triggerRender =
-      renderCache.result == null ||
-      !renderCache.highlighted ||
-      !areFileRenderOptionsEqual(renderCache.options, options) ||
-      !areFileTargetsEqual(renderCache.file, currentFile);
-    if (!triggerRender) {
       return;
     }
 
@@ -1114,20 +1088,6 @@ export class FileRenderer<LAnnotation = undefined> {
       result,
     };
     this.onRenderUpdate?.();
-  }
-
-  private getMatchingWorkerResultCache(
-    file: FileContents,
-    options: RenderFileOptions
-  ): RenderFileResult | undefined {
-    if (this.editSessionActive) {
-      return undefined;
-    }
-    const cache = this.workerManager?.getFileResultCache(file);
-    if (cache == null || !areFileRenderOptionsEqual(options, cache.options)) {
-      return undefined;
-    }
-    return cache;
   }
 
   // Returns completed background work that can replace the rendered AST on
@@ -1145,8 +1105,14 @@ export class FileRenderer<LAnnotation = undefined> {
       return pendingHighlightResult;
     }
 
-    const workerCache = this.getMatchingWorkerResultCache(file, options);
-    if (workerCache == null || this.hasHighlightedRenderCache(file, options)) {
+    const workerCache = this.editSessionActive
+      ? undefined
+      : this.workerManager?.getFileResultCache(file);
+    if (
+      workerCache == null ||
+      !areFileRenderOptionsEqual(options, workerCache.options) ||
+      this.hasHighlightedRenderCache(file, options)
+    ) {
       return undefined;
     }
     return { file, highlighted: true, ...workerCache };
@@ -1172,21 +1138,4 @@ export class FileRenderer<LAnnotation = undefined> {
   private getTokenizeMaxLength(): number {
     return this.options.tokenizeMaxLength ?? DEFAULT_TOKENIZE_MAX_LENGTH;
   }
-
-  private createPreElement(totalLines: number): HASTElement {
-    const { disableLineNumbers = false, overflow = 'scroll' } = this.options;
-    return createPreElement({
-      type: 'file',
-      diffIndicators: 'none',
-      disableBackground: true,
-      disableLineNumbers,
-      overflow,
-      split: false,
-      totalLines,
-    });
-  }
-}
-
-function isFileMassive(lineCount: number, tokenizeMaxLength: number): boolean {
-  return lineCount > tokenizeMaxLength;
 }

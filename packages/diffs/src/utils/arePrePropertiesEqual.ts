@@ -1,5 +1,7 @@
 import type { CustomPreProperties, PrePropertiesConfig } from '../types';
 
+const EMPTY_CUSTOM_PROPERTIES: CustomPreProperties = {};
+
 export function arePrePropertiesEqual(
   propsA: PrePropertiesConfig | undefined,
   propsB: PrePropertiesConfig | undefined
@@ -7,11 +9,18 @@ export function arePrePropertiesEqual(
   if (propsA == null || propsB == null) {
     return propsA === propsB;
   }
+  const { customProperties: customA = EMPTY_CUSTOM_PROPERTIES } = propsA;
+  const { customProperties: customB = EMPTY_CUSTOM_PROPERTIES } = propsB;
+  if (customA !== customB) {
+    const keysA = Object.keys(customA);
+    if (
+      keysA.length !== Object.keys(customB).length ||
+      keysA.some((key) => customA[key] !== customB[key])
+    ) {
+      return false;
+    }
+  }
   return (
-    areCustomPropertiesEqual(
-      propsA.customProperties,
-      propsB.customProperties
-    ) &&
     propsA.type === propsB.type &&
     propsA.diffIndicators === propsB.diffIndicators &&
     propsA.disableBackground === propsB.disableBackground &&
@@ -20,26 +29,4 @@ export function arePrePropertiesEqual(
     propsA.split === propsB.split &&
     propsA.totalLines === propsB.totalLines
   );
-}
-
-const EMPTY_CUSTOM_PROPERTIES: CustomPreProperties = {};
-
-function areCustomPropertiesEqual(
-  customPropertiesA: CustomPreProperties = EMPTY_CUSTOM_PROPERTIES,
-  customPropertiesB: CustomPreProperties = EMPTY_CUSTOM_PROPERTIES
-): boolean {
-  if (customPropertiesA === customPropertiesB) {
-    return true;
-  }
-  const keysA = Object.keys(customPropertiesA);
-  const keysB = Object.keys(customPropertiesB);
-  if (keysA.length !== keysB.length) {
-    return false;
-  }
-  for (const key of keysA) {
-    if (customPropertiesA[key] !== customPropertiesB[key]) {
-      return false;
-    }
-  }
-  return true;
 }

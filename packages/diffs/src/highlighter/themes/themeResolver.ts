@@ -113,7 +113,7 @@ function createHighlightsTheme(
   };
 }
 
-/** Keep caches separate because the same name can have TextMate and Zed palettes. */
+// Keep caches separate because the same name can have TextMate and Zed palettes.
 export function createDiffsThemeResolver(
   backend: HighlighterTypes
 ): ThemeResolver<DiffsTheme> {

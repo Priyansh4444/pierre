@@ -13,10 +13,6 @@ import { getHighlighterThemeStyles } from './getHighlighterThemeStyles';
 import { getTokenOptions } from './getTokenOptions';
 import { renderTokenLines } from './renderTokenLines';
 
-const DEFAULT_PLAIN_TEXT_OPTIONS: ForceFilePlainTextOptions = {
-  forcePlainText: false,
-};
-
 export function renderFileWithHighlighter(
   file: FileContents,
   highlighter: DiffsHighlighter,
@@ -27,7 +23,7 @@ export function renderFileWithHighlighter(
     startingLine,
     totalLines,
     lines,
-  }: ForceFilePlainTextOptions = DEFAULT_PLAIN_TEXT_OPTIONS
+  }: ForceFilePlainTextOptions = { forcePlainText: false }
 ): ThemedFileResult {
   if (forcePlainText) {
     startingLine ??= 0;
@@ -38,7 +34,6 @@ export function renderFileWithHighlighter(
     totalLines = Infinity;
   }
   const isWindowedHighlight = startingLine > 0 || totalLines < Infinity;
-  const state: SharedRenderState = { lineInfo: [] };
   const lang = forcePlainText
     ? 'text'
     : (file.lang ?? getFiletypeFromFileName(file.name));
@@ -48,22 +43,26 @@ export function renderFileWithHighlighter(
     theme,
     highlighter,
   });
-  state.lineInfo = (shikiLineNumber: number) => ({
-    type: 'context',
-    lineIndex: shikiLineNumber - 1 + startingLine,
-    lineNumber: shikiLineNumber + startingLine,
-  });
+  const state: SharedRenderState = {
+    lineInfo: (shikiLineNumber: number) => ({
+      type: 'context',
+      lineIndex: shikiLineNumber - 1 + startingLine,
+      lineNumber: shikiLineNumber + startingLine,
+    }),
+  };
+  // Shiki does not treat a lone carriage return as a line break. Normalize only
+  // the text sent to the highlighter so its output stays aligned with the file
+  // model while the original document retains its line endings.
+  const source = (
+    isWindowedHighlight
+      ? (lines ?? linesFromFileContents(file.contents))
+          .slice(startingLine, startingLine + totalLines)
+          .join('')
+      : file.contents
+  ).replace(/\r(?!\n)/g, '\n');
   const highlightedLines = renderTokenLines(
     highlighter.codeToTokens(
-      normalizeHighlightLineEndings(
-        isWindowedHighlight
-          ? extractWindowedFileContent(
-              lines ?? linesFromFileContents(file.contents),
-              startingLine,
-              totalLines
-            )
-          : file.contents
-      ),
+      source,
       getTokenOptions(lang, theme, tokenizeMaxLineLength)
     ).tokens,
     {
@@ -81,23 +80,4 @@ export function renderFileWithHighlighter(
   }
 
   return { code, themeStyles, baseThemeType };
-}
-
-// Shiki does not treat a lone carriage return as a line break. Normalize only
-// the text sent to the highlighter so its output stays aligned with the file
-// model while the original document retains its line endings.
-function normalizeHighlightLineEndings(contents: string): string {
-  return contents.replace(/\r(?!\n)/g, '\n');
-}
-
-function extractWindowedFileContent(
-  lines: string[],
-  startingLine: number,
-  totalLines: number
-): string {
-  if (lines.length === 0) {
-    return '';
-  }
-  const endLine = Math.min(startingLine + totalLines, lines.length);
-  return lines.slice(startingLine, endLine).join('');
 }

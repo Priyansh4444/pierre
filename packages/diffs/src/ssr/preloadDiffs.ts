@@ -5,7 +5,6 @@ import {
 } from '../components/UnresolvedFile';
 import {
   DiffHunksRenderer,
-  type DiffHunksRendererOptions,
   type HunksRenderResult,
 } from '../renderers/DiffHunksRenderer';
 import { UnresolvedFileHunksRenderer } from '../renderers/UnresolvedFileHunksRenderer';
@@ -65,9 +64,18 @@ export async function preloadDiffHTML<
       'preloadFileDiff: You must pass at least a fileDiff, oldFile, or newFile prop'
     );
   }
-  const renderer = new DiffHunksRenderer<LAnnotation>(
-    getHunksRendererOptions(options)
-  );
+  const renderer = new DiffHunksRenderer<LAnnotation>({
+    ...options,
+    // Match the client's option snapshot: token callbacks imply the
+    // transformer, so server markup hydrates into identical client renders.
+    useTokenTransformer: shouldUseTokenTransformer<'diff'>(options),
+    headerRenderMode:
+      options?.renderCustomHeader != null ? 'custom' : 'default',
+    hunkSeparators:
+      typeof options?.hunkSeparators === 'function'
+        ? 'custom'
+        : options?.hunkSeparators,
+  });
   if (annotations != null && annotations.length > 0) {
     renderer.setLineAnnotations(annotations);
   }
@@ -265,15 +273,15 @@ function processHunkResult<LAnnotation>(
   unsafeCSS: string | undefined,
   themeType: 'system' | 'light' | 'dark'
 ) {
-  const children = [createStyleElement(hunkResult.css, true)];
-  children.push(
+  const children = [
+    createStyleElement(hunkResult.css, true),
     createThemeStyleElement(
       wrapThemeCSS(
         hunkResult.themeStyles,
         hunkResult.baseThemeType ?? themeType
       )
-    )
-  );
+    ),
+  ];
   if (unsafeCSS != null) {
     children.push(createStyleElement(unsafeCSS));
   }
@@ -284,21 +292,4 @@ function processHunkResult<LAnnotation>(
   code.properties['data-dehydrated'] = '';
   children.push(code);
   return children;
-}
-
-function getHunksRendererOptions<LAnnotation, Caret>(
-  options: FileDiffOptions<LAnnotation, Caret> | undefined
-): DiffHunksRendererOptions {
-  return {
-    ...options,
-    // Match the client's option snapshot: token callbacks imply the
-    // transformer, so server markup hydrates into identical client renders.
-    useTokenTransformer: shouldUseTokenTransformer<'diff'>(options),
-    headerRenderMode:
-      options?.renderCustomHeader != null ? 'custom' : 'default',
-    hunkSeparators:
-      typeof options?.hunkSeparators === 'function'
-        ? 'custom'
-        : options?.hunkSeparators,
-  };
 }

@@ -45,7 +45,6 @@ export function createSeparator({
   isFirstHunk,
   isLastHunk,
 }: CreateSeparatorProps): HASTElement {
-  let buttonCount = 0;
   const children = [];
   if (type === 'metadata' && content != null) {
     children.push(
@@ -65,18 +64,16 @@ export function createSeparator({
             !isFirstHunk && !isLastHunk ? 'both' : isFirstHunk ? 'down' : 'up'
           )
         );
-        buttonCount++;
       } else {
         if (!isFirstHunk) {
           contentChildren.push(createExpandButton('up'));
-          buttonCount++;
         }
         if (!isLastHunk) {
           contentChildren.push(createExpandButton('down'));
-          buttonCount++;
         }
       }
     }
+    const buttonCount = contentChildren.length;
     contentChildren.push(
       createHastElement({
         tagName: 'div',

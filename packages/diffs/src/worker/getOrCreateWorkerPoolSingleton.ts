@@ -15,17 +15,13 @@ export function getOrCreateWorkerPoolSingleton({
   poolOptions,
   highlighterOptions,
 }: SetupWorkerPoolProps): WorkerPoolManager {
-  workerPoolSingleton ??= new WorkerPoolManager(
+  return (workerPoolSingleton ??= new WorkerPoolManager(
     poolOptions,
     highlighterOptions
-  );
-  return workerPoolSingleton;
+  ));
 }
 
 export function terminateWorkerPoolSingleton(): void {
-  if (workerPoolSingleton == null) {
-    return;
-  }
-  workerPoolSingleton.terminate();
+  workerPoolSingleton?.terminate();
   workerPoolSingleton = undefined;
 }

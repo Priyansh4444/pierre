@@ -1,3 +1,4 @@
+import { computeLineOffsets } from '../utils/computeFileOffsets';
 import type { TextDocumentChangeTransaction } from './textDocumentChangeTransaction';
 import type { Position, ResolvedTextEdit, TextEdit } from './types';
 
@@ -108,19 +109,6 @@ const CAPTURE_CONTEXT_OPTIONS = [
 ] as const;
 const textEncoder = new TextEncoder();
 
-function lineStarts(text: string): number[] {
-  const starts = [0];
-  for (let index = 0; index < text.length; index++) {
-    if (text.charCodeAt(index) === 13 && text.charCodeAt(index + 1) === 10) {
-      index++;
-    }
-    if (text.charCodeAt(index) === 10 || text.charCodeAt(index) === 13) {
-      starts.push(index + 1);
-    }
-  }
-  return starts;
-}
-
 // A line start at text.length is the boundary after a trailing terminator,
 // not an additional document line for unified-diff counts.
 function diffLineCount(text: string, starts: readonly number[]): number {
@@ -178,32 +166,27 @@ function lineDiffBounds(
   const oldLineCount = diffLineCount(oldText, oldStarts);
   const newLineCount = diffLineCount(newText, newStarts);
   let prefixLines = 0;
-  while (prefixLines < oldLineCount && prefixLines < newLineCount) {
-    if (
-      !linesEqual(
-        oldText,
-        oldStarts,
-        prefixLines,
-        newText,
-        newStarts,
-        prefixLines
-      )
-    ) {
-      break;
-    }
+  while (
+    prefixLines < oldLineCount &&
+    prefixLines < newLineCount &&
+    linesEqual(oldText, oldStarts, prefixLines, newText, newStarts, prefixLines)
+  ) {
     prefixLines++;
   }
 
   let suffixLines = 0;
   while (
     suffixLines < oldLineCount - prefixLines &&
-    suffixLines < newLineCount - prefixLines
+    suffixLines < newLineCount - prefixLines &&
+    linesEqual(
+      oldText,
+      oldStarts,
+      oldLineCount - 1 - suffixLines,
+      newText,
+      newStarts,
+      newLineCount - 1 - suffixLines
+    )
   ) {
-    const oldLine = oldLineCount - 1 - suffixLines;
-    const newLine = newLineCount - 1 - suffixLines;
-    if (!linesEqual(oldText, oldStarts, oldLine, newText, newStarts, newLine)) {
-      break;
-    }
     suffixLines++;
   }
   return { oldLineCount, newLineCount, prefixLines, suffixLines };
@@ -218,8 +201,8 @@ function formatEditHunk(
   if (oldText === newText) {
     return;
   }
-  const oldStarts = lineStarts(oldText);
-  const newStarts = lineStarts(newText);
+  const oldStarts = computeLineOffsets(oldText);
+  const newStarts = computeLineOffsets(newText);
   const bounds = lineDiffBounds(oldText, oldStarts, newText, newStarts);
   if (
     bounds.prefixLines === bounds.oldLineCount &&
@@ -263,26 +246,23 @@ function formatEditHunk(
       newCount === 0 ? line : line + 1
     },${newCount} @@`,
   ];
-  for (let line = start; line < bounds.prefixLines; line++) {
-    output.push(
-      ` ${oldText.slice(oldStarts[line], lineEnd(oldText, oldStarts, line))}`
-    );
-  }
-  for (let line = bounds.prefixLines; line < oldChangedEnd; line++) {
-    output.push(
-      `-${oldText.slice(oldStarts[line], lineEnd(oldText, oldStarts, line))}`
-    );
-  }
-  for (let line = bounds.prefixLines; line < newChangedEnd; line++) {
-    output.push(
-      `+${newText.slice(newStarts[line], lineEnd(newText, newStarts, line))}`
-    );
-  }
-  for (let line = oldChangedEnd; line < oldEnd; line++) {
-    output.push(
-      ` ${oldText.slice(oldStarts[line], lineEnd(oldText, oldStarts, line))}`
-    );
-  }
+  const pushLines = (
+    prefix: string,
+    text: string,
+    starts: readonly number[],
+    from: number,
+    to: number
+  ) => {
+    for (let line = from; line < to; line++) {
+      output.push(
+        prefix + text.slice(starts[line], lineEnd(text, starts, line))
+      );
+    }
+  };
+  pushLines(' ', oldText, oldStarts, start, bounds.prefixLines);
+  pushLines('-', oldText, oldStarts, bounds.prefixLines, oldChangedEnd);
+  pushLines('+', newText, newStarts, bounds.prefixLines, newChangedEnd);
+  pushLines(' ', oldText, oldStarts, oldChangedEnd, oldEnd);
   const hunk = output.join('\n');
   return textEncoder.encode(hunk).byteLength <= MAX_CAPTURE_BYTES
     ? { hunk, bounds }
@@ -363,18 +343,17 @@ function captureEditPredictionTransaction(
     ) {
       continue;
     }
-    const bounds = lineDiffBounds(
-      beforeText,
-      lineStarts(beforeText),
-      afterText,
-      lineStarts(afterText)
-    );
     return {
       beforeText,
       afterText,
       startOffset: afterStart,
       startLine,
-      bounds,
+      bounds: lineDiffBounds(
+        beforeText,
+        computeLineOffsets(beforeText),
+        afterText,
+        computeLineOffsets(afterText)
+      ),
     };
   }
   return undefined;
@@ -389,11 +368,11 @@ export function recordEditPrediction(
   at: number = Date.now()
 ): EditPredictionHistoryRecord[] {
   const kept = history.slice(-MAX_HISTORY_ENTRIES);
+  const last = kept.at(-1);
   const fragment = captureEditPredictionTransaction(document, transaction);
   if (fragment === undefined) {
-    const previous = kept.at(-1);
-    if (previous?.fragment !== undefined) {
-      kept[kept.length - 1] = { ...previous, fragment: undefined };
+    if (last?.fragment !== undefined) {
+      kept[kept.length - 1] = { ...last, fragment: undefined };
     }
     return kept;
   }
@@ -405,23 +384,18 @@ export function recordEditPrediction(
     fragment.startLine +
     fragment.bounds.oldLineCount -
     fragment.bounds.suffixLines;
-  const last = kept.at(-1);
-  const gap =
-    last !== undefined && changedStartLine > last.end
-      ? changedStartLine - last.end
-      : last !== undefined && last.start > beforeChangedEndLine
-        ? last.start - beforeChangedEndLine
-        : 0;
-  const canMerge =
-    last !== undefined &&
-    last.fragment !== undefined &&
+
+  if (
+    last?.fragment !== undefined &&
     last.path === path &&
     last.source === source &&
     at - last.at < COALESCE_MS &&
-    gap <= COALESCE_LINES;
-
-  if (canMerge) {
+    (changedStartLine > last.end
+      ? changedStartLine - last.end
+      : Math.max(0, last.start - beforeChangedEndLine)) <= COALESCE_LINES
+  ) {
     const previous = last.fragment;
+    const previousFirst = previous.currentStart <= fragment.startOffset;
     const beforeEnd = fragment.startOffset + fragment.beforeText.length;
     const overlapStart = Math.max(previous.currentStart, fragment.startOffset);
     const overlapEnd = Math.min(previous.currentEnd, beforeEnd);
@@ -437,16 +411,15 @@ export function recordEditPrediction(
         )
     ) {
       const unionStart = Math.min(previous.currentStart, fragment.startOffset);
-      const currentText =
-        previous.currentStart <= fragment.startOffset
-          ? previous.currentText +
-            fragment.beforeText.slice(
-              Math.max(0, previous.currentEnd - fragment.startOffset)
-            )
-          : fragment.beforeText +
-            previous.currentText.slice(
-              Math.max(0, beforeEnd - previous.currentStart)
-            );
+      const currentText = previousFirst
+        ? previous.currentText +
+          fragment.beforeText.slice(
+            Math.max(0, previous.currentEnd - fragment.startOffset)
+          )
+        : fragment.beforeText +
+          previous.currentText.slice(
+            Math.max(0, beforeEnd - previous.currentStart)
+          );
       const prefix = currentText.slice(0, previous.currentStart - unionStart);
       const suffix = currentText.slice(previous.currentEnd - unionStart);
       const baseText = prefix + previous.baseText + suffix;
@@ -455,10 +428,7 @@ export function recordEditPrediction(
         unionStart,
         transaction.appliedEdits
       );
-      const startLine =
-        previous.currentStart <= fragment.startOffset
-          ? previous.startLine
-          : fragment.startLine;
+      const startLine = previousFirst ? previous.startLine : fragment.startLine;
       if (
         nextText !== undefined &&
         baseText.length <= MAX_CAPTURE_BYTES &&
@@ -495,9 +465,8 @@ export function recordEditPrediction(
       }
     }
   }
-  const previous = kept.at(-1);
-  if (previous?.fragment !== undefined) {
-    kept[kept.length - 1] = { ...previous, fragment: undefined };
+  if (last?.fragment !== undefined) {
+    kept[kept.length - 1] = { ...last, fragment: undefined };
   }
   const formatted = formatEditHunk(
     path,
@@ -624,21 +593,19 @@ export function buildEditPredictionRequest(
   }
   const tokenCosts = new Map<number, number>();
   const costForLine = (line: number): number => {
-    const cached = tokenCosts.get(line);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const lineLength = document.getLineLength(line);
-    if (Math.floor(lineLength / 3) > MAX_CONTEXT_TOKENS) {
-      const cost = MAX_CONTEXT_TOKENS + 1;
+    let cost = tokenCosts.get(line);
+    if (cost === undefined) {
+      cost =
+        Math.floor(document.getLineLength(line) / 3) > MAX_CONTEXT_TOKENS
+          ? MAX_CONTEXT_TOKENS + 1
+          : Math.max(
+              1,
+              Math.floor(
+                textEncoder.encode(document.getLineText(line)).byteLength / 3
+              )
+            );
       tokenCosts.set(line, cost);
-      return cost;
     }
-    const cost = Math.max(
-      1,
-      Math.floor(textEncoder.encode(document.getLineText(line)).byteLength / 3)
-    );
-    tokenCosts.set(line, cost);
     return cost;
   };
 
@@ -677,16 +644,14 @@ export function buildEditPredictionRequest(
     remaining
   ));
 
-  let contextFirst = editableFirst;
-  let contextLast = editableLast;
-  ({ first: contextFirst, last: contextLast } = expandLinewise(
+  const { first: contextFirst, last: contextLast } = expandLinewise(
     document.lineCount,
     costForLine,
     () => true,
-    contextFirst,
-    contextLast,
+    editableFirst,
+    editableLast,
     CONTEXT_TOKENS
-  ));
+  );
   let editableTokens = 0;
   for (let line = editableFirst; line <= editableLast; line++) {
     editableTokens += costForLine(line);
@@ -706,16 +671,17 @@ export function buildEditPredictionRequest(
     line: contextFirst,
     character: 0,
   });
-  const contextEnd = document.offsetAt({
-    line: contextLast,
-    character: document.getLineLength(contextLast),
-  });
-  const excerptText = document.getTextSlice(contextStart, contextEnd);
   const request: EditPredictRequest = {
     path,
     version: document.version,
     eol: document.eol,
-    excerptText,
+    excerptText: document.getTextSlice(
+      contextStart,
+      document.offsetAt({
+        line: contextLast,
+        character: document.getLineLength(contextLast),
+      })
+    ),
     excerptStartLine: contextFirst,
     cursorOffsetInExcerpt: cursor - contextStart,
     editableRange: {

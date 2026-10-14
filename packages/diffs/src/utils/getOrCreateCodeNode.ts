@@ -26,10 +26,6 @@ export function getOrCreateCodeNode({
   } else {
     code.style.removeProperty('grid-row');
   }
-  if (containerSize) {
-    code.setAttribute('data-container-size', '');
-  } else {
-    code.removeAttribute('data-container-size');
-  }
+  code.toggleAttribute('data-container-size', containerSize);
   return code;
 }

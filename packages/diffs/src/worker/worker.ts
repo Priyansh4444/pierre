@@ -2,32 +2,21 @@ import { DEFAULT_THEMES } from '../constants';
 import { attachResolvedLanguages } from '../highlighter/languages/attachResolvedLanguages';
 import { createHighlighter } from '../highlighter/shared_highlighter';
 import { attachResolvedThemes } from '../highlighter/themes/attachResolvedThemes';
-import type { DiffsHighlighter, HighlighterTypes } from '../types';
+import type { DiffsHighlighter } from '../types';
 import { replaceCustomExtensions } from '../utils/getFiletypeFromFileName';
 import { renderDiffWithHighlighter } from '../utils/renderDiffWithHighlighter';
 import { renderFileWithHighlighter } from '../utils/renderFileWithHighlighter';
 import { encodeHastLines } from './hastLinesTransport';
 import type {
   InitializeSuccessResponse,
-  InitializeWorkerRequest,
-  RenderDiffRequest,
-  RenderDiffSuccessResponse,
+  RegisterThemeSuccessResponse,
   RenderErrorResponse,
-  RenderFileRequest,
-  RenderFileSuccessResponse,
-  SetRenderOptionsWorkerRequest,
   WorkerRenderingOptions,
   WorkerRequest,
-  WorkerRequestId,
 } from './types';
-import type {
-  EncodedDiffSuccessResponse,
-  EncodedFileSuccessResponse,
-  InitializeWorkerWireRequest,
-  WorkerWireRequest,
-} from './workerMessage';
+import type { WorkerWireRequest } from './workerMessage';
 
-let highlighter: Promise<DiffsHighlighter> | DiffsHighlighter | undefined;
+let highlighter: Promise<DiffsHighlighter> | undefined;
 let compactResults = false;
 let renderOptions: WorkerRenderingOptions = {
   theme: DEFAULT_THEMES,
@@ -50,18 +39,114 @@ self.addEventListener('message', (event: MessageEvent<WorkerWireRequest>) => {
 async function handleMessage(request: WorkerWireRequest) {
   try {
     switch (request.type) {
-      case 'initialize':
-        await handleInitialize(request);
-        break;
       case 'set-render-options':
-        await handleSetRenderOptions(request);
+        attachResolvedThemes(
+          request.resolvedThemes,
+          await (highlighter ??= createHighlighter())
+        );
+        renderOptions = request.renderOptions;
+        postMessage({
+          type: 'success',
+          id: request.id,
+          requestType: 'set-render-options',
+          sentAt: Date.now(),
+        } satisfies RegisterThemeSuccessResponse);
         break;
+      case 'initialize':
       case 'file':
-        await handleRenderFile(request);
+      case 'diff': {
+        const instance = await (highlighter ??= createHighlighter(
+          request.type === 'initialize'
+            ? request.preferredHighlighter
+            : undefined
+        ));
+        const {
+          id,
+          customExtensionsVersion,
+          customExtensionMap,
+          resolvedLanguages,
+        } = request;
+        if (customExtensionsVersion != null || customExtensionMap != null) {
+          if (customExtensionsVersion == null || customExtensionMap == null) {
+            throw new Error(
+              'Worker request must include both customExtensionsVersion and customExtensionMap'
+            );
+          }
+          replaceCustomExtensions(customExtensionsVersion, customExtensionMap);
+        }
+        if (request.type === 'initialize') {
+          attachResolvedThemes(request.resolvedThemes, instance);
+        }
+        if (resolvedLanguages != null) {
+          attachResolvedLanguages(resolvedLanguages, instance);
+        }
+        if (request.type === 'initialize') {
+          renderOptions = request.renderOptions;
+          compactResults = request.resultFormat === 'hast-ops-v1';
+          postMessage({
+            type: 'success',
+            id,
+            requestType: 'initialize',
+            sentAt: Date.now(),
+          } satisfies InitializeSuccessResponse);
+        } else if (request.type === 'file') {
+          const options = {
+            theme: renderOptions.theme,
+            useTokenTransformer: renderOptions.useTokenTransformer,
+            tokenizeMaxLineLength: renderOptions.tokenizeMaxLineLength,
+          };
+          const result = renderFileWithHighlighter(
+            request.file,
+            instance,
+            options
+          );
+          const code = compactResults
+            ? encodeHastLines(result.code)
+            : undefined;
+          postMessage(
+            {
+              type: 'success',
+              requestType: 'file',
+              id,
+              result: code == null ? result : { ...result, code },
+              options,
+              sentAt: Date.now(),
+            },
+            code == null ? [] : [code.ops.buffer, code.offsets.buffer]
+          );
+        } else {
+          const result = renderDiffWithHighlighter(
+            request.diff,
+            instance,
+            renderOptions
+          );
+          const code = compactResults
+            ? {
+                deletionLines: encodeHastLines(result.code.deletionLines),
+                additionLines: encodeHastLines(result.code.additionLines),
+              }
+            : undefined;
+          postMessage(
+            {
+              type: 'success',
+              requestType: 'diff',
+              id,
+              result: code == null ? result : { ...result, code },
+              options: renderOptions,
+              sentAt: Date.now(),
+            },
+            code == null
+              ? []
+              : [
+                  code.deletionLines.ops.buffer,
+                  code.deletionLines.offsets.buffer,
+                  code.additionLines.ops.buffer,
+                  code.additionLines.offsets.buffer,
+                ]
+          );
+        }
         break;
-      case 'diff':
-        await handleRenderDiff(request);
-        break;
+      }
       default:
         throw new Error(
           `Unknown request type: ${(request as WorkerRequest).type}`
@@ -69,191 +154,15 @@ async function handleMessage(request: WorkerWireRequest) {
     }
   } catch (error) {
     console.error('Worker error:', error);
-    sendError(request.id, error);
+    postMessage({
+      type: 'error',
+      id: request.id,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    } satisfies RenderErrorResponse);
   } finally {
     // Reset legacy RegExp last-match state so it cannot keep a highlighted
     // source string alive after a highlight job completes.
     EMPTY_REGEXP.exec('');
   }
-}
-
-async function handleInitialize({
-  id,
-  renderOptions: options,
-  preferredHighlighter,
-  resolvedThemes,
-  resolvedLanguages,
-  customExtensionsVersion,
-  customExtensionMap,
-  resultFormat,
-}: InitializeWorkerWireRequest): Promise<void> {
-  let highlighter = getHighlighter(preferredHighlighter);
-  if ('then' in highlighter) {
-    highlighter = await highlighter;
-  }
-  syncCustomExtensionsFromRequest({
-    customExtensionsVersion,
-    customExtensionMap,
-  });
-  attachResolvedThemes(resolvedThemes, highlighter);
-  if (resolvedLanguages != null) {
-    attachResolvedLanguages(resolvedLanguages, highlighter);
-  }
-  renderOptions = options;
-  compactResults = resultFormat === 'hast-ops-v1';
-  postMessage({
-    type: 'success',
-    id,
-    requestType: 'initialize',
-    sentAt: Date.now(),
-  } satisfies InitializeSuccessResponse);
-}
-
-async function handleSetRenderOptions({
-  id,
-  renderOptions: options,
-  resolvedThemes,
-}: SetRenderOptionsWorkerRequest): Promise<void> {
-  let highlighter = getHighlighter();
-  if ('then' in highlighter) {
-    highlighter = await highlighter;
-  }
-  attachResolvedThemes(resolvedThemes, highlighter);
-  renderOptions = options;
-  postMessage({
-    type: 'success',
-    id,
-    requestType: 'set-render-options',
-    sentAt: Date.now(),
-  });
-}
-
-async function handleRenderFile({
-  id,
-  file,
-  resolvedLanguages,
-  customExtensionsVersion,
-  customExtensionMap,
-}: RenderFileRequest): Promise<void> {
-  let highlighter = getHighlighter();
-  if ('then' in highlighter) {
-    highlighter = await highlighter;
-  }
-  syncCustomExtensionsFromRequest({
-    customExtensionsVersion,
-    customExtensionMap,
-  });
-  if (resolvedLanguages != null) {
-    attachResolvedLanguages(resolvedLanguages, highlighter);
-  }
-  const fileOptions = {
-    theme: renderOptions.theme,
-    useTokenTransformer: renderOptions.useTokenTransformer,
-    tokenizeMaxLineLength: renderOptions.tokenizeMaxLineLength,
-  };
-  const result = renderFileWithHighlighter(file, highlighter, fileOptions);
-  const code = compactResults ? encodeHastLines(result.code) : undefined;
-  const response: RenderFileSuccessResponse = {
-    type: 'success',
-    requestType: 'file',
-    id,
-    result,
-    options: fileOptions,
-    sentAt: Date.now(),
-  };
-  postMessage(
-    code == null
-      ? response
-      : ({
-          ...response,
-          result: { ...result, code },
-        } satisfies EncodedFileSuccessResponse),
-    code == null ? [] : [code.ops.buffer, code.offsets.buffer]
-  );
-}
-
-async function handleRenderDiff({
-  id,
-  diff,
-  resolvedLanguages,
-  customExtensionsVersion,
-  customExtensionMap,
-}: RenderDiffRequest): Promise<void> {
-  let highlighter = getHighlighter();
-  if ('then' in highlighter) {
-    highlighter = await highlighter;
-  }
-  syncCustomExtensionsFromRequest({
-    customExtensionsVersion,
-    customExtensionMap,
-  });
-  if (resolvedLanguages != null) {
-    attachResolvedLanguages(resolvedLanguages, highlighter);
-  }
-  const result = renderDiffWithHighlighter(diff, highlighter, renderOptions);
-  const code = compactResults
-    ? {
-        deletionLines: encodeHastLines(result.code.deletionLines),
-        additionLines: encodeHastLines(result.code.additionLines),
-      }
-    : undefined;
-  const response: RenderDiffSuccessResponse = {
-    type: 'success',
-    requestType: 'diff',
-    id,
-    result,
-    options: renderOptions,
-    sentAt: Date.now(),
-  };
-  postMessage(
-    code == null
-      ? response
-      : ({
-          ...response,
-          result: { ...result, code },
-        } satisfies EncodedDiffSuccessResponse),
-    code == null
-      ? []
-      : [
-          code.deletionLines.ops.buffer,
-          code.deletionLines.offsets.buffer,
-          code.additionLines.ops.buffer,
-          code.additionLines.offsets.buffer,
-        ]
-  );
-}
-
-function getHighlighter(
-  preferredHighlighter?: HighlighterTypes
-): Promise<DiffsHighlighter> | DiffsHighlighter {
-  highlighter ??= createHighlighter(preferredHighlighter);
-  return highlighter;
-}
-
-function syncCustomExtensionsFromRequest({
-  customExtensionsVersion,
-  customExtensionMap,
-}: Pick<
-  InitializeWorkerRequest | RenderFileRequest | RenderDiffRequest,
-  'customExtensionsVersion' | 'customExtensionMap'
->) {
-  if (customExtensionsVersion == null && customExtensionMap == null) {
-    return;
-  }
-  if (customExtensionsVersion == null || customExtensionMap == null) {
-    throw new Error(
-      'Worker request must include both customExtensionsVersion and customExtensionMap'
-    );
-  }
-  replaceCustomExtensions(customExtensionsVersion, customExtensionMap);
-}
-
-function sendError(id: WorkerRequestId, error: unknown) {
-  const response: RenderErrorResponse = {
-    type: 'error',
-    id,
-    error: error instanceof Error ? error.message : String(error),
-    stack: error instanceof Error ? error.stack : undefined,
-  };
-  postMessage(response);
 }

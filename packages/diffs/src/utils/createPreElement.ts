@@ -20,7 +20,7 @@ export function createPreWrapperProperties({
   type,
   customProperties,
 }: PrePropertiesConfig): Properties {
-  const properties: Properties = {
+  return {
     // NOTE: We always apply custom properties first so the important
     // properties cannot be overridden
     ...customProperties,
@@ -41,6 +41,4 @@ export function createPreWrapperProperties({
     // wrapper that wants to own keyboard navigation of the selection.
     style: `--diffs-min-number-column-width-default:${`${totalLines}`.length}ch;`,
   };
-
-  return properties;
 }

@@ -110,33 +110,26 @@ export class FileStream {
     const [source, wrapper] = this.queuedSetupArgs;
     this.queuedSetupArgs = undefined;
 
-    this.setupStream(source, wrapper, highlighter);
-  }
-
-  private setupStream(
-    stream: ReadableStream<string>,
-    wrapper: HTMLElement,
-    highlighter: DiffsHighlighter
-  ): void {
     const {
       disableLineNumbers = false,
       overflow = 'scroll',
       theme = DEFAULT_THEMES,
       themeType = 'system',
     } = this.options;
-    const fileContainer = this.getOrCreateFileContainer();
+    const fileContainer = (this.fileContainer ??=
+      document.createElement(DIFFS_TAG_NAME));
     if (fileContainer.parentElement == null) {
       wrapper.appendChild(fileContainer);
     }
-    this.pre ??= document.createElement('pre');
-    if (this.pre.parentElement == null) {
-      fileContainer.shadowRoot?.appendChild(this.pre);
+    const pre = (this.pre ??= document.createElement('pre'));
+    if (pre.parentElement == null) {
+      fileContainer.shadowRoot?.appendChild(pre);
     }
     const baseThemeType =
       typeof theme === 'string' ? highlighter.getTheme(theme).type : undefined;
     const themeStyles = getHighlighterThemeStyles({ theme, highlighter });
     this.applyThemeState(fileContainer, themeStyles, themeType, baseThemeType);
-    const pre = setPreNodeProperties(this.pre, {
+    setPreNodeProperties(pre, {
       type: 'file',
       diffIndicators: 'none',
       disableBackground: true,
@@ -146,8 +139,6 @@ export class FileStream {
       totalLines: 0,
     });
     pre.textContent = '';
-
-    this.pre = pre;
     this.code = getOrCreateCodeNode({ code: this.code, pre });
     this.gutterElement = undefined;
     this.contentElement = undefined;
@@ -164,7 +155,7 @@ export class FileStream {
     // Cancel the prior source so upstream producers stop generating tokens.
     // Swallow AbortError / locked-stream rejections since we're tearing down.
     this.stream?.cancel().catch(() => {});
-    this.stream = stream;
+    this.stream = source;
     const tokenStream = new CodeToTokenTransformStream({
       ...getTokenOptions(
         this.options.lang ?? 'text',
@@ -175,7 +166,7 @@ export class FileStream {
       allowRecalls: true,
     });
     this.tokenStream = tokenStream;
-    this.stream
+    source
       .pipeThrough(tokenStream)
       .pipeTo(
         new WritableStream({
@@ -224,13 +215,44 @@ export class FileStream {
   private streamClosed = false;
   private render = () => {
     this.options.onPreRender?.(this);
-    const { gutter, content } = this.getOrCreateStreamColumns();
+    if (this.code == null) {
+      throw new Error('FileStream: expected code element to exist');
+    }
+    if (this.gutterElement == null || this.contentElement == null) {
+      this.gutterElement = document.createElement('div');
+      this.gutterElement.dataset.gutter = '';
+      this.contentElement = document.createElement('div');
+      this.contentElement.dataset.content = '';
+      this.code.appendChild(this.gutterElement);
+      this.code.appendChild(this.contentElement);
+    }
+    const { gutterElement: gutter, contentElement: content } = this;
     const gutterFragment = document.createDocumentFragment();
     const contentFragment = document.createDocumentFragment();
     const cacheHtmlStyle =
       this.tokenStream?.options.highlighter.name === 'highlights';
     const appendLine = () => {
-      const { gutterLine, contentLine } = this.createLine();
+      const lineNumber = this.currentLineIndex;
+      const lineIndex = `${lineNumber - 1}`;
+      const gutterLine = document.createElement('div');
+      gutterLine.dataset.columnNumber = `${lineNumber}`;
+      gutterLine.dataset.lineType = 'context';
+      gutterLine.dataset.lineIndex = lineIndex;
+
+      const numberContent = document.createElement('span');
+      numberContent.dataset.lineNumberContent = '';
+      numberContent.textContent = `${lineNumber}`;
+      gutterLine.appendChild(numberContent);
+
+      const contentLine = document.createElement('div');
+      contentLine.dataset.line = `${lineNumber}`;
+      contentLine.dataset.lineType = 'context';
+      contentLine.dataset.lineIndex = lineIndex;
+
+      this.currentRowCount += 1;
+      gutter.style.gridRow = `span ${this.currentRowCount}`;
+      content.style.gridRow = `span ${this.currentRowCount}`;
+      this.currentLineElement = contentLine;
       gutterFragment.appendChild(gutterLine);
       contentFragment.appendChild(contentLine);
     };
@@ -281,80 +303,6 @@ export class FileStream {
     this.queuedTokens.length = 0;
     this.options.onPostRender?.(this);
   };
-
-  private getOrCreateStreamColumns(): {
-    gutter: HTMLElement;
-    content: HTMLElement;
-  } {
-    if (this.code == null) {
-      throw new Error('FileStream: expected code element to exist');
-    }
-    if (this.gutterElement != null && this.contentElement != null) {
-      return { gutter: this.gutterElement, content: this.contentElement };
-    }
-    const gutter = document.createElement('div');
-    gutter.dataset.gutter = '';
-    const content = document.createElement('div');
-    content.dataset.content = '';
-    this.code.appendChild(gutter);
-    this.code.appendChild(content);
-    this.gutterElement = gutter;
-    this.contentElement = content;
-    return { gutter, content };
-  }
-
-  private updateRowSpan(): void {
-    if (this.gutterElement != null) {
-      this.gutterElement.style.gridRow = `span ${this.currentRowCount}`;
-    }
-    if (this.contentElement != null) {
-      this.contentElement.style.gridRow = `span ${this.currentRowCount}`;
-    }
-  }
-
-  private createLine(): { gutterLine: HTMLElement; contentLine: HTMLElement } {
-    const lineNumber = this.currentLineIndex;
-    const lineIndex = `${lineNumber - 1}`;
-    const gutterLine = document.createElement('div');
-    gutterLine.dataset.columnNumber = `${lineNumber}`;
-    gutterLine.dataset.lineType = 'context';
-    gutterLine.dataset.lineIndex = lineIndex;
-
-    const numberContent = document.createElement('span');
-    numberContent.dataset.lineNumberContent = '';
-    numberContent.textContent = `${lineNumber}`;
-    gutterLine.appendChild(numberContent);
-
-    const contentLine = document.createElement('div');
-    contentLine.dataset.line = `${lineNumber}`;
-    contentLine.dataset.lineType = 'context';
-    contentLine.dataset.lineIndex = lineIndex;
-
-    this.currentRowCount += 1;
-    this.updateRowSpan();
-    this.currentLineElement = contentLine;
-    return { gutterLine, contentLine };
-  }
-
-  private getOrCreateFileContainer(fileContainer?: HTMLElement): HTMLElement {
-    if (
-      (fileContainer != null && fileContainer === this.fileContainer) ||
-      (fileContainer == null && this.fileContainer != null)
-    ) {
-      return this.fileContainer;
-    }
-    if (
-      this.fileContainer != null &&
-      fileContainer != null &&
-      fileContainer !== this.fileContainer
-    ) {
-      this.themeCSSStyle = undefined;
-      this.appliedThemeCSS = undefined;
-    }
-    this.fileContainer =
-      fileContainer ?? document.createElement(DIFFS_TAG_NAME);
-    return this.fileContainer;
-  }
 
   private applyThemeState(
     container: HTMLElement,

@@ -49,16 +49,15 @@ class TextBuffer {
     const offset = this.text.length;
     for (let i = 0; i < text.length; i++) {
       const charCode = text.charCodeAt(i);
-      if (charCode !== LINE_FEED && charCode !== CARRIAGE_RETURN) {
-        continue;
+      if (charCode === LINE_FEED || charCode === CARRIAGE_RETURN) {
+        if (
+          charCode === CARRIAGE_RETURN &&
+          text.charCodeAt(i + 1) === LINE_FEED
+        ) {
+          i++;
+        }
+        this.lineOffsets.push(offset + i + 1);
       }
-      if (
-        charCode === CARRIAGE_RETURN &&
-        text.charCodeAt(i + 1) === LINE_FEED
-      ) {
-        i++;
-      }
-      this.lineOffsets.push(offset + i + 1);
     }
     this.text += text;
     return offset;
@@ -106,15 +105,14 @@ class PieceNode {
   }
 }
 
-/**
- * A piece table is a data structure that allows for efficient insertion and deletion of text.
- * It is a tree of pieces, where each piece is a segment of text that is either original or added.
- * The tree is a treap (a binary search tree that also keeps each node's random priority in heap
- * order, which keeps the tree balanced without an explicit rebalancing pass). Each edit reshapes
- * only the nodes along one root-to-leaf path via split and merge in O(log P), instead of
- * rebuilding all P pieces.
- * Inspired by https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation
- */
+// A piece table allows efficient insertion and deletion of text. It is a tree
+// of pieces, where each piece is a segment of text that is either original or
+// added. The tree is a treap (a binary search tree that also keeps each node's
+// random priority in heap order, which keeps the tree balanced without an
+// explicit rebalancing pass). Each edit reshapes only the nodes along one
+// root-to-leaf path via split and merge in O(log P), instead of rebuilding all
+// P pieces.
+// Inspired by https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation
 export class PieceTable {
   #original: TextBuffer;
   #add = new TextBuffer('');
@@ -134,9 +132,12 @@ export class PieceTable {
 
   constructor(originalText: string) {
     this.#original = new TextBuffer(originalText);
-    const piece = this.#createPiece(Piece.Original, 0, originalText.length);
-    this.#root = piece.length > 0 ? this.#createNode(piece) : null;
-    this.#length = this.#root?.subtreeLength ?? 0;
+    this.#length = originalText.length;
+    if (this.#length > 0) {
+      this.#root = this.#createNode(
+        this.#createPiece(Piece.Original, 0, this.#length)
+      );
+    }
     this.#lineCount = (this.#root?.subtreeLineBreakCount ?? 0) + 1;
   }
 
@@ -148,9 +149,10 @@ export class PieceTable {
     if (range === undefined) {
       return this.#textFromPieces();
     }
-    const start = this.offsetAt(range.start);
-    const end = this.offsetAt(range.end);
-    return this.getTextSlice(start, end);
+    return this.getTextSlice(
+      this.offsetAt(range.start),
+      this.offsetAt(range.end)
+    );
   }
 
   getLineText(line: number, includeLineBreak = false): string {
@@ -161,11 +163,8 @@ export class PieceTable {
     ) {
       return this.#lastVisitedLine[2];
     }
-    const offset = this.#getLineOffset(line);
-    if (offset === undefined) {
-      throw new Error(`Line index out of range: ${line}`);
-    }
-    const text = this.getTextSlice(offset[0], offset[1], !includeLineBreak);
+    const [start, end] = this.#getLineOffset(line);
+    const text = this.getTextSlice(start, end, !includeLineBreak);
     this.#lastVisitedLine = [line, includeLineBreak, text];
     this.#lastVisitedLineLength = [line, includeLineBreak, text.length];
     return text;
@@ -190,11 +189,7 @@ export class PieceTable {
       this.#lastVisitedLineLength = [line, includeLineBreak, length];
       return length;
     }
-    const offset = this.#getLineOffset(line);
-    if (offset === undefined) {
-      throw new Error(`Line index out of range: ${line}`);
-    }
-    const [start, end] = offset;
+    const [start, end] = this.#getLineOffset(line);
     let length = end - start;
     if (!includeLineBreak) {
       while (
@@ -209,10 +204,6 @@ export class PieceTable {
   }
 
   getTextSlice(start: number, end: number, trimEOF = false): string {
-    if (start >= end) {
-      return '';
-    }
-
     const sliceStart = clamp(start, 0, this.#length);
     const sliceEnd = clamp(end, sliceStart, this.#length);
     if (sliceStart >= sliceEnd) {
@@ -225,7 +216,7 @@ export class PieceTable {
     }
 
     const chunks: string[] = [];
-    let [node, offsetInPiece] = location as [PieceNode | null, number];
+    let [node, offsetInPiece]: [PieceNode | null, number] = location;
     let remaining = sliceEnd - sliceStart;
     while (node !== null && remaining > 0) {
       const takeLength = Math.min(node.piece.length - offsetInPiece, remaining);
@@ -252,36 +243,17 @@ export class PieceTable {
       return '';
     }
 
-    const [node, offsetInPiece] = location;
-    const buffer = this.#bufferFor(node.piece.source);
-    return buffer.text.charAt(node.piece.offset + offsetInPiece);
+    const [{ piece }, offsetInPiece] = location;
+    return this.#bufferFor(piece.source).text.charAt(
+      piece.offset + offsetInPiece
+    );
   }
 
   includes(needle: string): boolean {
-    if (needle.length === 0) {
-      return true;
-    }
-
-    const prefixTable = createPrefixTable(needle);
-    let matched = 0;
-    let found = false;
-    this.#forEachPieceSegment((segment) => {
-      for (let offset = segment.start; offset < segment.end; offset++) {
-        const charCode = segment.text.charCodeAt(offset);
-        while (matched > 0 && charCode !== needle.charCodeAt(matched)) {
-          matched = prefixTable[matched - 1];
-        }
-        if (charCode === needle.charCodeAt(matched)) {
-          matched++;
-        }
-        if (matched === needle.length) {
-          found = true;
-          return false;
-        }
-      }
-      return true;
-    });
-    return found;
+    return (
+      needle.length === 0 ||
+      this.findNextNonOverlappingSubstring(needle, []) !== undefined
+    );
   }
 
   findNextNonOverlappingSubstring(
@@ -292,17 +264,49 @@ export class PieceTable {
       return undefined;
     }
 
-    const ranges = normalizeRanges(occupied, this.#length);
-    const pivot = ranges.reduce((max, [, end]) => Math.max(max, end), 0);
-    const prefixTable = createPrefixTable(needle);
+    // Clamp, sort and merge the occupied ranges so their ends are ascending
+    // and one binary search finds the only range that can overlap a match.
+    const clamped: [start: number, end: number][] = [];
+    for (const [rawStart, rawEnd] of occupied) {
+      const start = clamp(rawStart, 0, this.#length);
+      const end = clamp(rawEnd, start, this.#length);
+      if (start < end) {
+        clamped.push([start, end]);
+      }
+    }
+    clamped.sort((a, b) => a[0] - b[0]);
+    const ranges: [start: number, end: number][] = [];
+    for (const range of clamped) {
+      const previous = ranges[ranges.length - 1];
+      if (previous !== undefined && range[0] <= previous[1]) {
+        previous[1] = Math.max(previous[1], range[1]);
+      } else {
+        ranges.push(range);
+      }
+    }
+    const ends = ranges.map(([, end]) => end);
+    const pivot = ends.at(-1) ?? 0;
+
+    // KMP prefix table for the needle.
+    const prefixTable = new Array<number>(needle.length).fill(0);
+    for (let i = 1, matched = 0; i < needle.length; i++) {
+      const charCode = needle.charCodeAt(i);
+      while (matched > 0 && charCode !== needle.charCodeAt(matched)) {
+        matched = prefixTable[matched - 1];
+      }
+      if (charCode === needle.charCodeAt(matched)) {
+        matched++;
+      }
+      prefixTable[i] = matched;
+    }
+
     let matched = 0;
     let documentOffset = 0;
     let wrappedOffset: number | undefined;
     let foundOffset: number | undefined;
-
-    this.#forEachPieceSegment((segment) => {
-      for (let offset = segment.start; offset < segment.end; offset++) {
-        const charCode = segment.text.charCodeAt(offset);
+    this.#walk(this.#root, (text, start, end) => {
+      for (let offset = start; offset < end; offset++) {
+        const charCode = text.charCodeAt(offset);
         while (matched > 0 && charCode !== needle.charCodeAt(matched)) {
           matched = prefixTable[matched - 1];
         }
@@ -310,13 +314,14 @@ export class PieceTable {
           matched++;
         }
         if (matched === needle.length) {
-          const start = documentOffset - needle.length + 1;
-          if (!rangeOverlaps(ranges, start, start + needle.length)) {
-            if (start >= pivot) {
-              foundOffset = start;
+          const matchStart = documentOffset - needle.length + 1;
+          const range = ranges[upperBound(ends, matchStart)];
+          if (range === undefined || range[0] >= matchStart + needle.length) {
+            if (matchStart >= pivot) {
+              foundOffset = matchStart;
               return false;
             }
-            wrappedOffset ??= start;
+            wrappedOffset ??= matchStart;
           }
           matched = prefixTable[matched - 1];
         }
@@ -335,11 +340,8 @@ export class PieceTable {
 
     // Search currently operates line-by-line, so newline-spanning patterns are unsupported.
     if (
-      searchParams.text.includes('\n') ||
-      searchParams.text.includes('\r') ||
-      (searchParams.regex &&
-        (searchParams.text.includes('\\n') ||
-          searchParams.text.includes('\\r')))
+      /[\n\r]/.test(searchParams.text) ||
+      (searchParams.regex && /\\[nr]/.test(searchParams.text))
     ) {
       return [];
     }
@@ -355,18 +357,6 @@ export class PieceTable {
       return [];
     }
 
-    return this.#collectSearchMatchesLineByLine(
-      pattern,
-      searchParams.wholeWord,
-      MAX_FIND_MATCHES
-    );
-  }
-
-  #collectSearchMatchesLineByLine(
-    pattern: RegExp,
-    wholeWord: boolean,
-    limit: number
-  ): [number, number][] {
     const out: [number, number][] = [];
     // Search visits the whole document, so flatten it once instead of making
     // several treap descents for every line and whole-word boundary.
@@ -397,12 +387,18 @@ export class PieceTable {
           continue;
         }
         const docStart = lineStart + rel;
+        const docEnd = docStart + fragment.length;
+        // Whole-word matches need a word separator (or a document edge) on
+        // both sides.
         if (
-          !wholeWord ||
-          isWholeWordAtDocOffsets(documentText, docStart, fragment.length)
+          !searchParams.wholeWord ||
+          ((docStart <= 0 ||
+            isWordSeparatorCharCode(documentText.charCodeAt(docStart - 1))) &&
+            (docEnd >= docLength ||
+              isWordSeparatorCharCode(documentText.charCodeAt(docEnd))))
         ) {
-          out.push([docStart, docStart + fragment.length]);
-          if (out.length >= limit) {
+          out.push([docStart, docEnd]);
+          if (out.length >= MAX_FIND_MATCHES) {
             return out;
           }
         }
@@ -415,25 +411,16 @@ export class PieceTable {
   }
 
   insert(text: string, offset: number): void {
-    if (text.length === 0) {
-      return;
+    if (text.length > 0) {
+      this.applyEdits([{ start: offset, end: offset, text }]);
     }
-    const start = clamp(offset, 0, this.#length);
-    this.#replaceRangeIncremental(start, start, text);
-    this.#invalidateCaches();
   }
 
   delete(offset: number, length: number): void {
-    if (length <= 0 || this.#length === 0) {
-      return;
-    }
     const start = clamp(offset, 0, this.#length);
-    const end = clamp(start + length, start, this.#length);
-    if (start === end) {
-      return;
+    if (length > 0 && start < this.#length) {
+      this.applyEdits([{ start, end: start + length, text: '' }]);
     }
-    this.#replaceRangeIncremental(start, end, '');
-    this.#invalidateCaches();
   }
 
   applyEdits(edits: readonly ResolvedTextEdit[]): void {
@@ -442,15 +429,56 @@ export class PieceTable {
     }
     // Edits arrive sorted ascending and non-overlapping (TextDocument enforces
     // this). Applying them from last to first keeps each remaining edit's
-    // offsets valid, since edits at higher offsets never shift lower ones, and
-    // every edit becomes an O(log P) incremental replace.
+    // offsets valid, since edits at higher offsets never shift lower ones.
+    // Each edit splits the tree at its start, drops the deleted prefix from
+    // the remainder, and joins the inserted piece back in. Every tree
+    // operation touches only one root-to-leaf path, so the edit is O(log P)
+    // instead of rebuilding all P pieces.
     for (let i = edits.length - 1; i >= 0; i--) {
-      const edit = edits[i];
-      const start = clamp(edit.start, 0, this.#length);
-      const end = clamp(edit.end, start, this.#length);
-      this.#replaceRangeIncremental(start, end, edit.text);
+      const { text } = edits[i];
+      const start = clamp(edits[i].start, 0, this.#length);
+      const end = clamp(edits[i].end, start, this.#length);
+      if (start === end && text.length === 0) {
+        continue;
+      }
+
+      const [left, rest] = this.#split(this.#root, start);
+      const right = this.#dropPrefix(rest, end - start);
+      let root: PieceNode | null;
+      if (text.length > 0) {
+        // The inserted text is fresh at the end of the add buffer, so it can
+        // only sit next to the piece on its left, never the one on its right.
+        root = this.#mergeNodes(
+          this.#appendCoalescing(
+            left,
+            this.#createPiece(Piece.Added, this.#add.append(text), text.length)
+          ),
+          right
+        );
+      } else {
+        // Pure deletion: the pieces now meeting at the seam may be contiguous
+        // in the same buffer, so re-attach the right side's first piece
+        // through the coalescing append to merge them when possible.
+        const [seamPiece, restRight] = this.#popLeftmost(right);
+        root =
+          seamPiece === undefined
+            ? left
+            : this.#mergeNodes(
+                this.#appendCoalescing(left, seamPiece),
+                restRight
+              );
+      }
+      if (root !== null) {
+        root.parent = null;
+      }
+      this.#root = root;
+      this.#length = root?.subtreeLength ?? 0;
+      this.#lineCount = (root?.subtreeLineBreakCount ?? 0) + 1;
     }
-    this.#invalidateCaches();
+    // Clear read caches once, including for multi-edit batches.
+    this.#lastVisitedLine = null;
+    this.#lastVisitedLineLength = null;
+    this.#lastPosition = null;
   }
 
   positionAt(offset: number): Position {
@@ -465,28 +493,9 @@ export class PieceTable {
     return { line, character };
   }
 
-  positionsAt(offsets: readonly number[]): Position[] {
-    const positions: Position[] = Array.from({ length: offsets.length });
-    if (offsets.length === 0) {
-      return positions;
-    }
-    if (this.#length === 0) {
-      return positions.fill({ line: 0, character: 0 });
-    }
-
-    for (let i = 0; i < offsets.length; i++) {
-      positions[i] = this.positionAt(offsets[i]);
-    }
-
-    return positions;
-  }
-
   offsetAt(position: Position): number {
     if (position.line < 0 || this.#length === 0) {
       return 0;
-    }
-    if (position.line >= this.#lineCount) {
-      throw new Error(`Line index out of range: ${position.line}`);
     }
     const lastPosition = this.#lastPosition;
     if (
@@ -496,12 +505,8 @@ export class PieceTable {
     ) {
       return lastPosition[2];
     }
-    const offset = this.#getLineOffset(position.line);
-    if (offset === undefined) {
-      throw new Error(`Line index out of range: ${position.line}`);
-    }
-    const character = clamp(position.character, 0, offset[1] - offset[0]);
-    return offset[0] + character;
+    const [start, end] = this.#getLineOffset(position.line);
+    return start + clamp(position.character, 0, end - start);
   }
 
   #findPieceAtOffset(
@@ -548,17 +553,8 @@ export class PieceTable {
     return current.parent;
   }
 
-  #getLineOffset(line: number): [start: number, end: number] | undefined {
-    if (line < 0) {
-      throw new Error(`Line index out of range: ${line}`);
-    }
-    if (this.#length === 0) {
-      if (line === 0) {
-        return [0, 0];
-      }
-      throw new Error(`Line index out of range: ${line}`);
-    }
-    if (line >= this.#lineCount) {
+  #getLineOffset(line: number): [start: number, end: number] {
+    if (line < 0 || line >= this.#lineCount) {
       throw new Error(`Line index out of range: ${line}`);
     }
 
@@ -570,7 +566,7 @@ export class PieceTable {
 
   #lineAtOffset(offset: number): number {
     let node = this.#root;
-    let remaining = clamp(offset, 0, this.#length);
+    let remaining = offset;
     let line = 0;
 
     while (node !== null) {
@@ -593,20 +589,18 @@ export class PieceTable {
           node.piece.lineOffsetEnd
         );
         line += lineOffsetEnd - node.piece.lineOffsetStart;
-        if (
-          remaining === node.piece.length &&
-          node.piece.hasVirtualTrailingCRBreak
-        ) {
-          line++;
-        }
-        if (
-          remaining === node.piece.length &&
-          formsCRLF(
-            node.piece.lastCharCode,
-            this.#nextNode(node)?.piece.firstCharCode
-          )
-        ) {
-          line--;
+        if (remaining === node.piece.length) {
+          if (node.piece.hasVirtualTrailingCRBreak) {
+            line++;
+          }
+          if (
+            formsCRLF(
+              node.piece.lastCharCode,
+              this.#nextNode(node)?.piece.firstCharCode
+            )
+          ) {
+            line--;
+          }
         }
         return line;
       }
@@ -651,8 +645,14 @@ export class PieceTable {
         node.piece.lineBreakCount -
         (formsCRLF(node.piece.lastCharCode, nextCharCode) ? 1 : 0);
       if (remaining < pieceLineBreakCount) {
+        const { piece } = node;
         return (
-          documentOffset + this.#pieceLineBreakOffset(node.piece, remaining)
+          documentOffset +
+          (remaining < piece.lineOffsetEnd - piece.lineOffsetStart
+            ? this.#bufferFor(piece.source).lineOffsets[
+                piece.lineOffsetStart + remaining
+              ] - piece.offset
+            : piece.length)
         );
       }
 
@@ -664,46 +664,12 @@ export class PieceTable {
     return this.#length;
   }
 
-  #pieceLineBreakOffset(piece: Piece, lineBreakIndex: number): number {
-    const bufferLineBreakCount = piece.lineOffsetEnd - piece.lineOffsetStart;
-    if (lineBreakIndex < bufferLineBreakCount) {
-      const bufferLineOffset = this.#bufferFor(piece.source).lineOffsets[
-        piece.lineOffsetStart + lineBreakIndex
-      ];
-      return bufferLineOffset - piece.offset;
-    }
-    return piece.length;
-  }
-
   #textFromPieces(): string {
     const chunks: string[] = [];
-    this.#forEachPieceSegment((segment) => {
-      chunks.push(segment.text.slice(segment.start, segment.end));
+    this.#walk(this.#root, (text, start, end) => {
+      chunks.push(text.slice(start, end));
     });
     return chunks.join('');
-  }
-
-  #forEachPieceSegment(
-    callback: (segment: {
-      readonly start: number;
-      readonly end: number;
-      readonly text: string;
-      readonly lineOffsets: number[];
-      readonly lineOffsetStart: number;
-      readonly lineOffsetEnd: number;
-    }) => boolean | void
-  ): void {
-    this.#walk(this.#root, (node) => {
-      const buffer = this.#bufferFor(node.piece.source);
-      return callback({
-        text: buffer.text,
-        lineOffsets: buffer.lineOffsets,
-        lineOffsetStart: node.piece.lineOffsetStart,
-        lineOffsetEnd: node.piece.lineOffsetEnd,
-        start: node.piece.offset,
-        end: node.piece.offset + node.piece.length,
-      });
-    });
   }
 
   #bufferFor(source: number): TextBuffer {
@@ -729,70 +695,11 @@ export class PieceTable {
     );
   }
 
-  // Replaces document range [start, end) with `text` by splitting at the start,
-  // dropping the deleted prefix from the remainder, and joining the inserted
-  // piece back in. Each tree operation touches only one root-to-leaf path, so
-  // the edit is O(log P) instead of rebuilding all P pieces. `start`/`end` must
-  // be clamped into [0, length] with start <= end.
-  #replaceRangeIncremental(start: number, end: number, text: string): void {
-    if (start === end && text.length === 0) {
-      return;
-    }
-
-    const [left, rest] = this.#split(this.#root, start);
-    const right = this.#dropPrefix(rest, end - start);
-
-    let root: PieceNode | null;
-    if (text.length > 0) {
-      const insertedPiece = this.#createPiece(
-        Piece.Added,
-        this.#add.append(text),
-        text.length
-      );
-      // The inserted text is fresh at the end of the add buffer, so it can only
-      // sit next to the piece on its left, never the one on its right.
-      root = this.#mergeNodes(
-        this.#appendCoalescing(left, insertedPiece),
-        right
-      );
-    } else {
-      // Pure deletion: the pieces now meeting at the seam may be contiguous in
-      // the same buffer, so re-attach the right side's first piece through the
-      // coalescing append to merge them when possible.
-      const [seamPiece, restRight] = this.#popLeftmost(right);
-      root =
-        seamPiece === undefined
-          ? left
-          : this.#mergeNodes(
-              this.#appendCoalescing(left, seamPiece),
-              restRight
-            );
-    }
-
-    if (root !== null) {
-      root.parent = null;
-    }
-    this.#root = root;
-    this.#length = root?.subtreeLength ?? 0;
-    this.#lineCount = (root?.subtreeLineBreakCount ?? 0) + 1;
-  }
-
-  // Public mutations clear read caches once, including multi-edit batches.
-  #invalidateCaches(): void {
-    this.#lastVisitedLine = null;
-    this.#lastVisitedLineLength = null;
-    this.#lastPosition = null;
-  }
-
-  #nextPriority(): number {
-    this.#priorityState =
-      (Math.imul(this.#priorityState, 1664525) + 1013904223) >>> 0;
-    return this.#priorityState;
-  }
-
   #createNode(piece: Piece): PieceNode {
     const node = new PieceNode(piece);
-    node.priority = this.#nextPriority();
+    this.#priorityState =
+      (Math.imul(this.#priorityState, 1664525) + 1013904223) >>> 0;
+    node.priority = this.#priorityState;
     return node;
   }
 
@@ -939,8 +846,24 @@ export class PieceTable {
     while (last.right !== null) {
       last = last.right;
     }
-    if (canCoalescePieces(last.piece, piece)) {
-      last.piece = coalesceTwoPieces(last.piece, piece);
+    const prev = last.piece;
+    // CRLF seams stay explicit because separately appended buffer chunks may
+    // each record a break there; the tree aggregate reconciles the pair.
+    if (
+      prev.source === piece.source &&
+      prev.offset + prev.length === piece.offset &&
+      !formsCRLF(prev.lastCharCode, piece.firstCharCode)
+    ) {
+      last.piece = new Piece(
+        prev.source,
+        prev.offset,
+        prev.length + piece.length,
+        prev.lineOffsetStart,
+        piece.lineOffsetEnd,
+        piece.hasVirtualTrailingCRBreak,
+        prev.firstCharCode,
+        piece.lastCharCode
+      );
       // The last piece grew, so refresh aggregates from it up to the root.
       for (let node: PieceNode | null = last; node !== null; ) {
         node.updateSubtreeLength();
@@ -973,9 +896,11 @@ export class PieceTable {
     return [piece, tree];
   }
 
+  // Visits each piece's buffer text and [start, end) range in document order;
+  // stops early when `visit` returns false.
   #walk(
     node: PieceNode | null,
-    visit: (node: PieceNode) => boolean | void
+    visit: (text: string, start: number, end: number) => boolean | void
   ): boolean {
     if (node === null) {
       return true;
@@ -983,7 +908,14 @@ export class PieceTable {
     if (!this.#walk(node.left, visit)) {
       return false;
     }
-    if (visit(node) === false) {
+    const { piece } = node;
+    if (
+      visit(
+        this.#bufferFor(piece.source).text,
+        piece.offset,
+        piece.offset + piece.length
+      ) === false
+    ) {
       return false;
     }
     return this.#walk(node.right, visit);
@@ -996,94 +928,6 @@ function isEOL(charCode: number): boolean {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
-}
-
-function createPrefixTable(text: string): number[] {
-  const table = Array.from<number>({ length: text.length }).fill(0);
-  let matched = 0;
-  for (let i = 1; i < text.length; i++) {
-    const charCode = text.charCodeAt(i);
-    while (matched > 0 && charCode !== text.charCodeAt(matched)) {
-      matched = table[matched - 1];
-    }
-    if (charCode === text.charCodeAt(matched)) {
-      matched++;
-    }
-    table[i] = matched;
-  }
-  return table;
-}
-
-function normalizeRanges(
-  ranges: readonly [start: number, end: number][],
-  length: number
-): [start: number, end: number][] {
-  const normalized: [start: number, end: number][] = [];
-  for (const [rawStart, rawEnd] of ranges) {
-    const start = clamp(rawStart, 0, length);
-    const end = clamp(rawEnd, start, length);
-    if (start < end) {
-      normalized.push([start, end]);
-    }
-  }
-  normalized.sort((a, b) => a[0] - b[0]);
-
-  const merged: [start: number, end: number][] = [];
-  for (const range of normalized) {
-    const previous = merged[merged.length - 1];
-    if (previous !== undefined && range[0] <= previous[1]) {
-      previous[1] = Math.max(previous[1], range[1]);
-      continue;
-    }
-    merged.push(range);
-  }
-  return merged;
-}
-
-function rangeOverlaps(
-  ranges: readonly [start: number, end: number][],
-  start: number,
-  end: number
-): boolean {
-  let low = 0;
-  let high = ranges.length;
-  while (low < high) {
-    const mid = low + Math.floor((high - low) / 2);
-    if (ranges[mid][1] <= start) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-
-  const range = ranges[low];
-  return range !== undefined && range[0] < end;
-}
-
-// CRLF seams stay explicit because separately appended buffer chunks may each
-// record a break there; the tree aggregate reconciles the document-level pair.
-function canCoalescePieces(prev: Piece, next: Piece): boolean {
-  return (
-    prev.source === next.source &&
-    prev.offset + prev.length === next.offset &&
-    !formsCRLF(prev.lastCharCode, next.firstCharCode)
-  );
-}
-
-// Joins two adjacent pieces (see canCoalescePieces) into one. Keeping the table
-// compact after every edit is what stops the piece count from growing without
-// bound during normal typing.
-function coalesceTwoPieces(prev: Piece, next: Piece): Piece {
-  return new Piece(
-    prev.source,
-    prev.offset,
-    prev.length + next.length,
-    prev.lineOffsetStart,
-    next.lineOffsetEnd,
-    next.hasVirtualTrailingCRBreak,
-    prev.firstCharCode,
-    next.lastCharCode
-  );
 }
 
 function formsCRLF(
@@ -1108,31 +952,12 @@ function upperBound(values: number[], target: number): number {
   return lo;
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function isWordSeparatorCharCode(charCode: number): boolean {
-  if (charCode <= 32 || charCode === 127) {
-    return true;
-  }
-  const ch = String.fromCharCode(charCode);
-  return WORD_SEPARATORS.includes(ch);
-}
-
-// Checks if the given text is a whole word by checking if the
-// characters before and after are word separators.
-function isWholeWordAtDocOffsets(
-  text: string,
-  docStart: number,
-  length: number
-): boolean {
-  const beforeOk =
-    docStart <= 0 || isWordSeparatorCharCode(text.charCodeAt(docStart - 1));
-  const afterOk =
-    docStart + length >= text.length ||
-    isWordSeparatorCharCode(text.charCodeAt(docStart + length));
-  return beforeOk && afterOk;
+  return (
+    charCode <= 32 ||
+    charCode === 127 ||
+    WORD_SEPARATORS.includes(String.fromCharCode(charCode))
+  );
 }
 
 function compileSearchRegExp(
@@ -1140,32 +965,14 @@ function compileSearchRegExp(
   isRegex: boolean,
   caseSensitive: boolean
 ): RegExp {
-  const body = isRegex ? source : escapeRegExp(source);
-  const flags = `g${caseSensitive ? '' : 'i'}${isRegex ? 'm' : ''}`;
-  return new RegExp(body, flags);
+  return new RegExp(
+    isRegex ? source : source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    `g${caseSensitive ? '' : 'i'}${isRegex ? 'm' : ''}`
+  );
 }
 
-/** Expands `$&`, `$1`, `$$`, etc. in a regex replace string using a match. */
-function expandReplaceString(
-  replacement: string,
-  match: RegExpExecArray
-): string {
-  return replacement.replace(/\$([$&]|\d+)/g, (_token, group: string) => {
-    if (group === '$') {
-      return '$';
-    }
-    if (group === '&') {
-      return match[0] ?? '';
-    }
-    const index = Number(group);
-    return match[index] ?? '';
-  });
-}
-
-/**
- * Builds the text to insert for one search match, including regex capture
- * substitution when regex mode is enabled.
- */
+// Builds the text to insert for one search match, including regex capture
+// substitution when regex mode is enabled.
 export function buildSearchReplacementText(
   positionAt: (offset: number) => Position,
   offsetAt: (position: Position) => number,
@@ -1205,21 +1012,26 @@ export function buildSearchReplacementText(
   ) {
     return searchParams.replaceText;
   }
-  return expandReplaceString(searchParams.replaceText, match);
+  // Expand `$&`, `$1`, `$$`, etc. from this match.
+  return searchParams.replaceText.replace(
+    /\$([$&]|\d+)/g,
+    (_token, group: string) => {
+      if (group === '$') {
+        return '$';
+      }
+      return match[group === '&' ? 0 : Number(group)] ?? '';
+    }
+  );
 }
 
+// Steps past an empty match without splitting a surrogate pair.
 function advancePastEmptyMatch(text: string, index: number): number {
-  if (index + 1 < text.length) {
-    const first = text.charCodeAt(index);
-    const second = text.charCodeAt(index + 1);
-    if (
-      first >= 0xd800 &&
-      first <= 0xdbff &&
-      second >= 0xdc00 &&
-      second <= 0xdfff
-    ) {
-      return index + 2;
-    }
-  }
-  return index + 1;
+  const first = text.charCodeAt(index);
+  const second = text.charCodeAt(index + 1);
+  return first >= 0xd800 &&
+    first <= 0xdbff &&
+    second >= 0xdc00 &&
+    second <= 0xdfff
+    ? index + 2
+    : index + 1;
 }

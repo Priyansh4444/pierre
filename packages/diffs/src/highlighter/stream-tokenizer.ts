@@ -4,14 +4,12 @@ import type {
 } from './tokenizer-types';
 import type { ThemedToken } from './types';
 
-/**
- * The final line stays provisional until a line break or stream close.
- * A trailing CR waits for the next chunk, which may complete a CRLF pair.
- * Token offsets are absolute UTF-16 positions in the stream.
- */
+// The final line stays provisional until a line break or stream close.
+// A trailing CR waits for the next chunk, which may complete a CRLF pair.
+// Token offsets are absolute UTF-16 positions in the stream.
 export abstract class BaseStreamTokenizer implements DiffsStreamTokenizer {
   protected disposed = false;
-  /** Stream offset of the provisional line's first character. */
+  // Stream offset of the provisional line's first character.
   protected stableOffset = 0;
   protected unstable: ThemedToken[] = [];
   protected pendingCarriageReturn = '';
@@ -31,16 +29,14 @@ export abstract class BaseStreamTokenizer implements DiffsStreamTokenizer {
     return { recall, stable, unstable };
   }
 
-  /**
-   * Append completed lines to stable, using pushLineBreak for their endings.
-   * Return the unfinished line's tokens and UTF-16 length.
-   */
+  // Append completed lines to stable, using pushLineBreak for their endings.
+  // Return the unfinished line's tokens and UTF-16 length.
   protected abstract tokenizeChunk(
     chunk: string,
     stable: ThemedToken[]
   ): { unstable: ThemedToken[]; tailLength: number };
 
-  /** Emit one token per line-break character and move past the line. */
+  // Emit one token per line-break character and move past the line.
   protected pushLineBreak(
     stable: ThemedToken[],
     lineLength: number,
@@ -88,7 +84,7 @@ export abstract class BaseStreamTokenizer implements DiffsStreamTokenizer {
     if (this.disposed) throw new Error('stream tokenizer is disposed');
   }
 
-  /** Forget the provisional line and any lexer state. */
+  // Forget the provisional line and any lexer state.
   protected abstract resetSource(): void;
 
   protected abstract releaseSource(): void;

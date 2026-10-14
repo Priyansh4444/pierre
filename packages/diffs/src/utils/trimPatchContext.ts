@@ -36,30 +36,15 @@ export function trimPatchContext(patch: string, contextSize = 10): string {
         currentHunk = undefined;
       }
 
-      const additionStart = parseInt(parsedHunkHeader[3]);
-      const deletionStart = parseInt(parsedHunkHeader[1]);
-      const additionCount = parseInt(parsedHunkHeader[4] ?? '1');
-      const deletionCount = parseInt(parsedHunkHeader[2] ?? '1');
-
-      // If we can't parse valid numbers out of the hunk header
-      // lets just skip the hunk altogether
-      if (
-        isNaN(additionStart) ||
-        isNaN(deletionStart) ||
-        isNaN(additionCount) ||
-        isNaN(deletionCount)
-      ) {
-        lines.push(line);
-      } else {
-        currentHunk = {
-          additionStart,
-          deletionStart,
-          additionCount: 0,
-          deletionCount: 0,
-          hunkLines: [],
-          contextLines: [],
-        };
-      }
+      // The header regex only matches digits, so these always parse
+      currentHunk = {
+        additionStart: parseInt(parsedHunkHeader[3]),
+        deletionStart: parseInt(parsedHunkHeader[1]),
+        additionCount: 0,
+        deletionCount: 0,
+        hunkLines: [],
+        contextLines: [],
+      };
       continue;
     }
 
@@ -82,20 +67,16 @@ export function trimPatchContext(patch: string, contextSize = 10): string {
           currentHunk.contextLines.length - contextSize * 2;
         const nextContextLines = currentHunk.contextLines.slice(-contextSize);
         flushContextLines(currentHunk, contextSize, 'trailing');
-        const {
-          additionCount: emittedAdditionCount,
-          deletionCount: emittedDeletionCount,
-        } = currentHunk;
         flushHunk(currentHunk, lines);
 
         currentHunk = {
           additionStart:
             currentHunk.additionStart +
-            emittedAdditionCount +
+            currentHunk.additionCount +
             omittedContextLineCount,
           deletionStart:
             currentHunk.deletionStart +
-            emittedDeletionCount +
+            currentHunk.deletionCount +
             omittedContextLineCount,
           deletionCount: 0,
           additionCount: 0,
@@ -149,7 +130,6 @@ function flushContextLines(
     hunk.deletionCount += hunk.contextLines.length;
     hunk.contextLines.length = 0;
   }
-  return hunk;
 }
 
 function flushHunk(hunk: CurrentHunk, lines: string[]) {

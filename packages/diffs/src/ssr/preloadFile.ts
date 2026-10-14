@@ -44,16 +44,15 @@ export async function preloadFile<LAnnotation = undefined, Caret = undefined>({
   }
 
   const fileResult = await fileRenderer.asyncRender(file);
-  const children = [createStyleElement(fileResult.css, true)];
-
-  children.push(
+  const children = [
+    createStyleElement(fileResult.css, true),
     createThemeStyleElement(
       wrapThemeCSS(
         fileResult.themeStyles,
         fileResult.baseThemeType ?? options?.themeType ?? 'system'
       )
-    )
-  );
+    ),
+  ];
 
   if (options?.unsafeCSS != null) {
     children.push(createStyleElement(options.unsafeCSS));

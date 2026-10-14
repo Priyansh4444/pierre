@@ -4,8 +4,9 @@ import type { ThemeTypes } from '../types';
 import { createMeasuredScrollbarGutterDeclaration } from './scrollbarGutter';
 
 const LAYER_ORDER = `@layer base, theme, rendered, unsafe;`;
+// WARNING: the property name is used unescaped; it has no RegExp syntax.
 const SCROLLBAR_GUTTER_DECLARATION_PATTERN = new RegExp(
-  `${escapeRegExp(DIFFS_SCROLLBAR_GUTTER_MEASURED_PROPERTY)}\\s*:\\s*[^;]+;`
+  `${DIFFS_SCROLLBAR_GUTTER_MEASURED_PROPERTY}\\s*:\\s*[^;]+;`
 );
 
 export function wrapCoreCSS(mainCSS: string) {
@@ -67,14 +68,8 @@ export function patchScrollbarGutterSize(
   themeCSS: string,
   scrollbarGutter: number | undefined
 ): string {
-  const scrollbarGutterRule =
-    createMeasuredScrollbarGutterDeclaration(scrollbarGutter);
   return themeCSS.replace(
     SCROLLBAR_GUTTER_DECLARATION_PATTERN,
-    scrollbarGutterRule
+    createMeasuredScrollbarGutterDeclaration(scrollbarGutter)
   );
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

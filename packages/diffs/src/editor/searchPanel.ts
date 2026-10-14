@@ -36,24 +36,22 @@ export interface SearchPanelOptions {
 export class SearchPanelWidget {
   #container: HTMLDivElement;
   #inputElement: HTMLInputElement;
-  #updateMatches?: (options?: { syncSelection?: boolean }) => void;
-  #applyMode?: (mode: SearchPanelMode) => void;
-  #navigate?: (findPrevious: boolean) => void;
-  #close?: () => void;
+  #updateMatches: (options?: { syncSelection?: boolean }) => void;
+  #applyMode: (mode: SearchPanelMode) => void;
+  #navigate: (findPrevious: boolean) => void;
+  #close: () => void;
 
-  constructor(options: SearchPanelOptions) {
-    const {
-      textDocument,
-      containerElement,
-      defaultQuery,
-      mode = 'find',
-      initialMatch,
-      scrollToMatch,
-      applyReplace,
-      onUpdate,
-      onClose,
-    } = options;
-
+  constructor({
+    textDocument,
+    containerElement,
+    defaultQuery,
+    mode = 'find',
+    initialMatch,
+    scrollToMatch,
+    applyReplace,
+    onUpdate,
+    onClose,
+  }: SearchPanelOptions) {
     const searchParams: SearchParams = {
       text: defaultQuery,
       replaceText: '',
@@ -92,13 +90,11 @@ export class SearchPanelWidget {
       }
 
       delete matchResultElement.dataset.noMatches;
-      if (options?.syncSelection === false) {
-        const currentMatch = onUpdate(matches.all, { syncSelection: false });
-        updateCurrentMatch(currentMatch);
-        return;
-      }
-
-      updateCurrentMatch(onUpdate(matches.all));
+      updateCurrentMatch(
+        options?.syncSelection === false
+          ? onUpdate(matches.all, { syncSelection: false })
+          : onUpdate(matches.all)
+      );
     };
     this.#updateMatches = updateMatches;
 
@@ -115,38 +111,28 @@ export class SearchPanelWidget {
       matches.current = currentMatch;
     };
 
-    const updateSearchParam = <K extends keyof SearchParams>(
-      key: K,
-      value: SearchParams[K]
-    ) => {
-      searchParams[key] = value;
-      updateMatches();
-    };
-
     const findNextMatch = (
       findPrevious: boolean = false,
       retainFocus: boolean = false
     ) => {
       const allMatches = matches.all;
       let nextMatch: MatchRange | undefined = allMatches[0];
-      if (allMatches.length > 0) {
-        if (findPrevious) {
-          const searchOffset = matches.current?.[0] ?? 0;
-          nextMatch = allMatches.at(-1);
-          for (const m of allMatches) {
-            if (m[1] <= searchOffset) {
-              nextMatch = m;
-            } else {
-              break;
-            }
+      if (findPrevious) {
+        const searchOffset = matches.current?.[0] ?? 0;
+        nextMatch = allMatches.at(-1);
+        for (const m of allMatches) {
+          if (m[1] <= searchOffset) {
+            nextMatch = m;
+          } else {
+            break;
           }
-        } else {
-          const searchOffset = matches.current?.[1] ?? 0;
-          for (const m of allMatches) {
-            if (m[0] >= searchOffset) {
-              nextMatch = m;
-              break;
-            }
+        }
+      } else {
+        const searchOffset = matches.current?.[1] ?? 0;
+        for (const m of allMatches) {
+          if (m[0] >= searchOffset) {
+            nextMatch = m;
+            break;
           }
         }
       }
@@ -176,18 +162,17 @@ export class SearchPanelWidget {
       ),
     });
 
+    // An empty query never has matches, so these only check the match list.
     const replace = () => {
-      if (searchParams.text === '' || matches.all.length === 0) {
+      if (matches.all.length === 0) {
         return;
       }
-
-      let currentMatch = matches.current;
-      if (currentMatch === undefined) {
+      if (matches.current === undefined) {
         findNextMatch(false, true);
-        currentMatch = matches.current;
-        if (currentMatch === undefined) {
-          return;
-        }
+      }
+      const currentMatch = matches.current;
+      if (currentMatch === undefined) {
+        return;
       }
 
       const [start, end] = currentMatch;
@@ -195,13 +180,14 @@ export class SearchPanelWidget {
       applyReplace([edit]);
 
       // Collapse after the replacement so the next search pass advances.
-      scrollToMatch([start + edit.text.length, start + edit.text.length], true);
+      const caret = start + edit.text.length;
+      scrollToMatch([caret, caret], true);
       matches.current = undefined;
       updateMatches();
     };
 
     const replaceAll = () => {
-      if (searchParams.text === '' || matches.all.length === 0) {
+      if (matches.all.length === 0) {
         return;
       }
 
@@ -234,7 +220,7 @@ export class SearchPanelWidget {
         title: opts.label,
         ariaLabel: opts.label,
         dataset: { searchIcon: '', ...opts.dataset },
-        innerHTML: getEditorIconSvg(opts.icon, opts.size ?? 16),
+        innerHTML: getEditorIconSvg(opts.icon, opts.size),
         onclick: opts.onClick,
       });
 
@@ -254,46 +240,46 @@ export class SearchPanelWidget {
         onClick: () => {
           const next = !searchParams[key];
           button.ariaPressed = String(next);
-          updateSearchParam(key, next);
+          searchParams[key] = next;
+          updateMatches();
         },
       });
       button.ariaPressed = String(searchParams[key]);
       return button;
     };
 
-    const caseSensitiveToggle = makeToggle(
-      'case',
-      'Match Case',
-      'caseSensitive'
-    );
-    const wholeWordToggle = makeToggle('whole-word', 'Whole Word', 'wholeWord');
-    const regexToggle = makeToggle('regex', 'Regexp', 'regex');
-
-    const replaceInputElement = h('input', {
-      type: 'text',
-      placeholder: 'Replace',
-      dataset: 'replace',
-      value: '',
-      oninput: (e: Event) => {
-        searchParams.replaceText = (e.target as HTMLInputElement).value;
-      },
-      onkeydown: (e: KeyboardEvent) => {
-        if (e.isComposing || e.keyCode === 229) {
-          return;
-        }
-        const findAgain = resolveFindAgainShortcut(e);
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          close();
-        } else if (e.key === 'Enter') {
-          e.preventDefault();
+    // Shared keyboard handling for the find and replace inputs.
+    const onInputKeyDown = (e: KeyboardEvent, isFindInput: boolean) => {
+      if (e.isComposing || e.keyCode === 229) {
+        return;
+      }
+      const findAgain = resolveFindAgainShortcut(e);
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (isFindInput) {
+          findNextMatch(e.shiftKey, true);
+        } else {
           replace();
-        } else if (findAgain !== undefined) {
-          e.preventDefault();
-          findNextMatch(findAgain === 'previous', true);
         }
-      },
-    });
+      } else if (findAgain !== undefined) {
+        // Override the native browser find-again shortcut so cmd+g steps to
+        // the next match and cmd+shift+g to the previous one.
+        e.preventDefault();
+        findNextMatch(findAgain === 'previous', true);
+      } else if (
+        isFindInput &&
+        isPrimaryModifier(e) &&
+        (e.key === 'f' || e.code === 'KeyF')
+      ) {
+        // Prevent the default browser search panel and switch the panel mode
+        // in place (cmd+f -> find, cmd+opt+f -> find/replace).
+        e.preventDefault();
+        this.#applyMode(e.altKey ? 'replace' : 'find');
+      }
+    };
 
     this.#inputElement = h('input', {
       type: 'text',
@@ -305,63 +291,7 @@ export class SearchPanelWidget {
         matches.current = undefined;
         updateMatches();
       },
-      onkeydown: (e: KeyboardEvent) => {
-        if (e.isComposing || e.keyCode === 229) {
-          return;
-        }
-        const findAgain = resolveFindAgainShortcut(e);
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          close();
-        } else if (e.key === 'Enter') {
-          e.preventDefault();
-          findNextMatch(e.shiftKey, true);
-        } else if (findAgain !== undefined) {
-          // Override the native browser find-again shortcut so cmd+g steps to
-          // the next match and cmd+shift+g to the previous one.
-          e.preventDefault();
-          findNextMatch(findAgain === 'previous', true);
-        } else if (
-          isPrimaryModifier(e) &&
-          (e.key === 'f' || e.code === 'KeyF')
-        ) {
-          // Prevent the default browser search panel and switch the panel mode
-          // in place (cmd+f -> find, cmd+opt+f -> find/replace).
-          e.preventDefault();
-          applyMode(e.altKey ? 'replace' : 'find');
-        }
-      },
-    });
-
-    // The three search-option toggles are overlaid on the right edge of the
-    // find input instead of sitting beside it.
-    const searchTogglesElement = h('div', {
-      dataset: 'searchToggles',
-      children: [caseSensitiveToggle, wholeWordToggle, regexToggle],
-    });
-
-    const findInputBox = h('div', {
-      dataset: { inputBox: '', find: '' },
-      children: [this.#inputElement, searchTogglesElement],
-    });
-
-    // The replace input and its action buttons are tagged as replace cells so
-    // they can be hidden together when the panel is in find-only mode.
-    const replaceInputBox = h('div', {
-      dataset: { inputBox: '', replace: '', replaceCell: '' },
-      children: [replaceInputElement],
-    });
-
-    const replaceActionsElement = h('div', {
-      dataset: { replaceActions: '', replaceCell: '' },
-      children: [
-        iconButton({ icon: 'replace', label: 'Replace', onClick: replace }),
-        iconButton({
-          icon: 'replace-all',
-          label: 'Replace All',
-          onClick: replaceAll,
-        }),
-      ],
+      onkeydown: (e: KeyboardEvent) => onInputKeyDown(e, true),
     });
 
     // Held so the no-results state can toggle their native disabled flag.
@@ -382,18 +312,6 @@ export class SearchPanelWidget {
     prevButton.disabled = true;
     nextButton.disabled = true;
 
-    const navElement = h('div', {
-      dataset: 'searchNav',
-      children: [prevButton, nextButton],
-    });
-
-    const closeElement = iconButton({
-      icon: 'close',
-      label: 'Close',
-      onClick: close,
-      dataset: { searchClose: '' },
-    });
-
     // Cells are positioned by CSS grid-template-areas (see editor.css), so DOM
     // order here only drives tab/reading order, not layout. Keep the replace
     // input directly after the find input (and its toggles) so Tab walks
@@ -401,23 +319,66 @@ export class SearchPanelWidget {
     const gridElement = h('div', {
       dataset: { searchGrid: '', mode },
       children: [
-        findInputBox,
-        replaceInputBox,
-        replaceActionsElement,
+        h('div', {
+          dataset: { inputBox: '', find: '' },
+          children: [
+            this.#inputElement,
+            // The search-option toggles overlay the find input's right edge.
+            h('div', {
+              dataset: 'searchToggles',
+              children: [
+                makeToggle('case', 'Match Case', 'caseSensitive'),
+                makeToggle('whole-word', 'Whole Word', 'wholeWord'),
+                makeToggle('regex', 'Regexp', 'regex'),
+              ],
+            }),
+          ],
+        }),
+        // Replace cells are hidden together in find-only mode.
+        h('div', {
+          dataset: { inputBox: '', replace: '', replaceCell: '' },
+          children: [
+            h('input', {
+              type: 'text',
+              placeholder: 'Replace',
+              dataset: 'replace',
+              value: '',
+              oninput: (e: Event) => {
+                searchParams.replaceText = (e.target as HTMLInputElement).value;
+              },
+              onkeydown: (e: KeyboardEvent) => onInputKeyDown(e, false),
+            }),
+          ],
+        }),
+        h('div', {
+          dataset: { replaceActions: '', replaceCell: '' },
+          children: [
+            iconButton({ icon: 'replace', label: 'Replace', onClick: replace }),
+            iconButton({
+              icon: 'replace-all',
+              label: 'Replace All',
+              onClick: replaceAll,
+            }),
+          ],
+        }),
         matchResultElement,
-        navElement,
-        closeElement,
+        h('div', { dataset: 'searchNav', children: [prevButton, nextButton] }),
+        iconButton({
+          icon: 'close',
+          label: 'Close',
+          onClick: close,
+          dataset: { searchClose: '' },
+        }),
       ],
     });
 
     // Toggles the panel between find and find/replace modes by showing or
     // hiding the replace cells, then returns focus to the find input.
-    const applyMode = (next: SearchPanelMode) => {
+    this.#applyMode = (next: SearchPanelMode) => {
       gridElement.dataset.mode = next;
       this.#inputElement.focus();
       this.#inputElement.select();
     };
-    this.#applyMode = applyMode;
 
     this.#container = h('div', {
       dataset: 'searchPanel',
@@ -447,22 +408,22 @@ export class SearchPanelWidget {
   }
 
   navigate(findPrevious: boolean): void {
-    this.#navigate?.(findPrevious);
+    this.#navigate(findPrevious);
   }
 
   updateMatches(options?: { syncSelection?: boolean }): void {
-    this.#updateMatches?.(options);
+    this.#updateMatches(options);
   }
 
   setMode(mode: SearchPanelMode): void {
-    this.#applyMode?.(mode);
+    this.#applyMode(mode);
   }
 
   // Tears the panel down the way the close button and Escape-in-input do:
   // removes the DOM and runs onClose so the editor clears its match highlights.
   // Prefer this over cleanup() for any user-initiated dismissal.
   close(): void {
-    this.#close?.();
+    this.#close();
   }
 
   // DOM-only teardown. Does NOT run onClose, so it leaves the editor's match

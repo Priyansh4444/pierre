@@ -17,7 +17,7 @@ import {
   type FileDiffOptions,
 } from '../../components/FileDiff';
 import { VirtualizedFileDiff } from '../../components/VirtualizedFileDiff';
-import type { Editor, EditorChangeEvent, EditorOptions } from '../../edit';
+import type { EditorChangeEvent, EditorOptions } from '../../edit';
 import type { GetHoveredLineResult } from '../../managers/InteractionManager';
 import type {
   DiffLineAnnotation,
@@ -182,35 +182,25 @@ export function useFileDiffInstance<LAnnotation, Caret>({
           'useFileDiffInstance: An instance should not already exist when a node is created'
         );
       }
-      if (simpleVirtualizer != null) {
-        instanceRef.current = new VirtualizedFileDiff(
-          mergeFileDiffOptions({
-            controlledSelection,
-            hasCustomHeader,
-            hasGutterRenderUtility,
-            onEditChange,
-            onEditComplete,
-            options,
-          }),
-          simpleVirtualizer,
-          metrics,
-          !disableWorkerPool ? poolManager : undefined,
-          true
-        );
-      } else {
-        instanceRef.current = new FileDiff(
-          mergeFileDiffOptions({
-            controlledSelection,
-            hasCustomHeader,
-            hasGutterRenderUtility,
-            onEditChange,
-            onEditComplete,
-            options,
-          }),
-          !disableWorkerPool ? poolManager : undefined,
-          true
-        );
-      }
+      const mergedOptions = mergeFileDiffOptions({
+        controlledSelection,
+        hasCustomHeader,
+        hasGutterRenderUtility,
+        onEditChange,
+        onEditComplete,
+        options,
+      });
+      const workerManager = !disableWorkerPool ? poolManager : undefined;
+      instanceRef.current =
+        simpleVirtualizer != null
+          ? new VirtualizedFileDiff(
+              mergedOptions,
+              simpleVirtualizer,
+              metrics,
+              workerManager,
+              true
+            )
+          : new FileDiff(mergedOptions, workerManager, true);
       void instanceRef.current.hydrate({
         fileDiff: effectiveFileDiff,
         fileContainer,
@@ -257,15 +247,42 @@ export function useFileDiffInstance<LAnnotation, Caret>({
         disposeEditor();
       }
     }
-    const resolved = resolveAcceptedValues(
-      effectiveFileDiff,
-      lineAnnotations,
-      acceptedCache
-    );
+    // Render the installed values in place of props that still match their
+    // stale counterparts. Any other prop value clears its slot — filePair
+    // settles in the parse memo instead — and the ref clears once all three
+    // have.
+    let resolvedFileDiff = effectiveFileDiff;
+    let resolvedAnnotations = lineAnnotations;
+    const { current: accepted } = acceptedCache;
+    if (accepted != null) {
+      const { fileDiff: acceptedDiff, annotations: acceptedAnnotations } =
+        accepted;
+      if (acceptedDiff != null) {
+        if (areDiffTargetsEqual(effectiveFileDiff, acceptedDiff.stale)) {
+          resolvedFileDiff = acceptedDiff.installed;
+        } else {
+          accepted.fileDiff = null;
+        }
+      }
+      if (acceptedAnnotations != null) {
+        if (lineAnnotations === acceptedAnnotations.stale) {
+          resolvedAnnotations = acceptedAnnotations.installed;
+        } else {
+          accepted.annotations = null;
+        }
+      }
+      if (
+        accepted.fileDiff == null &&
+        accepted.annotations == null &&
+        accepted.filePair == null
+      ) {
+        acceptedCache.current = null;
+      }
+    }
     void instance.render({
       forceRender,
-      fileDiff: resolved.fileDiff,
-      lineAnnotations: resolved.lineAnnotations,
+      fileDiff: resolvedFileDiff,
+      lineAnnotations: resolvedAnnotations,
     });
     if (selectedLines !== undefined) {
       instance.setSelectedLines(selectedLines);
@@ -285,7 +302,13 @@ export function useFileDiffInstance<LAnnotation, Caret>({
       ) {
         return;
       }
-      disposeEditorRef.current = applyEdit(instance, getEditor);
+      const editor = getEditor();
+      try {
+        disposeEditorRef.current = editor.edit(instance);
+      } catch (error) {
+        editor.cleanUp();
+        throw error;
+      }
     };
     // If we're all ready to attach the editor, lets go ahead
     // and do that synchronously
@@ -324,11 +347,11 @@ export function useFileDiffInstance<LAnnotation, Caret>({
       });
   });
 
-  const getHoveredLine = useCallback(():
-    | GetHoveredLineResult<'diff'>
-    | undefined => {
-    return instanceRef.current?.getHoveredLine();
-  }, []);
+  const getHoveredLine = useCallback(
+    (): GetHoveredLineResult<'diff'> | undefined =>
+      instanceRef.current?.getHoveredLine(),
+    []
+  );
   const getAnnotationSlotName = useCallback(
     (annotation: DiffLineAnnotation<LAnnotation>): string =>
       instanceRef.current?.getAnnotationSlotName(annotation) ??
@@ -371,7 +394,7 @@ function useEffectiveFileDiff<LAnnotation, Caret>({
 }: UseEffectiveFileDiffProps<LAnnotation, Caret>): FileDiffMetadata {
   /* oxlint-disable react/immutability react/refs -- accepted edit output must
    * replace stale file-pair props during render */
-  const effectiveFileDiff = useMemo(() => {
+  return useMemo(() => {
     if (fileDiff != null) {
       return fileDiff;
     }
@@ -393,8 +416,6 @@ function useEffectiveFileDiff<LAnnotation, Caret>({
     );
   }, [acceptedCache, fileDiff, oldFile, newFile, parseDiffOptions]);
   /* oxlint-enable react/immutability react/refs */
-
-  return effectiveFileDiff;
 }
 
 // Whether the file props name the same files as a recorded pair.
@@ -407,48 +428,6 @@ function isSameFilePair(
     areFileTargetsEqual(oldFile ?? undefined, filePair.oldFile ?? undefined) &&
     areFileTargetsEqual(newFile ?? undefined, filePair.newFile ?? undefined)
   );
-}
-
-// Render the installed values in place of props that still match their stale
-// counterparts. Any other prop value clears its slot — filePair settles in
-// the parse memo instead — and the ref clears once all three have.
-function resolveAcceptedValues<LAnnotation>(
-  fileDiff: FileDiffMetadata,
-  lineAnnotations: DiffLineAnnotation<LAnnotation>[] | undefined,
-  acceptedCache: RefObject<AcceptedCompletion<LAnnotation> | null>
-): {
-  fileDiff: FileDiffMetadata;
-  lineAnnotations: DiffLineAnnotation<LAnnotation>[] | undefined;
-} {
-  const { current: accepted } = acceptedCache;
-  if (accepted == null) {
-    return { fileDiff, lineAnnotations };
-  }
-  const { fileDiff: acceptedDiff, annotations: acceptedAnnotations } = accepted;
-  let resolvedFileDiff = fileDiff;
-  if (acceptedDiff != null) {
-    if (areDiffTargetsEqual(fileDiff, acceptedDiff.stale)) {
-      resolvedFileDiff = acceptedDiff.installed;
-    } else {
-      accepted.fileDiff = null;
-    }
-  }
-  let resolvedAnnotations = lineAnnotations;
-  if (acceptedAnnotations != null) {
-    if (lineAnnotations === acceptedAnnotations.stale) {
-      resolvedAnnotations = acceptedAnnotations.installed;
-    } else {
-      accepted.annotations = null;
-    }
-  }
-  if (
-    accepted.fileDiff == null &&
-    accepted.annotations == null &&
-    accepted.filePair == null
-  ) {
-    acceptedCache.current = null;
-  }
-  return { fileDiff: resolvedFileDiff, lineAnnotations: resolvedAnnotations };
 }
 
 interface MergeFileDiffOptionsProps<LAnnotation, Caret> {
@@ -493,17 +472,4 @@ function mergeFileDiffOptions<LAnnotation, Caret>({
     onEditChange,
     onEditComplete,
   };
-}
-
-function applyEdit<LAnnotation, Caret>(
-  instance: FileDiff<LAnnotation, Caret>,
-  getEditor: () => Editor<'file-diff', LAnnotation, Caret>
-): () => void {
-  const editor = getEditor();
-  try {
-    return editor.edit(instance);
-  } catch (error) {
-    editor.cleanUp();
-    throw error;
-  }
 }

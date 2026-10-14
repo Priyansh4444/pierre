@@ -13,36 +13,35 @@ export function setDeferredArrayItem<T>(
         cached = create();
         initialized = true;
       }
-      if (
-        Object.getOwnPropertyDescriptor(array, index)?.configurable === true
-      ) {
-        Object.defineProperty(array, index, {
-          configurable: true,
-          enumerable: true,
-          writable: true,
-          value: cached,
-        });
-      }
+      replaceWithValue(array, index, cached);
       return cached;
     },
     set(value: T) {
-      if (
-        Object.getOwnPropertyDescriptor(array, index)?.configurable === true
-      ) {
-        Object.defineProperty(array, index, {
-          configurable: true,
-          enumerable: true,
-          writable: true,
-          value,
-        });
-      } else if (Object.isFrozen(array)) {
+      if (replaceWithValue(array, index, value)) {
+        return;
+      }
+      if (Object.isFrozen(array)) {
         throw new TypeError(
           `Cannot assign to read only array index '${index}'`
         );
-      } else {
-        cached = value;
-        initialized = true;
       }
+      cached = value;
+      initialized = true;
     },
   });
+}
+
+// Swaps the lazy accessor for a plain value while the slot is still
+// configurable. Returns false when it is not.
+function replaceWithValue<T>(array: T[], index: number, value: T): boolean {
+  if (Object.getOwnPropertyDescriptor(array, index)?.configurable !== true) {
+    return false;
+  }
+  Object.defineProperty(array, index, {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value,
+  });
+  return true;
 }

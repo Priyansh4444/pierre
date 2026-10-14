@@ -4,7 +4,6 @@ import {
   MERGE_CONFLICT_SEPARATOR_MARKER_REGEX,
   MERGE_CONFLICT_START_MARKER_REGEX,
 } from '../constants';
-import type { MergeConflictRegion } from '../types';
 
 export type MergeConflictLineType =
   | 'none'
@@ -16,101 +15,33 @@ export type MergeConflictLineType =
   | 'base'
   | 'incoming';
 
-type MergeConflictStage = 'current' | 'base' | 'incoming';
-
-interface MergeConflictFrame {
-  stage: MergeConflictStage;
-  startLineIndex: number;
-  baseMarkerLineIndex?: number;
-  separatorLineIndex?: number;
-}
-
-export interface MergeConflictParseResult {
-  lineTypes: MergeConflictLineType[];
-  regions: MergeConflictRegion[];
-}
-
-function trimLineEnding(line: string): string {
-  return line.replace(/(?:\r\n|\n|\r)$/, '');
-}
-
+// Classifies every line of a file with conflict markers. Open conflicts are
+// kept on a stack so nested markers resolve against the innermost conflict.
 export function getMergeConflictLineTypes(
   lines: string[]
 ): MergeConflictLineType[] {
-  return getMergeConflictParseResult(lines).lineTypes;
-}
-
-export function getMergeConflictParseResult(
-  lines: string[]
-): MergeConflictParseResult {
-  return parseMergeConflicts(lines);
-}
-
-export function getMergeConflictActionLineNumber(
-  conflict: MergeConflictRegion
-): number {
-  return Math.max(1, conflict.startLineNumber - 1);
-}
-
-function parseMergeConflicts(lines: string[]): MergeConflictParseResult {
   const lineTypes = new Array<MergeConflictLineType>(lines.length);
-  const stack: MergeConflictFrame[] = [];
-  const regions: MergeConflictRegion[] = [];
-
+  const stages: Array<'current' | 'base' | 'incoming'> = [];
   for (let index = 0; index < lines.length; index++) {
-    const line = trimLineEnding(lines[index]);
-
+    const line = lines[index].replace(/(?:\r\n|\n|\r)$/, '');
+    const depth = stages.length - 1;
     if (MERGE_CONFLICT_START_MARKER_REGEX.test(line)) {
-      stack.push({ stage: 'current', startLineIndex: index });
+      stages.push('current');
       lineTypes[index] = 'marker-start';
-      continue;
-    }
-
-    const frame = stack.at(-1);
-    if (frame == null) {
+    } else if (depth < 0) {
       lineTypes[index] = 'none';
-      continue;
-    }
-
-    if (MERGE_CONFLICT_BASE_MARKER_REGEX.test(line)) {
-      frame.stage = 'base';
-      frame.baseMarkerLineIndex = index;
+    } else if (MERGE_CONFLICT_BASE_MARKER_REGEX.test(line)) {
+      stages[depth] = 'base';
       lineTypes[index] = 'marker-base';
-      continue;
-    }
-
-    if (MERGE_CONFLICT_SEPARATOR_MARKER_REGEX.test(line)) {
-      frame.stage = 'incoming';
-      frame.separatorLineIndex = index;
+    } else if (MERGE_CONFLICT_SEPARATOR_MARKER_REGEX.test(line)) {
+      stages[depth] = 'incoming';
       lineTypes[index] = 'marker-separator';
-      continue;
-    }
-
-    if (MERGE_CONFLICT_END_MARKER_REGEX.test(line)) {
-      const completedFrame = stack.pop();
+    } else if (MERGE_CONFLICT_END_MARKER_REGEX.test(line)) {
+      stages.pop();
       lineTypes[index] = 'marker-end';
-      if (completedFrame?.separatorLineIndex != null) {
-        const conflictIndex = regions.length;
-        regions.push({
-          conflictIndex,
-          startLineIndex: completedFrame.startLineIndex,
-          startLineNumber: completedFrame.startLineIndex + 1,
-          separatorLineIndex: completedFrame.separatorLineIndex,
-          separatorLineNumber: completedFrame.separatorLineIndex + 1,
-          endLineIndex: index,
-          endLineNumber: index + 1,
-          baseMarkerLineIndex: completedFrame.baseMarkerLineIndex,
-          baseMarkerLineNumber:
-            completedFrame.baseMarkerLineIndex != null
-              ? completedFrame.baseMarkerLineIndex + 1
-              : undefined,
-        });
-      }
-      continue;
+    } else {
+      lineTypes[index] = stages[depth];
     }
-
-    lineTypes[index] = frame.stage;
   }
-
-  return { lineTypes, regions };
+  return lineTypes;
 }

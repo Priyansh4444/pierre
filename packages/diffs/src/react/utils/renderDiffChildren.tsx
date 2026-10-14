@@ -98,7 +98,15 @@ export function renderDiffChildren<LAnnotation, Caret, T>({
           if (action == null) {
             return undefined;
           }
-          const slot = getSlotName(action, fileDiff);
+          const anchor = getMergeConflictActionAnchor(action, fileDiff);
+          const slot =
+            anchor != null
+              ? getMergeConflictActionSlotName({
+                  hunkIndex: anchor.hunkIndex,
+                  lineIndex: anchor.lineIndex,
+                  conflictIndex: action.conflictIndex,
+                })
+              : undefined;
           return (
             <div key={slot} slot={slot} style={MergeConflictSlotStyles}>
               {renderMergeConflictUtility(action, getInstance)}
@@ -112,18 +120,4 @@ export function renderDiffChildren<LAnnotation, Caret, T>({
       )}
     </>
   );
-}
-
-function getSlotName(
-  action: MergeConflictDiffAction,
-  fileDiff: FileDiffMetadata
-): string | undefined {
-  const anchor = getMergeConflictActionAnchor(action, fileDiff);
-  return anchor != null
-    ? getMergeConflictActionSlotName({
-        hunkIndex: anchor.hunkIndex,
-        lineIndex: anchor.lineIndex,
-        conflictIndex: action.conflictIndex,
-      })
-    : undefined;
 }

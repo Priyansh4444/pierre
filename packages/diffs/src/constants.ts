@@ -12,7 +12,7 @@ export const DIFFS_TAG_NAME = 'diffs-container' as const;
 
 // Keep this as a NODE_ENV read so app builds can hard-disable development-only
 // checks unless they are explicitly built for development.
-export const DIFFS_DEVELOPMENT_BUILD: boolean = (() => {
+export const DIFFS_DEVELOPMENT_BUILD: boolean = /* @__PURE__ */ (() => {
   try {
     return process.env.NODE_ENV === 'development';
   } catch {
@@ -85,10 +85,11 @@ export const DEFAULT_SMOOTH_SCROLL_SETTINGS: SmoothScrollSettings = {
   velocityEpsilon: 0.05,
 };
 
-export const DEFAULT_EXPANDED_REGION: HunkExpansionRegion = Object.freeze({
-  fromStart: 0,
-  fromEnd: 0,
-});
+export const DEFAULT_EXPANDED_REGION: HunkExpansionRegion =
+  /* @__PURE__ */ Object.freeze({
+    fromStart: 0,
+    fromEnd: 0,
+  });
 
 export const DEFAULT_RENDER_RANGE: RenderRange = {
   startingLine: 0,

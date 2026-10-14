@@ -130,17 +130,32 @@ export function renderTokenLines(
       children: [],
     };
     const spans = decorationsByLine?.get(lineIndex);
-    const column =
-      spans == null
-        ? appendTokens(line, normalized, useTokenTransformer, cacheHtmlStyles)
-        : appendDecoratedTokens(
-            line,
-            normalized,
-            spans,
-            lineIndex,
-            useTokenTransformer,
-            cacheHtmlStyles
-          );
+    // The line length in UTF-16 code units
+    let column = 0;
+    if (spans == null) {
+      for (const token of normalized) {
+        if (token.content === '') continue;
+        line.children.push(
+          createTokenSpan(
+            token,
+            tokenStyle(token, cacheHtmlStyles),
+            token.content,
+            column,
+            useTokenTransformer
+          )
+        );
+        column += token.content.length;
+      }
+    } else {
+      column = appendDecoratedTokens(
+        line,
+        normalized,
+        spans,
+        lineIndex,
+        useTokenTransformer,
+        cacheHtmlStyles
+      );
+    }
     if (useTokenTransformer && column === 0) {
       line.children.push({
         type: 'element',
@@ -162,30 +177,6 @@ export function renderTokenLines(
     setDeferredArrayItem(rows, index, () => renderLine(tokens, index));
   }
   return rows;
-}
-
-// Returns the line length in UTF-16 code units.
-function appendTokens(
-  line: Element,
-  tokens: ThemedToken[],
-  useTokenTransformer: boolean,
-  cacheHtmlStyles: boolean
-): number {
-  let column = 0;
-  for (const token of tokens) {
-    if (token.content === '') continue;
-    line.children.push(
-      createTokenSpan(
-        token,
-        tokenStyle(token, cacheHtmlStyles),
-        token.content,
-        column,
-        useTokenTransformer
-      )
-    );
-    column += token.content.length;
-  }
-  return column;
 }
 
 // Visit sorted boundaries once to avoid scanning every decoration per token.

@@ -1,9 +1,6 @@
 import type { TextDocument } from './textDocument';
 import type { EditorSelection, TextEdit } from './types';
 
-const DEFAULT_LINE_COMMENT = '//';
-const DEFAULT_BLOCK_COMMENT = ['/*', '*/'] as const;
-
 export interface LanguageConfig {
   lineComment?: string | null;
   blockComment?: readonly [open: string, close: string];
@@ -16,8 +13,14 @@ interface ResolvedLanguageConfig {
   blockComment: readonly [open: string, close: string];
 }
 
+const HASH_COMMENT: LanguageConfig = { lineComment: '#' };
+const MARKUP_COMMENT: LanguageConfig = {
+  lineComment: null,
+  blockComment: ['<!--', '-->'],
+};
+
 // Language comment configurations
-// Languages matching DEFAULT_LINE_COMMENT and DEFAULT_BLOCK_COMMENT are omitted.
+// Languages using the `//` and `/* */` defaults are omitted.
 const LANGUAGE_COMMENT_CONFIGS: LanguageConfigMap = {
   sql: { lineComment: '--' },
   ruby: { lineComment: '#', blockComment: ['=begin', '=end'] },
@@ -25,34 +28,34 @@ const LANGUAGE_COMMENT_CONFIGS: LanguageConfigMap = {
   coffeescript: { lineComment: '#', blockComment: ['###', '###'] },
   cmd: { lineComment: '@REM' },
   julia: { lineComment: '#', blockComment: ['#=', '=#'] },
-  yaml: { lineComment: '#' },
-  yml: { lineComment: '#' },
-  markdown: { lineComment: null, blockComment: ['<!--', '-->'] },
-  zsh: { lineComment: '#' },
-  makefile: { lineComment: '#' },
+  yaml: HASH_COMMENT,
+  yml: HASH_COMMENT,
+  markdown: MARKUP_COMMENT,
+  zsh: HASH_COMMENT,
+  makefile: HASH_COMMENT,
   handlebars: { lineComment: null, blockComment: ['{{!--', '--}}'] },
   ini: { lineComment: ';', blockComment: [';', ' '] },
   powershell: { lineComment: '#', blockComment: ['<#', '#>'] },
   vb: { lineComment: "'" },
-  xml: { lineComment: null, blockComment: ['<!--', '-->'] },
+  xml: MARKUP_COMMENT,
   lua: { lineComment: '--', blockComment: ['--[[', ']]'] },
-  html: { lineComment: null, blockComment: ['<!--', '-->'] },
+  html: MARKUP_COMMENT,
   diff: { lineComment: '#', blockComment: ['#', ' '] },
-  r: { lineComment: '#' },
+  r: HASH_COMMENT,
   fsharp: { blockComment: ['(*', '*)'] },
   pug: { lineComment: '//-' },
-  perl: { lineComment: '#' },
+  perl: HASH_COMMENT,
   tex: { lineComment: '%' },
   clojure: { lineComment: ';;' },
   css: { lineComment: null },
   python: { lineComment: '#', blockComment: ['"""', '"""'] },
-  dotenv: { lineComment: '#' },
-  dockerfile: { lineComment: '#' },
-  razor: { lineComment: null, blockComment: ['<!--', '-->'] },
-  prompt: { lineComment: null, blockComment: ['<!--', '-->'] },
+  dotenv: HASH_COMMENT,
+  dockerfile: HASH_COMMENT,
+  razor: MARKUP_COMMENT,
+  prompt: MARKUP_COMMENT,
 };
 
-/** Resolves language-specific comment tokens over the editor defaults. */
+// Resolves language-specific comment tokens over the editor defaults.
 export function resolveCommentConfig(
   languageId: string,
   overrides?: LanguageConfigMap
@@ -62,11 +65,8 @@ export function resolveCommentConfig(
     ...overrides?.[languageId],
   };
   return {
-    lineComment:
-      config.lineComment === undefined
-        ? DEFAULT_LINE_COMMENT
-        : config.lineComment,
-    blockComment: config.blockComment ?? DEFAULT_BLOCK_COMMENT,
+    lineComment: config.lineComment === undefined ? '//' : config.lineComment,
+    blockComment: config.blockComment ?? ['/*', '*/'],
   };
 }
 
@@ -78,7 +78,7 @@ interface LineCommentInfo {
   single: boolean;
 }
 
-/** Builds one aligned batch of line-comment edits for all selected lines. */
+// Builds one aligned batch of line-comment edits for all selected lines.
 export function resolveLineCommentEdits(
   textDocument: TextDocument,
   selections: readonly EditorSelection[],
@@ -198,8 +198,10 @@ function findBlockComment(
   from: number,
   to: number
 ): BlockCommentMatch | undefined {
-  const beforeStart = Math.max(0, from - BLOCK_COMMENT_SEARCH_MARGIN);
-  const textBefore = textDocument.getTextSlice(beforeStart, from);
+  const textBefore = textDocument.getTextSlice(
+    Math.max(0, from - BLOCK_COMMENT_SEARCH_MARGIN),
+    from
+  );
   const textAfter = textDocument.getTextSlice(
     to,
     to + BLOCK_COMMENT_SEARCH_MARGIN
@@ -227,9 +229,8 @@ function findBlockComment(
     };
   }
 
-  const length = to - from;
   const shortText =
-    length <= BLOCK_COMMENT_SEARCH_MARGIN * 2
+    to - from <= BLOCK_COMMENT_SEARCH_MARGIN * 2
       ? textDocument.getTextSlice(from, to)
       : undefined;
   const startText =
@@ -310,7 +311,7 @@ function mapOffset(
   return offset + delta;
 }
 
-/** Builds block-comment edits and content-preserving post-edit selections. */
+// Builds block-comment edits and content-preserving post-edit selections.
 export function resolveBlockCommentEdits(
   textDocument: TextDocument,
   selections: readonly EditorSelection[],
@@ -340,10 +341,7 @@ export function resolveBlockCommentEdits(
     };
   });
   if (linewise && ranges.length > 1) {
-    ranges.sort((a, b) => {
-      const startOrder = a.from - b.from;
-      return startOrder !== 0 ? startOrder : a.to - b.to;
-    });
+    ranges.sort((a, b) => (a.from !== b.from ? a.from - b.from : a.to - b.to));
     let lastRangeIndex = 0;
     for (let index = 1; index < ranges.length; index++) {
       const previous = ranges[lastRangeIndex];
@@ -368,36 +366,27 @@ export function resolveBlockCommentEdits(
 
   const shouldUncomment = ranges.every((range) => range.comment !== undefined);
   const offsetEdits: OffsetEdit[] = [];
-  for (const range of ranges) {
-    const comment = range.comment;
-    if (shouldUncomment && comment !== undefined) {
-      offsetEdits.push(comment.open, comment.close);
-      continue;
-    }
+  for (const { from, to, comment } of ranges) {
     if (comment !== undefined) {
-      continue;
+      if (shouldUncomment) {
+        offsetEdits.push(comment.open, comment.close);
+      }
+    } else if (from === to) {
+      offsetEdits.push({ start: from, end: to, text: open + '  ' + close });
+    } else {
+      offsetEdits.push(
+        { start: from, end: from, text: open + ' ' },
+        { start: to, end: to, text: ' ' + close }
+      );
     }
-    if (range.from === range.to) {
-      offsetEdits.push({
-        start: range.from,
-        end: range.to,
-        text: open + '  ' + close,
-      });
-      continue;
-    }
-    offsetEdits.push(
-      { start: range.from, end: range.from, text: open + ' ' },
-      { start: range.to, end: range.to, text: ' ' + close }
-    );
   }
 
   if (offsetEdits.length === 0) {
     return undefined;
   }
-  offsetEdits.sort((a, b) => {
-    const startOrder = a.start - b.start;
-    return startOrder !== 0 ? startOrder : a.end - b.end;
-  });
+  offsetEdits.sort((a, b) =>
+    a.start !== b.start ? a.start - b.start : a.end - b.end
+  );
   const edits = offsetEdits.map((edit) => ({
     range: {
       start: textDocument.positionAt(edit.start),
@@ -409,46 +398,6 @@ export function resolveBlockCommentEdits(
     return { edits, nextSelectionOffsets: [] };
   }
 
-  const logicalRanges: Array<{
-    start: number;
-    end: number;
-    startAssociation: -1 | 1;
-    endAssociation: -1 | 1;
-    collapsedInset?: number;
-  }> = ranges.map((range) => {
-    const comment = range.comment;
-    if (shouldUncomment && comment !== undefined) {
-      return {
-        start: comment.contentStart,
-        end: comment.contentEnd,
-        startAssociation: 1,
-        endAssociation: -1,
-      };
-    }
-    if (comment !== undefined) {
-      return {
-        start: range.from,
-        end: range.to,
-        startAssociation: 1,
-        endAssociation: 1,
-      };
-    }
-    if (range.from === range.to) {
-      return {
-        start: range.from,
-        end: range.to,
-        startAssociation: -1,
-        endAssociation: -1,
-        collapsedInset: open.length + 1,
-      };
-    }
-    return {
-      start: range.from,
-      end: range.to,
-      startAssociation: 1,
-      endAssociation: -1,
-    };
-  });
   const cumulativeDeltas = new Array<number>(offsetEdits.length + 1);
   cumulativeDeltas[0] = 0;
   for (let index = 0; index < offsetEdits.length; index++) {
@@ -456,28 +405,32 @@ export function resolveBlockCommentEdits(
     cumulativeDeltas[index + 1] =
       cumulativeDeltas[index] + edit.text.length - (edit.end - edit.start);
   }
-  const nextSelectionOffsets = logicalRanges.map((range, index) => {
-    const start =
-      mapOffset(
-        range.start,
-        offsetEdits,
-        cumulativeDeltas,
-        range.startAssociation
-      ) + (range.collapsedInset ?? 0);
-    const end =
-      range.collapsedInset === undefined
-        ? mapOffset(
-            range.end,
-            offsetEdits,
-            cumulativeDeltas,
-            range.endAssociation
-          )
-        : start;
-    return [start, end, ranges[index].direction] as const;
-  });
+  const nextSelectionOffsets = ranges.map(
+    ({ from, to, direction, comment }) => {
+      // Collapsed carets land inside the inserted `open  close` pair.
+      if (comment === undefined && from === to) {
+        const caret =
+          mapOffset(from, offsetEdits, cumulativeDeltas, -1) + open.length + 1;
+        return [caret, caret, direction] as const;
+      }
+      // Uncommenting keeps the content selected; commenting keeps the
+      // selection inside the new delimiters.
+      if (shouldUncomment && comment !== undefined) {
+        from = comment.contentStart;
+        to = comment.contentEnd;
+      }
+      return [
+        mapOffset(from, offsetEdits, cumulativeDeltas, 1),
+        mapOffset(
+          to,
+          offsetEdits,
+          cumulativeDeltas,
+          comment !== undefined && !shouldUncomment ? 1 : -1
+        ),
+        direction,
+      ] as const;
+    }
+  );
 
-  return {
-    edits,
-    nextSelectionOffsets,
-  };
+  return { edits, nextSelectionOffsets };
 }

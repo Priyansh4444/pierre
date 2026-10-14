@@ -1,3 +1,4 @@
+import { snapCharacterToGraphemeBoundary } from './selection';
 import { getGraphemeSegmenter, h, round } from './utils';
 
 // Upper bound on cached DOM text-width measurements. The cache only holds
@@ -17,16 +18,13 @@ export class Metrics {
   // Memoizes domMeasureTextWidth() results
   #textWidthCache = new Map<string, number>();
 
-  /** Width of the '0' character. */
+  // Width of the '0' character.
   ch: number = -1;
-  /** Size of a tab(\t) character. */
   tabSize: number = 2;
-  /** Height of the code line. */
   lineHeight: number = 20;
-  /** Padding top of the root element. */
+  // Padding top of the root element's parent.
   paddingTop: number = 0;
 
-  /** initialize the metrics */
   init(root: HTMLElement): void {
     if (
       this.#root === root &&
@@ -75,21 +73,16 @@ export class Metrics {
     }
   }
 
-  /**
-   * Re-measure the '0' character width against the font that is loaded right
-   * now, returning true when measurement-dependent UI should refresh.
-   *
-   * A custom web font can finish loading after the editor first renders.
-   * Until then canvas measureText reports the fallback font's width, and
-   * getComputedStyle returns the same font-family string before and after the
-   * file arrives, so init()'s font guard never re-measures on its own. Call
-   * this once fonts have settled (e.g. on document.fonts.ready) to replace a
-   * width measured against the fallback font with the real glyph width. Font
-   * completion can also change DOM-measured emoji/ZWJ widths while leaving the
-   * ASCII width unchanged, and the computed font string stays the same in both
-   * cases. The boolean return lets the caller skip re-rendering when there is no
-   * measured state to refresh.
-   */
+  // Re-measure the '0' width against the font loaded right now. Returns true
+  // when measurement-dependent UI should refresh.
+  //
+  // A custom web font can finish loading after the first render. Until then
+  // canvas measureText reports the fallback font's width, and getComputedStyle
+  // returns the same font string before and after the file arrives, so init()
+  // never re-measures on its own. Call this once fonts settle (e.g. on
+  // document.fonts.ready). Font loading can also change DOM-measured emoji/ZWJ
+  // widths while the ASCII width stays the same, so cached DOM widths are
+  // dropped too.
   remeasureCharacterWidth(): boolean {
     if (this.#canvasCtx === undefined || this.#font === undefined) {
       return false;
@@ -97,39 +90,25 @@ export class Metrics {
     this.#setCanvasFont(this.#font);
     const ch = this.canvasMeasureTextWidth('0');
     const characterWidthChanged = ch !== this.ch;
-    if (characterWidthChanged) {
-      this.ch = ch;
-    }
-    const textWidthCacheCleared = this.#clearTextWidthCache();
-    return characterWidthChanged || textWidthCacheCleared;
+    this.ch = ch;
+    return this.clearTextWidthCache() || characterWidthChanged;
   }
 
-  /**
-   * Set the canvas font while the canvas is connected to the document.
-   *
-   * WebKit resolves a canvas font from the canvas element's computed style at
-   * assignment. A detached canvas has none, so WebKit ignores user-installed
-   * fonts and measures the fallback family while the DOM renders the real font,
-   * shifting every caret and selection in hosts that allow user-installed fonts
-   * (WKWebView, Playwright WebKit). Connecting the canvas for the assignment
-   * makes it measure the same font the DOM renders.
-   */
+  // Set the canvas font while the canvas is connected to the document. WebKit
+  // resolves a canvas font from the canvas element's computed style; a
+  // detached canvas has none, so WebKit ignores user-installed fonts and
+  // measures the fallback family while the DOM renders the real font.
+  // Callers run after init(), so root, canvas and context exist.
   #setCanvasFont(font: string): void {
-    const root = this.#root;
-    const canvas = this.#canvas;
-    const canvasCtx = this.#canvasCtx;
-    if (root == null || canvas == null || canvasCtx == null) {
-      throw new Error('Metrics not initialized');
-    }
-    root.append(canvas);
+    const canvas = this.#canvas!;
+    this.#root!.append(canvas);
     try {
-      canvasCtx.font = font;
+      this.#canvasCtx!.font = font;
     } finally {
       canvas.remove();
     }
   }
 
-  /** measure the width of the text */
   measureTextWidth(text: string): number {
     if (!text.includes('\t')) {
       return this.#measureTextWidthWithoutTabs(text);
@@ -168,10 +147,8 @@ export class Metrics {
     return round(width);
   }
 
-  /**
-   * Pixel width from a wrapped segment's start up to a character. Tabs advance
-   * from the segment start so their stops line up with the rendered text.
-   */
+  // Pixel width from a wrapped segment's start up to a character. Tabs advance
+  // from the segment start so their stops line up with the rendered text.
   segmentTextWidth(
     lineText: string,
     segmentStart: number,
@@ -188,13 +165,11 @@ export class Metrics {
   }
 
   #measureTextWidthWithoutTabs(text: string): number {
-    if (needsDomTextMeasurement(text)) {
-      return this.domMeasureTextWidth(text);
-    }
-    return this.canvasMeasureTextWidth(text);
+    return needsDomTextMeasurement(text)
+      ? this.domMeasureTextWidth(text)
+      : this.canvasMeasureTextWidth(text);
   }
 
-  /** measure the width of the text using the canvas measureText API */
   canvasMeasureTextWidth(text: string): number {
     if (this.#canvasCtx === undefined) {
       throw new Error('Metrics not initialized');
@@ -202,17 +177,15 @@ export class Metrics {
     return round(this.#canvasCtx.measureText(text).width);
   }
 
-  /**
-   * measure the width of the text using the DOM
-   * this is slow because it cause a reflow, use it for non-ascii text;
-   * results are memoized per text so repeated measurements skip the reflow
-   */
+  // Slow: forces a reflow, so it is only used for non-ASCII text and its
+  // results are memoized per text.
   domMeasureTextWidth(text: string): number {
     if (this.#root === undefined) {
       throw new Error('Metrics not initialized');
     }
+    const cache = this.#textWidthCache;
     const cacheKey = text + '|' + this.#font;
-    const cached = this.#textWidthCache.get(cacheKey);
+    const cached = cache.get(cacheKey);
     if (cached !== undefined) {
       return cached;
     }
@@ -241,33 +214,22 @@ export class Metrics {
     } finally {
       measureEl.remove();
     }
-    if (this.#textWidthCache.size >= TEXT_WIDTH_CACHE_LIMIT) {
-      const oldestKey = this.#textWidthCache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.#textWidthCache.delete(oldestKey);
-      }
+    if (cache.size >= TEXT_WIDTH_CACHE_LIMIT) {
+      cache.delete(cache.keys().next().value!);
     }
-    this.#textWidthCache.set(cacheKey, width);
+    cache.set(cacheKey, width);
     return width;
   }
 
-  /**
-   * discard memoized DOM text widths
-   * call this when the inherited font may have changed without re-running
-   * init(), e.g. on a layout reflow, so stale widths are not reused
-   */
-  clearTextWidthCache(): void {
-    this.#clearTextWidthCache();
-  }
-
-  #clearTextWidthCache(): boolean {
+  // Drop memoized DOM widths when the inherited font may have changed without
+  // re-running init(). Returns whether anything was cached.
+  clearTextWidthCache(): boolean {
     const hadCachedTextWidths = this.#textWidthCache.size > 0;
     this.#textWidthCache.clear();
     return hadCachedTextWidths;
   }
 }
 
-/** Check if the text needs DOM text measurement. */
 export function needsDomTextMeasurement(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
@@ -284,7 +246,9 @@ export function needsDomTextMeasurement(text: string): boolean {
   return false;
 }
 
-/** snap the text offset to the Unicode boundary */
+// Avoid measuring a caret position inside one visual emoji/grapheme. Browser
+// caret movement can report offsets around UTF-16 surrogate pairs and emoji
+// joiners; measuring a partial sequence gives a replacement-glyph width.
 export function snapTextOffsetToUnicodeBoundary(
   text: string,
   offset: number
@@ -297,41 +261,9 @@ export function snapTextOffsetToUnicodeBoundary(
   ) {
     return boundedOffset;
   }
-  // Avoid measuring a caret position inside one visual emoji/grapheme.
-  // Browser caret movement can report offsets around UTF-16 surrogate
-  // pairs and emoji joiners; measuring a partial sequence gives a
-  // replacement-glyph width.
-  const segmenter = getGraphemeSegmenter();
-  if (segmenter !== undefined) {
-    for (const segment of segmenter.segment(text)) {
-      const segmentStart = segment.index;
-      const segmentEnd = segmentStart + segment.segment.length;
-      if (boundedOffset > segmentStart && boundedOffset < segmentEnd) {
-        return segmentEnd;
-      }
-      if (boundedOffset <= segmentStart) {
-        break;
-      }
-    }
-    return boundedOffset;
-  }
-  // Degraded path for engines lacking Intl.Segmenter: snap out of a
-  // surrogate pair by stepping over code points.
-  let segmentStart = 0;
-  for (const codePoint of text) {
-    const segmentEnd = segmentStart + codePoint.length;
-    if (boundedOffset > segmentStart && boundedOffset < segmentEnd) {
-      return segmentEnd;
-    }
-    if (boundedOffset <= segmentStart) {
-      break;
-    }
-    segmentStart = segmentEnd;
-  }
-  return boundedOffset;
+  return snapCharacterToGraphemeBoundary(text, boundedOffset);
 }
 
-/** get the offsets of the Unicode grapheme clusters in the text */
 export function getUnicodeMeasurementOffsets(
   text: string
 ): number[] | undefined {
@@ -355,11 +287,9 @@ export function getUnicodeMeasurementOffsets(
   return offsets;
 }
 
-/**
- * Count the rendered columns of ASCII text, advancing each tab to the next
- * fixed tab stop (a multiple of tabSize) to match CSS `tab-size`. Returns -1
- * for non-ASCII text, which must be measured glyph-by-glyph instead.
- */
+// Count the rendered columns of ASCII text, advancing each tab to the next
+// fixed tab stop (a multiple of tabSize) to match CSS `tab-size`. Returns -1
+// for non-ASCII text, which must be measured glyph-by-glyph instead.
 export function getExpandedAsciiTextColumns(
   text: string,
   tabSize: number

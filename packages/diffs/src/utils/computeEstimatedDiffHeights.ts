@@ -1,7 +1,5 @@
 import type {
-  ChangeContent,
   FileDiffMetadata,
-  Hunk,
   HunkExpansionRegion,
   HunkSeparators,
   VirtualFileMetrics,
@@ -48,14 +46,10 @@ export function computeEstimatedDiffHeights({
   let splitHeight = getVirtualFileHeaderRegion(metrics, disableFileHeader);
   let unifiedHeight = splitHeight;
   const expandedHunks = expandUnchanged ? true : configuredExpandedHunks;
-  const finalHunkIndex = fileDiff.hunks.length - 1;
+  const { lineHeight } = metrics;
 
   for (let hunkIndex = 0; hunkIndex < fileDiff.hunks.length; hunkIndex++) {
     const hunk = fileDiff.hunks[hunkIndex];
-    if (hunk == null) {
-      throw new Error('computeEstimatedDiffHeights: invalid hunk index');
-    }
-
     const leadingRegion = getExpandedRegion({
       isPartial: fileDiff.isPartial,
       rangeSize: hunk.collapsedBefore,
@@ -64,7 +58,7 @@ export function computeEstimatedDiffHeights({
       collapsedContextThreshold,
     });
     const leadingExpandedHeight =
-      (leadingRegion.fromStart + leadingRegion.fromEnd) * metrics.lineHeight;
+      (leadingRegion.fromStart + leadingRegion.fromEnd) * lineHeight;
     splitHeight += leadingExpandedHeight;
     unifiedHeight += leadingExpandedHeight;
 
@@ -80,95 +74,61 @@ export function computeEstimatedDiffHeights({
       unifiedHeight += separatorHeight;
     }
 
-    splitHeight += hunk.splitLineCount * metrics.lineHeight;
-    unifiedHeight += hunk.unifiedLineCount * metrics.lineHeight;
+    splitHeight += hunk.splitLineCount * lineHeight;
+    unifiedHeight += hunk.unifiedLineCount * lineHeight;
 
-    const metadataLineCounts = getNoNewlineMetadataLineCounts(hunk);
-    splitHeight += metadataLineCounts.split * metrics.lineHeight;
-    unifiedHeight += metadataLineCounts.unified * metrics.lineHeight;
-
-    const trailingRegion =
-      hunkIndex === finalHunkIndex
-        ? getTrailingExpandedRegion({
-            fileDiff,
-            hunkIndex,
-            expandedHunks,
-            collapsedContextThreshold,
-            errorPrefix: 'computeEstimatedDiffHeights',
-          })
-        : undefined;
-    if (trailingRegion != null) {
-      const trailingExpandedHeight =
-        (trailingRegion.fromStart + trailingRegion.fromEnd) *
-        metrics.lineHeight;
-      splitHeight += trailingExpandedHeight;
-      unifiedHeight += trailingExpandedHeight;
-
-      if (trailingRegion.collapsedLines > 0) {
-        const separatorHeight =
-          getTrailingHunkSeparatorLayout({
-            type: hunkSeparators,
-            metrics,
-          })?.totalHeight ?? 0;
-        splitHeight += separatorHeight;
-        unifiedHeight += separatorHeight;
+    // "No newline at end of file" metadata rows after the hunk's last content.
+    if (hunk.noEOFCRAdditions || hunk.noEOFCRDeletions) {
+      const lastContent = hunk.hunkContent.at(-1);
+      if (lastContent?.type === 'context') {
+        const metadataRows = lastContent.lines > 0 ? 1 : 0;
+        splitHeight += metadataRows * lineHeight;
+        unifiedHeight += metadataRows * lineHeight;
+      } else if (lastContent != null) {
+        const hasDeletionMetadata =
+          lastContent.deletions > 0 && hunk.noEOFCRDeletions;
+        const hasAdditionMetadata =
+          lastContent.additions > 0 && hunk.noEOFCRAdditions;
+        splitHeight +=
+          (hasDeletionMetadata || hasAdditionMetadata ? 1 : 0) * lineHeight;
+        unifiedHeight +=
+          ((hasDeletionMetadata ? 1 : 0) + (hasAdditionMetadata ? 1 : 0)) *
+          lineHeight;
       }
-    } else if (
-      hunkIndex === finalHunkIndex &&
-      fileDiff.isPartial &&
-      canHydratePartialDiff
-    ) {
-      const separatorHeight =
-        getTrailingHunkSeparatorLayout({
-          type: hunkSeparators,
-          metrics,
-        })?.totalHeight ?? 0;
-      splitHeight += separatorHeight;
-      unifiedHeight += separatorHeight;
     }
   }
 
-  if (fileDiff.hunks.length > 0) {
+  const finalHunkIndex = fileDiff.hunks.length - 1;
+  if (finalHunkIndex >= 0) {
+    const trailingRegion = getTrailingExpandedRegion({
+      fileDiff,
+      hunkIndex: finalHunkIndex,
+      expandedHunks,
+      collapsedContextThreshold,
+      errorPrefix: 'computeEstimatedDiffHeights',
+    });
+    if (trailingRegion != null) {
+      const trailingExpandedHeight =
+        (trailingRegion.fromStart + trailingRegion.fromEnd) * lineHeight;
+      splitHeight += trailingExpandedHeight;
+      unifiedHeight += trailingExpandedHeight;
+    }
+    if (
+      trailingRegion != null
+        ? trailingRegion.collapsedLines > 0
+        : fileDiff.isPartial && canHydratePartialDiff
+    ) {
+      const separatorHeight =
+        getTrailingHunkSeparatorLayout({ type: hunkSeparators, metrics })
+          ?.totalHeight ?? 0;
+      splitHeight += separatorHeight;
+      unifiedHeight += separatorHeight;
+    }
+
     const paddingBottom = getVirtualFilePaddingBottom(metrics);
     splitHeight += paddingBottom;
     unifiedHeight += paddingBottom;
   }
 
   return { splitHeight, unifiedHeight };
-}
-
-function getNoNewlineMetadataLineCounts(hunk: Hunk): {
-  split: number;
-  unified: number;
-} {
-  if (!hunk.noEOFCRAdditions && !hunk.noEOFCRDeletions) {
-    return { split: 0, unified: 0 };
-  }
-
-  const lastContent = hunk.hunkContent.at(-1);
-  if (lastContent == null) {
-    return { split: 0, unified: 0 };
-  }
-
-  if (lastContent.type === 'context') {
-    const metadataRows = lastContent.lines > 0 ? 1 : 0;
-    return { split: metadataRows, unified: metadataRows };
-  }
-
-  return getChangeNoNewlineMetadataLineCounts(hunk, lastContent);
-}
-function getChangeNoNewlineMetadataLineCounts(
-  hunk: Hunk,
-  content: ChangeContent
-): { split: number; unified: number } {
-  const unified =
-    (content.deletions > 0 && hunk.noEOFCRDeletions ? 1 : 0) +
-    (content.additions > 0 && hunk.noEOFCRAdditions ? 1 : 0);
-  const splitDeletionHasMetadata =
-    content.deletions > 0 && hunk.noEOFCRDeletions;
-  const splitAdditionHasMetadata =
-    content.additions > 0 && hunk.noEOFCRAdditions;
-  const split = splitDeletionHasMetadata || splitAdditionHasMetadata ? 1 : 0;
-
-  return { split, unified };
 }

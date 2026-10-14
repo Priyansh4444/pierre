@@ -1,9 +1,4 @@
-import type {
-  ChangeContent,
-  ContextContent,
-  FileDiffMetadata,
-  Hunk,
-} from '../types';
+import type { ChangeContent, FileDiffMetadata, Hunk } from '../types';
 
 // The diff library emits one change block per replaced run, ordering every
 // deleted line before every added line. Renderers pair a block's lines
@@ -26,12 +21,12 @@ const MAX_ALIGNMENT_COMPARISONS = 4096;
 // line displacing an edited one, where the gap approaches 1.
 const MIN_IMPROVEMENT_PER_PAIR = 0.5;
 
-/**
- * Re-split count-mismatched change blocks in every hunk so paired lines are
- * chosen by content similarity instead of position. Mutates `hunks` in place
- * without moving changes across context lines; rendered row counts are
- * unchanged (a split block covers the same split/unified rows as the original).
- */
+const WHITESPACE = /\s+/g;
+
+// Re-split count-mismatched change blocks in every hunk so paired lines are
+// chosen by content similarity instead of position. Mutates `hunks` in place
+// without moving changes across context lines; rendered row counts are
+// unchanged (a split block covers the same split/unified rows as the original).
 export function realignChangeContentBySimilarity(
   diff: Pick<FileDiffMetadata, 'hunks' | 'additionLines' | 'deletionLines'>
 ): void {
@@ -41,37 +36,124 @@ export function realignChangeContentBySimilarity(
       if (content.type !== 'change') {
         continue;
       }
-      const replacement = realignChangeBlock(diff, content);
-      if (replacement != null) {
-        hunk.hunkContent.splice(index, 1, ...replacement);
-        index += replacement.length - 1;
+      // Balanced blocks and blocks too large to scan keep their positional
+      // pairing.
+      const { deletions, additions, deletionLineIndex, additionLineIndex } =
+        content;
+      const pairCount = Math.min(deletions, additions);
+      const surplus = Math.abs(additions - deletions);
+      if (
+        pairCount === 0 ||
+        surplus === 0 ||
+        pairCount * (surplus + 1) > MAX_ALIGNMENT_COMPARISONS
+      ) {
+        continue;
       }
+
+      // Whitespace (indentation, formatter churn, trailing spaces, the line
+      // break itself) is noise for deciding which lines pair — the rendered
+      // diff still shows every whitespace change on the paired row. Strip it
+      // once per line here rather than per comparison.
+      const strippedDeletions: string[] = [];
+      for (let line = 0; line < deletions; line++) {
+        strippedDeletions.push(
+          (diff.deletionLines[deletionLineIndex + line] ?? '').replace(
+            WHITESPACE,
+            ''
+          )
+        );
+      }
+      const strippedAdditions: string[] = [];
+      for (let line = 0; line < additions; line++) {
+        strippedAdditions.push(
+          (diff.additionLines[additionLineIndex + line] ?? '').replace(
+            WHITESPACE,
+            ''
+          )
+        );
+      }
+
+      // Score every offset of the shorter side along the longer side and keep
+      // the best one only when it decisively beats the positional pairing.
+      const additionsAreLonger = additions > deletions;
+      let bestOffset = 0;
+      let bestScore = -1;
+      for (let offset = 0; offset <= surplus; offset++) {
+        let score = 0;
+        for (let pair = 0; pair < pairCount; pair++) {
+          score += lineSimilarity(
+            strippedDeletions[pair + (additionsAreLonger ? 0 : offset)],
+            strippedAdditions[pair + (additionsAreLonger ? offset : 0)]
+          );
+        }
+        if (offset === 0) {
+          bestScore = score + pairCount * MIN_IMPROVEMENT_PER_PAIR;
+        } else if (score > bestScore) {
+          bestScore = score;
+          bestOffset = offset;
+        }
+      }
+      if (bestOffset === 0) {
+        continue;
+      }
+
+      // Split into the skipped surplus lines, the paired lines, and the rest of
+      // the surplus (when any is left).
+      const additionShift = additionsAreLonger ? bestOffset : 0;
+      const deletionShift = bestOffset - additionShift;
+      const blocks: ChangeContent[] = [
+        {
+          type: 'change',
+          deletions: deletionShift,
+          additions: additionShift,
+          deletionLineIndex,
+          additionLineIndex,
+        },
+        {
+          type: 'change',
+          deletions: pairCount,
+          additions: pairCount,
+          deletionLineIndex: deletionLineIndex + deletionShift,
+          additionLineIndex: additionLineIndex + additionShift,
+        },
+      ];
+      const tailDeletions = deletions - pairCount - deletionShift;
+      const tailAdditions = additions - pairCount - additionShift;
+      if (tailDeletions > 0 || tailAdditions > 0) {
+        blocks.push({
+          type: 'change',
+          deletions: tailDeletions,
+          additions: tailAdditions,
+          deletionLineIndex: deletionLineIndex + deletionShift + pairCount,
+          additionLineIndex: additionLineIndex + additionShift + pairCount,
+        });
+      }
+      hunk.hunkContent.splice(index, 1, ...blocks);
+      index += blocks.length - 1;
     }
   }
 }
 
-/**
- * During editing, slide pure insert/delete blocks made entirely of blank lines
- * to the top of the blank run they sit in. Adding or removing a blank line next to
- * existing blanks is ambiguous, and the diff library reports the change at
- * the run's bottom — so pressing Enter at the end of a line marks a blank
- * *below* the caret as inserted while the caret's own new line renders as
- * context. Sliding up anchors the change to the content above it (the caret
- * line after an Enter) instead.
- *
- * `resolveSlide` receives each block that qualifies along with the full
- * distance to the run's top and returns how far to actually move it; 0 keeps
- * the parsed position. Without it, every qualifying block slides to the top.
- *
- * The slide only applies when the block comes to rest directly beneath
- * remaining in-hunk content. A slide that would consume the
- * hunk's entire leading context was stopped by the hunk's edge — a context
- * window cut, not the top of the blank run — and that landing spot is
- * arbitrary, so the block keeps the library's bottom-of-run anchor (which
- * sits against the content below the run). Non-blank blocks never slide, so
- * code that merely ends like its neighbor (an added function before an
- * identical `}`) keeps the library's canonical position.
- */
+// During editing, slide pure insert/delete blocks made entirely of blank lines
+// to the top of the blank run they sit in. Adding or removing a blank line next
+// to existing blanks is ambiguous, and the diff library reports the change at
+// the run's bottom — so pressing Enter at the end of a line marks a blank
+// *below* the caret as inserted while the caret's own new line renders as
+// context. Sliding up anchors the change to the content above it (the caret
+// line after an Enter) instead.
+//
+// `resolveSlide` receives each block that qualifies along with the full
+// distance to the run's top and returns how far to actually move it; 0 keeps
+// the parsed position. Without it, every qualifying block slides to the top.
+//
+// The slide only applies when the block comes to rest directly beneath
+// remaining in-hunk content. A slide that would consume the hunk's entire
+// leading context was stopped by the hunk's edge — a context window cut, not
+// the top of the blank run — and that landing spot is arbitrary, so the block
+// keeps the library's bottom-of-run anchor (which sits against the content
+// below the run). Non-blank blocks never slide, so code that merely ends like
+// its neighbor (an added function before an identical `}`) keeps the
+// library's canonical position.
 export function slideBlankBoundaryBlocksUp(
   hunk: Hunk,
   diff: Pick<FileDiffMetadata, 'additionLines' | 'deletionLines'>,
@@ -102,14 +184,11 @@ export function slideBlankBoundaryBlocksUp(
     if (unit.trim() !== '') {
       continue;
     }
-    let uniform = true;
-    for (let offset = 1; offset < blockLength; offset++) {
-      if (lines[blockStart + offset] !== unit) {
-        uniform = false;
-        break;
-      }
+    let offset = 1;
+    while (offset < blockLength && lines[blockStart + offset] === unit) {
+      offset++;
     }
-    if (!uniform) {
+    if (offset < blockLength) {
       continue;
     }
 
@@ -163,120 +242,6 @@ export function slideBlankBoundaryBlocksUp(
       index--;
     }
   }
-}
-
-// Returns the split blocks for one change block, or null when the block is
-// balanced, too large to scan, or already best paired positionally.
-function realignChangeBlock(
-  diff: Pick<FileDiffMetadata, 'additionLines' | 'deletionLines'>,
-  content: ChangeContent
-): (ContextContent | ChangeContent)[] | null {
-  const { deletions, additions, deletionLineIndex, additionLineIndex } =
-    content;
-  const pairCount = Math.min(deletions, additions);
-  const surplus = Math.abs(additions - deletions);
-  if (
-    pairCount === 0 ||
-    surplus === 0 ||
-    pairCount * (surplus + 1) > MAX_ALIGNMENT_COMPARISONS
-  ) {
-    return null;
-  }
-
-  // Whitespace (indentation, formatter churn, trailing spaces, the line
-  // break itself) is noise for deciding which lines pair — the rendered diff
-  // still shows every whitespace change on the paired row. Strip it once per
-  // line here rather than per comparison.
-  const strippedDeletions: string[] = [];
-  for (let line = 0; line < deletions; line++) {
-    strippedDeletions.push(
-      stripWhitespace(diff.deletionLines[deletionLineIndex + line] ?? '')
-    );
-  }
-  const strippedAdditions: string[] = [];
-  for (let line = 0; line < additions; line++) {
-    strippedAdditions.push(
-      stripWhitespace(diff.additionLines[additionLineIndex + line] ?? '')
-    );
-  }
-
-  // Score every offset of the shorter side along the longer side and keep
-  // the best one only when it decisively beats the positional pairing.
-  const additionsAreLonger = additions > deletions;
-  let bestOffset = 0;
-  let bestScore = -1;
-  for (let offset = 0; offset <= surplus; offset++) {
-    let score = 0;
-    for (let pair = 0; pair < pairCount; pair++) {
-      score += lineSimilarity(
-        strippedDeletions[pair + (additionsAreLonger ? 0 : offset)],
-        strippedAdditions[pair + (additionsAreLonger ? offset : 0)]
-      );
-    }
-    if (offset === 0) {
-      bestScore = score + pairCount * MIN_IMPROVEMENT_PER_PAIR;
-    } else if (score > bestScore) {
-      bestScore = score;
-      bestOffset = offset;
-    }
-  }
-  if (bestOffset === 0) {
-    return null;
-  }
-
-  const blocks: ChangeContent[] = [];
-  const pushBlock = (
-    blockDeletions: number,
-    blockAdditions: number,
-    blockDeletionIndex: number,
-    blockAdditionIndex: number
-  ) => {
-    if (blockDeletions > 0 || blockAdditions > 0) {
-      blocks.push({
-        type: 'change',
-        deletions: blockDeletions,
-        additions: blockAdditions,
-        deletionLineIndex: blockDeletionIndex,
-        additionLineIndex: blockAdditionIndex,
-      });
-    }
-  };
-  if (additionsAreLonger) {
-    pushBlock(0, bestOffset, deletionLineIndex, additionLineIndex);
-    pushBlock(
-      pairCount,
-      pairCount,
-      deletionLineIndex,
-      additionLineIndex + bestOffset
-    );
-    pushBlock(
-      0,
-      additions - pairCount - bestOffset,
-      deletionLineIndex + pairCount,
-      additionLineIndex + bestOffset + pairCount
-    );
-  } else {
-    pushBlock(bestOffset, 0, deletionLineIndex, additionLineIndex);
-    pushBlock(
-      pairCount,
-      pairCount,
-      deletionLineIndex + bestOffset,
-      additionLineIndex
-    );
-    pushBlock(
-      deletions - pairCount - bestOffset,
-      0,
-      deletionLineIndex + bestOffset + pairCount,
-      additionLineIndex + pairCount
-    );
-  }
-  return blocks;
-}
-
-const WHITESPACE = /\s+/g;
-
-function stripWhitespace(line: string): string {
-  return line.replace(WHITESPACE, '');
 }
 
 // Cheap 0..1 similarity over whitespace-stripped lines: shared prefix plus

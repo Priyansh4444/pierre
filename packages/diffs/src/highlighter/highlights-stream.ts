@@ -8,7 +8,7 @@ import type { ThemedToken } from './types';
 const TRIM_LINE_COUNT = 1024;
 const DOCUMENT_START = { line: 0, character: 0 };
 
-/** Keeps the unfinished line editable so new chunks can recall provisional tokens. */
+// Keeps the unfinished line editable so new chunks can recall provisional tokens.
 export class HighlightsStreamTokenizer extends BaseStreamTokenizer {
   #tokenizer: LiveTokenizer;
   #trimLineCount = TRIM_LINE_COUNT;

@@ -1,4 +1,4 @@
-import type { Element, Nodes, Properties, RootContent } from 'hast';
+import type { Element, Nodes, RootContent } from 'hast';
 import { toHtml } from 'hast-util-to-html';
 
 // Must match the html-void-elements list used by toHtml().
@@ -54,10 +54,8 @@ const CHARACTER_REFERENCES: Record<string, string> = {
 };
 const MAX_CACHED_STYLES = 256;
 
-/**
- * Avoid schema lookups for common token spans; delegate other nodes and
- * attributes to toHtml(). Output must match its default serialization exactly.
- */
+// Avoid schema lookups for common token spans; delegate other nodes and
+// attributes to toHtml(). Output must match its default serialization exactly.
 export function hastToHtml(tree: Nodes | RootContent[]): string {
   const styles = new Map<string, string>();
   return Array.isArray(tree)
@@ -111,9 +109,30 @@ function serializeElement(node: Element, styles: Map<string, string>): string {
   if (DELEGATED_TAGS.has(tagName)) {
     return toHtml(node);
   }
-  const attributes = serializeAttributes(node.properties, styles);
-  if (attributes == null) {
-    return toHtml(node);
+  let attributes = '';
+  for (const key in node.properties) {
+    const value = node.properties[key];
+    if (value == null) {
+      continue;
+    }
+    const name =
+      ATTRIBUTE_NAMES[key] ?? (DATA_ATTRIBUTE.test(key) ? key : undefined);
+    // Properties outside the fast list need the HTML schema.
+    if (name == null) {
+      return toHtml(node);
+    }
+    if (value === false || (typeof value === 'number' && Number.isNaN(value))) {
+      continue;
+    }
+    const attribute =
+      key === 'style' && typeof value === 'string'
+        ? serializeStyle(value, styles)
+        : value === true
+          ? name
+          : `${name}="${escapeAttribute(
+              Array.isArray(value) ? value.join(' ').trim() : String(value)
+            )}"`;
+    attributes += attributes === '' ? attribute : ` ${attribute}`;
   }
   const open =
     attributes === '' ? `<${tagName}>` : `<${tagName} ${attributes}>`;
@@ -132,38 +151,6 @@ function serializeStyle(value: string, styles: Map<string, string>): string {
     if (styles.size < MAX_CACHED_STYLES) styles.set(value, attribute);
   }
   return attribute;
-}
-
-// Returns undefined when a property needs the HTML schema to serialize.
-function serializeAttributes(
-  properties: Properties | undefined,
-  styles: Map<string, string>
-): string | undefined {
-  let attributes = '';
-  for (const key in properties) {
-    const value = properties[key];
-    if (value == null) {
-      continue;
-    }
-    const name =
-      ATTRIBUTE_NAMES[key] ?? (DATA_ATTRIBUTE.test(key) ? key : undefined);
-    if (name == null) {
-      return undefined;
-    }
-    if (value === false || (typeof value === 'number' && Number.isNaN(value))) {
-      continue;
-    }
-    const attribute =
-      key === 'style' && typeof value === 'string'
-        ? serializeStyle(value, styles)
-        : value === true
-          ? name
-          : `${name}="${escapeAttribute(
-              Array.isArray(value) ? value.join(' ').trim() : String(value)
-            )}"`;
-    attributes += attributes === '' ? attribute : ` ${attribute}`;
-  }
-  return attributes;
 }
 
 function escapeText(value: string): string {

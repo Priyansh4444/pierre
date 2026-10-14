@@ -35,11 +35,9 @@ export function Virtualizer({
   contentClassName,
   contentStyle,
 }: VirtualizerProps): React.JSX.Element {
-  const [instance] = useState(() => {
-    return typeof window !== 'undefined'
-      ? new VirtualizerClass(config)
-      : undefined;
-  });
+  const [instance] = useState(() =>
+    typeof window !== 'undefined' ? new VirtualizerClass(config) : undefined
+  );
   const ref = useCallback(
     (node: HTMLElement | null) => {
       if (node != null) {

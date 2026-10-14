@@ -10,8 +10,8 @@ type TokenFragmentState = number | typeof NO_TOKEN | typeof MULTIPLE_TOKENS;
 // Walk a rendered line and add a single outer token wrapper around all
 // fragments that still belong to the same original syntax token.
 export function wrapTokenFragments(container: HASTElement): TokenFragmentState {
-  const ownTokenChar = getTokenChar(container);
-  if (ownTokenChar != null) {
+  const ownTokenChar = container.properties['data-char'];
+  if (typeof ownTokenChar === 'number') {
     return ownTokenChar;
   }
 
@@ -21,65 +21,43 @@ export function wrapTokenFragments(container: HASTElement): TokenFragmentState {
   let currentTokenChar: number | undefined;
 
   const flushTokenChildren = () => {
-    if (currentTokenChildren.length === 0 || currentTokenChar == null) {
-      currentTokenChildren = [];
-      currentTokenChar = undefined;
-      return;
-    }
-
-    if (currentTokenChildren.length === 1) {
-      const child = currentTokenChildren[0];
-      if (child?.type === 'element') {
-        setTokenChar(child, currentTokenChar);
-        for (const grandChild of child.children) {
-          stripTokenChar(grandChild);
+    if (currentTokenChar != null) {
+      if (currentTokenChildren.length === 1) {
+        const child = currentTokenChildren[0];
+        if (child.type === 'element') {
+          child.properties['data-char'] = currentTokenChar;
+          for (const grandChild of child.children) {
+            stripTokenChar(grandChild);
+          }
         }
+        wrappedChildren.push(child);
       } else {
-        stripTokenChar(child);
+        for (const child of currentTokenChildren) {
+          stripTokenChar(child);
+        }
+        wrappedChildren.push(
+          createHastElement({
+            tagName: 'span',
+            properties: { 'data-char': currentTokenChar },
+            children: currentTokenChildren,
+          })
+        );
       }
-      wrappedChildren.push(child);
-      currentTokenChildren = [];
-      currentTokenChar = undefined;
-      return;
     }
-
-    for (const child of currentTokenChildren) {
-      stripTokenChar(child);
-    }
-
-    wrappedChildren.push(
-      createHastElement({
-        tagName: 'span',
-        properties: { 'data-char': currentTokenChar },
-        children: currentTokenChildren,
-      })
-    );
-
     currentTokenChildren = [];
     currentTokenChar = undefined;
-  };
-
-  const mergeContainerTokenState = (childTokenState: TokenFragmentState) => {
-    if (childTokenState === NO_TOKEN) {
-      return;
-    }
-    if (childTokenState === MULTIPLE_TOKENS) {
-      containerTokenState = MULTIPLE_TOKENS;
-      return;
-    }
-    if (containerTokenState === NO_TOKEN) {
-      containerTokenState = childTokenState;
-      return;
-    }
-    if (containerTokenState !== childTokenState) {
-      containerTokenState = MULTIPLE_TOKENS;
-    }
   };
 
   for (const child of container.children) {
     const childTokenState: TokenFragmentState =
       child.type === 'element' ? wrapTokenFragments(child) : NO_TOKEN;
-    mergeContainerTokenState(childTokenState);
+    if (childTokenState !== NO_TOKEN) {
+      containerTokenState =
+        containerTokenState === NO_TOKEN ||
+        containerTokenState === childTokenState
+          ? childTokenState
+          : MULTIPLE_TOKENS;
+    }
 
     if (typeof childTokenState !== 'number') {
       flushTokenChildren();
@@ -100,22 +78,10 @@ export function wrapTokenFragments(container: HASTElement): TokenFragmentState {
   return containerTokenState;
 }
 
-function getTokenChar(node: HASTElement): number | undefined {
-  const value = node.properties['data-char'];
-  if (typeof value === 'number') {
-    return value;
-  }
-  return undefined;
-}
-
 function stripTokenChar(node: ElementContent): void {
   if (node.type !== 'element') return;
   node.properties['data-char'] = undefined;
   for (const child of node.children) {
     stripTokenChar(child);
   }
-}
-
-function setTokenChar(node: HASTElement, char: number): void {
-  node.properties['data-char'] = char;
 }

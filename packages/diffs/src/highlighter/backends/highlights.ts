@@ -16,9 +16,7 @@ import type {
 } from '../tokenizer-types';
 import type { CodeToTokensOptions, TokensResult } from '../types';
 
-/**
- * Highlights uses bundled lexers. Unsupported and custom languages render as text.
- */
+// Highlights uses bundled lexers. Unsupported and custom languages render as text.
 export class HighlightsHighlighter extends DiffsHighlighter {
   // Independent instances need their themes after the shared cache is cleared.
   private readonly usedThemes = new Map<string, DiffsTheme>();

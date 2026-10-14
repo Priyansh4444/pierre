@@ -39,9 +39,5 @@ function render(time: number): void {
   }
   // If render picked up any new callbacks, lets trigger a new
   // requestAnimationFrame
-  if (callbacks.size > 0) {
-    frameId = requestAnimationFrame(render);
-  } else {
-    frameId = null;
-  }
+  frameId = callbacks.size > 0 ? requestAnimationFrame(render) : null;
 }

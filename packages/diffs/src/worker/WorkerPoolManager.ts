@@ -60,8 +60,10 @@ import type {
   InitializeWorkerRequest,
   InitializeWorkerTask,
   RenderDiffRequest,
+  RenderDiffSuccessResponse,
   RenderDiffTask,
   RenderFileRequest,
+  RenderFileSuccessResponse,
   RenderFileTask,
   ResolvedLanguage,
   SetRenderOptionsWorkerTask,
@@ -73,12 +75,11 @@ import type {
   WorkerStats,
 } from './types';
 import type {
+  EncodedDiffSuccessResponse,
+  EncodedFileSuccessResponse,
   InitializeWorkerWireRequest,
   WorkerWireResponse,
 } from './workerMessage';
-
-const IGNORE_RESPONSE = Symbol('IGNORE_RESPONSE');
-const DEFAULT_WORKER_INITIALIZATION_TIMEOUT = 10_000;
 
 interface GetCachesResult {
   fileCache: LRUMap<string, RenderFileResult>;
@@ -261,7 +262,18 @@ export class WorkerPoolManager {
       this.renderOptionsVersion++;
       this.diffCache.clear();
       this.fileCache.clear();
-      this.invalidateRenderTasks();
+      // Drop render tasks queued or sent with the previous options.
+      for (let index = this.queuedTasks.length - 1; index >= 0; index--) {
+        const task = this.queuedTasks[index];
+        if (!this.isCurrentRenderTask(task)) {
+          this.removeQueuedTask(task);
+        }
+      }
+      for (const task of Array.from(this.activeTaskById.values())) {
+        if (isRenderTask(task) && !this.isCurrentRenderTask(task)) {
+          this.removeActiveTask(task);
+        }
+      }
 
       for (const instance of this.themeSubscribers) {
         instance.onThemeChange();
@@ -290,24 +302,13 @@ export class WorkerPoolManager {
     return { ...this.renderOptions };
   }
 
+  // Callers have awaited initialization, so every worker is initialized.
   private async setRenderOptionsOnWorkers(
     renderOptions: WorkerRenderingOptions,
     resolvedThemes: DiffsTheme[]
   ): Promise<void> {
-    if (this.workersFailed) {
-      return;
-    }
-    if (!this.isInitialized()) {
-      await this.initialize();
-    }
     const taskPromises: Promise<void>[] = [];
     for (const managedWorker of this.workers) {
-      if (!managedWorker.initialized) {
-        console.log({ managedWorker });
-        throw new Error(
-          'setRenderOptionsOnWorkers: Somehow we have an uninitialized worker'
-        );
-      }
       taskPromises.push(
         new Promise<void>((resolve, reject) => {
           const id = this.generateRequestId();
@@ -338,10 +339,7 @@ export class WorkerPoolManager {
   public subscribeToThemeChanges(instance: ThemeSubscriber): () => void {
     this.themeSubscribers.add(instance);
     this.queueBroadcastStateChanges();
-    return () => {
-      this.unsubscribeToThemeChanges(instance);
-      this.queueBroadcastStateChanges();
-    };
+    return () => this.unsubscribeToThemeChanges(instance);
   }
 
   public unsubscribeToThemeChanges(instance: ThemeSubscriber): void {
@@ -365,10 +363,7 @@ export class WorkerPoolManager {
   }
 
   private _broadcastStateChanges = () => {
-    if (this._queuedBroadcast != null) {
-      cancelAnimationFrame(this._queuedBroadcast);
-      this._queuedBroadcast = undefined;
-    }
+    this._queuedBroadcast = undefined;
     const stats = this.getStats();
     for (const callback of this.statSubscribers) {
       callback(stats);
@@ -381,7 +376,7 @@ export class WorkerPoolManager {
     if (requestId != null) {
       const task = this.activeTaskById.get(requestId);
       if (isRenderTask(task)) {
-        this.detachInstanceFromRenderTask(task, instance);
+        (task.instances as Set<RenderTaskInstance>).delete(instance);
         if (!task.primeCache && task.instances.size === 0) {
           this.removeActiveTask(task);
         }
@@ -408,71 +403,64 @@ export class WorkerPoolManager {
       return;
     } else if (this.initialized === false) {
       const { lifecycleGeneration } = this;
-      const initialization = new Promise<void>((resolve, reject) => {
-        void (async () => {
-          try {
-            const themes = getThemes(this.renderOptions.theme);
-            const resolvedThemes = hasResolvedThemes(
-              themes,
-              this.preferredHighlighter
-            )
-              ? getResolvedThemes(themes, this.preferredHighlighter)
-              : await resolveThemes(themes, this.preferredHighlighter);
-            if (!this.isCurrentLifecycle(lifecycleGeneration)) {
-              resolve();
-              return;
-            }
-
-            let resolvedLanguages: ResolvedLanguage[] = [];
-            if (this.preferredHighlighter !== 'highlights') {
-              resolvedLanguages = hasResolvedLanguages(languages)
-                ? getResolvedLanguages(languages)
-                : await resolveLanguages(languages);
-            }
-            if (!this.isCurrentLifecycle(lifecycleGeneration)) {
-              resolve();
-              return;
-            }
-
-            await Promise.all([
-              this.loadSharedHighlighter(themes, ['text', ...languages]),
-              this.initializeWorkers(resolvedThemes, resolvedLanguages),
-            ]);
-
-            if (!this.isCurrentLifecycle(lifecycleGeneration)) {
-              this.terminateWorkers();
-              resolve();
-              return;
-            }
-            this.initialized = true;
-            this.diffCache.clear();
-            this.fileCache.clear();
-            this.drainQueue();
-            this.queueBroadcastStateChanges();
-            resolve();
-          } catch (e) {
-            if (
-              e instanceof WorkerPoolTerminatedError ||
-              !this.isCurrentLifecycle(lifecycleGeneration)
-            ) {
-              resolve();
-              return;
-            }
-            this.initialized = false;
-            this.workersFailed = true;
-            // A partial pool is not supported, so stop every worker before
-            // consumers rerender through the main-thread fallback.
-            this.cancelActiveWorkerTasks();
-            this.terminateWorkers();
-            this.activeTaskById.clear();
-            for (const task of this.queuedTasks) {
-              this.rejectRenderTaskCallbacks(task, normalizeWorkerError(e));
-            }
-            this.queueBroadcastStateChanges();
-            reject(e);
+      const initialization = (async () => {
+        try {
+          const themes = getThemes(this.renderOptions.theme);
+          const resolvedThemes = hasResolvedThemes(
+            themes,
+            this.preferredHighlighter
+          )
+            ? getResolvedThemes(themes, this.preferredHighlighter)
+            : await resolveThemes(themes, this.preferredHighlighter);
+          if (!this.isCurrentLifecycle(lifecycleGeneration)) {
+            return;
           }
-        })();
-      });
+
+          let resolvedLanguages: ResolvedLanguage[] = [];
+          if (this.preferredHighlighter !== 'highlights') {
+            resolvedLanguages = hasResolvedLanguages(languages)
+              ? getResolvedLanguages(languages)
+              : await resolveLanguages(languages);
+          }
+          if (!this.isCurrentLifecycle(lifecycleGeneration)) {
+            return;
+          }
+
+          await Promise.all([
+            this.loadSharedHighlighter(themes, ['text', ...languages]),
+            this.initializeWorkers(resolvedThemes, resolvedLanguages),
+          ]);
+
+          if (!this.isCurrentLifecycle(lifecycleGeneration)) {
+            this.terminateWorkers();
+            return;
+          }
+          this.initialized = true;
+          this.diffCache.clear();
+          this.fileCache.clear();
+          this.drainQueue();
+          this.queueBroadcastStateChanges();
+        } catch (e) {
+          if (
+            e instanceof WorkerPoolTerminatedError ||
+            !this.isCurrentLifecycle(lifecycleGeneration)
+          ) {
+            return;
+          }
+          this.initialized = false;
+          this.workersFailed = true;
+          // A partial pool is not supported, so stop every worker before
+          // consumers rerender through the main-thread fallback.
+          this.cancelActiveWorkerTasks();
+          this.terminateWorkers();
+          this.activeTaskById.clear();
+          for (const task of this.queuedTasks) {
+            this.rejectRenderTaskCallbacks(task, normalizeWorkerError(e));
+          }
+          this.queueBroadcastStateChanges();
+          throw e;
+        }
+      })();
       this.initialized = initialization;
       this.queueBroadcastStateChanges();
       // Return the startup promise so callers can await initialization and the
@@ -512,9 +500,7 @@ export class WorkerPoolManager {
     const customExtensionVersion = getCustomExtensionsVersion();
     const customExtensionMap =
       customExtensionVersion > 0 ? getCustomExtensionsMap() : undefined;
-    if (this.workers.length > 0) {
-      this.terminateWorkers();
-    }
+    this.terminateWorkers();
     for (let i = 0; i < (this.options.poolSize ?? 8); i++) {
       const worker = this.options.workerFactory();
       const managedWorker: ManagedWorker = {
@@ -567,9 +553,7 @@ export class WorkerPoolManager {
         })
       );
     }
-    const timeoutMs =
-      this.options.workerInitializationTimeout ??
-      DEFAULT_WORKER_INITIALIZATION_TIMEOUT;
+    const timeoutMs = this.options.workerInitializationTimeout ?? 10_000;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -585,20 +569,15 @@ export class WorkerPoolManager {
         }),
       ]);
     } finally {
-      if (timeoutId != null) {
-        clearTimeout(timeoutId);
-      }
+      clearTimeout(timeoutId);
     }
   }
 
-  /**
-   * Pass worker errors to onWorkerError, or log them if no callback is set.
-   *
-   * A startup error rejects initialization so components can highlight on the
-   * main thread. Other requests wait for their own responses: worker.ts catches
-   * request errors, so this event may be unrelated to the current request.
-   * A worker that stops responding remains busy and receives no further work.
-   */
+  // Pass worker errors to onWorkerError, or log them if no callback is set.
+  // A startup error rejects initialization so components can highlight on the
+  // main thread. Other requests wait for their own responses: worker.ts catches
+  // request errors, so this event may be unrelated to the current request.
+  // A worker that stops responding remains busy and receives no further work.
   private handleWorkerError(
     managedWorker: ManagedWorker,
     event: ErrorEvent | Event
@@ -621,7 +600,21 @@ export class WorkerPoolManager {
     if (task?.type !== 'initialize') {
       return;
     }
-    const error = errorFromWorkerErrorEvent(event);
+    // Script load failures can provide a plain Event without an error or
+    // message, so use a default message when no details are available.
+    const cause: unknown = 'error' in event ? event.error : undefined;
+    const message =
+      'message' in event &&
+      typeof event.message === 'string' &&
+      event.message !== ''
+        ? event.message
+        : cause instanceof Error
+          ? cause.message
+          : 'the worker script failed to load (the error event carries no message)';
+    const error = new WorkerPoolWorkerError(
+      `WorkerPoolManager: worker failed: ${message}`,
+      cause instanceof Error ? { cause } : undefined
+    );
     if (onWorkerError != null) {
       markWorkerErrorReported(error);
     }
@@ -644,13 +637,42 @@ export class WorkerPoolManager {
         i++;
         continue;
       }
-      const langs = getLangsFromTask(task);
-      const availableWorker = this.getAvailableWorker(langs);
+      const langSet = new Set<SupportedLanguages>();
+      if (task.type === 'file') {
+        const { lang, name } = task.request.file;
+        langSet.add(lang ?? getFiletypeFromFileName(name));
+      } else {
+        const { lang, name, prevName } = task.request.diff;
+        langSet.add(lang ?? getFiletypeFromFileName(name));
+        langSet.add(lang ?? getFiletypeFromFileName(prevName ?? '-'));
+      }
+      langSet.delete('text');
+      const langs = Array.from(langSet);
+      // Prefer an idle worker that already has every language.
+      let availableWorker: ManagedWorker | undefined;
+      for (const managedWorker of this.workers) {
+        if (
+          managedWorker.requestId != null ||
+          managedWorker.pendingSetupRequestId != null ||
+          !managedWorker.initialized
+        ) {
+          continue;
+        }
+        availableWorker = managedWorker;
+        if (langs.every((lang) => managedWorker.langs.has(lang))) {
+          break;
+        }
+      }
       if (availableWorker == null) {
         break;
       }
       this.queuedTasks.splice(i, 1);
-      this.assignWorkerToTask(task, availableWorker);
+      availableWorker.requestId = task.id;
+      this.clearQueuedInstanceRequests(task);
+      for (const instance of task.instances) {
+        this.activeRequestByInstance.set(instance, task.id);
+      }
+      this.activeTaskById.set(task.id, task);
       void this.resolveLanguagesAndExecuteTask(availableWorker, task, langs);
     }
     this.queueBroadcastStateChanges();
@@ -660,23 +682,23 @@ export class WorkerPoolManager {
     instance: FileRendererInstance,
     file: FileContents
   ): void {
-    const cachedResult = this.getFileResultCache(file);
     // If we've already highlighted the file or it's plain text, we should not
     // attempt to highlight. This should be mostly never hit, but it's just an
     // extra level of safety
-    if (
-      isFilePlainText(file) ||
-      (cachedResult != null &&
-        areFileRenderOptionsEqual(
-          cachedResult.options,
-          this.getFileRenderOptions()
-        ))
-    ) {
+    if (this.isFileHighlighted(file)) {
       return;
     }
-    if (!this.hasMatchingFileInstanceTask(instance, file)) {
-      this.submitTask(instance, { type: 'file', file });
+    for (const task of this.iterateRenderTasks()) {
+      if (
+        task.type === 'file' &&
+        this.isCurrentRenderTask(task) &&
+        task.instances.has(instance) &&
+        areFilesEqual(file, task.request.file)
+      ) {
+        return;
+      }
     }
+    this.submitTask({ type: 'file', file }, instance);
   }
 
   public primeFileHighlightCache(file: FileContents): Promise<void> {
@@ -687,43 +709,15 @@ export class WorkerPoolManager {
         )
       );
     }
-
-    const task = this.getOrCreateFileHighlightCacheTask(file);
-    return task != null
-      ? this.createRenderTaskCallbacks(task)
-      : Promise.resolve();
-  }
-
-  private getOrCreateFileHighlightCacheTask(
-    file: FileContents
-  ): RenderFileTask | undefined {
     if (file.cacheKey == null) {
       console.warn(
         `WorkerPoolManager.primeFileHighlightCache: priming highlight cache requires file.cacheKey; skipping "${file.name}".`
       );
-      return undefined;
+      return Promise.resolve();
     }
-    const cachedResult = this.getFileResultCache(file);
-    const highlightKey = this.getFileHighlightKey(file);
-    if (
-      highlightKey == null ||
-      isFilePlainText(file) ||
-      (cachedResult != null &&
-        areFileRenderOptionsEqual(
-          cachedResult.options,
-          this.getFileRenderOptions()
-        ))
-    ) {
-      return undefined;
-    }
-    const existingTask = this.getTaskByHighlightKey(highlightKey);
-    if (existingTask != null) {
-      existingTask.primeCache = true;
-      return existingTask.type === 'file' ? existingTask : undefined;
-    } else {
-      const task = this.submitCacheTask({ type: 'file', file }, highlightKey);
-      return task.type === 'file' ? task : undefined;
-    }
+    return this.isFileHighlighted(file)
+      ? Promise.resolve()
+      : this.primeHighlightCache({ type: 'file', file });
   }
 
   public getPlainFileAST(
@@ -751,23 +745,23 @@ export class WorkerPoolManager {
     instance: DiffRendererInstance,
     diff: FileDiffMetadata
   ): void {
-    const cachedResult = this.getDiffResultCache(diff);
     // If we've already highlighted the diff or it's plain text, we should not
     // attempt to highlight. This should be mostly never hit, but it's just an
     // extra level of safety
-    if (
-      isDiffPlainText(diff) ||
-      (cachedResult != null &&
-        areDiffRenderOptionsEqual(
-          cachedResult.options,
-          this.getDiffRenderOptions()
-        ))
-    ) {
+    if (this.isDiffHighlighted(diff)) {
       return;
     }
-    if (!this.hasMatchingDiffInstanceTask(instance, diff)) {
-      this.submitTask(instance, { type: 'diff', diff });
+    for (const task of this.iterateRenderTasks()) {
+      if (
+        task.type === 'diff' &&
+        this.isCurrentRenderTask(task) &&
+        task.instances.has(instance) &&
+        areDiffTargetsEqual(task.request.diff, diff)
+      ) {
+        return;
+      }
     }
+    this.submitTask({ type: 'diff', diff }, instance);
   }
 
   public primeDiffHighlightCache(diff: FileDiffMetadata): Promise<void> {
@@ -778,43 +772,15 @@ export class WorkerPoolManager {
         )
       );
     }
-
-    const task = this.getOrCreateDiffHighlightCacheTask(diff);
-    return task != null
-      ? this.createRenderTaskCallbacks(task)
-      : Promise.resolve();
-  }
-
-  private getOrCreateDiffHighlightCacheTask(
-    diff: FileDiffMetadata
-  ): RenderDiffTask | undefined {
     if (diff.cacheKey == null) {
       console.warn(
         `WorkerPoolManager.primeDiffHighlightCache: priming highlight cache requires diff.cacheKey; skipping "${diff.prevName ?? diff.name}" -> "${diff.name}".`
       );
-      return undefined;
+      return Promise.resolve();
     }
-    const cachedResult = this.getDiffResultCache(diff);
-    const highlightKey = this.getDiffHighlightKey(diff);
-    if (
-      highlightKey == null ||
-      isDiffPlainText(diff) ||
-      (cachedResult != null &&
-        areDiffRenderOptionsEqual(
-          cachedResult.options,
-          this.getDiffRenderOptions()
-        ))
-    ) {
-      return undefined;
-    }
-    const existingTask = this.getTaskByHighlightKey(highlightKey);
-    if (existingTask != null) {
-      existingTask.primeCache = true;
-      return existingTask.type === 'diff' ? existingTask : undefined;
-    } else {
-      const task = this.submitCacheTask({ type: 'diff', diff }, highlightKey);
-      return task.type === 'diff' ? task : undefined;
-    }
+    return this.isDiffHighlighted(diff)
+      ? Promise.resolve()
+      : this.primeHighlightCache({ type: 'diff', diff });
   }
 
   public getPlainDiffAST(
@@ -879,7 +845,7 @@ export class WorkerPoolManager {
     for (const task of this.activeTaskById.values()) {
       if ('reject' in task) {
         task.reject(error);
-      } else if (isRenderTask(task)) {
+      } else {
         this.rejectRenderTaskCallbacks(task, error);
       }
     }
@@ -894,15 +860,12 @@ export class WorkerPoolManager {
 
   public getStats(): WorkerStats {
     return {
-      managerState: (() => {
-        if (this.initialized === false) {
-          return 'waiting';
-        }
-        if (this.initialized !== true) {
-          return 'initializing';
-        }
-        return 'initialized';
-      })(),
+      managerState:
+        this.initialized === true
+          ? 'initialized'
+          : this.initialized === false
+            ? 'waiting'
+            : 'initializing',
       totalWorkers: this.workers.length,
       workersFailed: this.workersFailed,
       busyWorkers: this.workers.filter(
@@ -916,128 +879,100 @@ export class WorkerPoolManager {
     };
   }
 
-  private submitTask(
-    instance: FileRendererInstance,
-    request: Omit<RenderFileRequest, 'id'>
-  ): void;
-  private submitTask(
-    instance: DiffRendererInstance,
-    request: Omit<RenderDiffRequest, 'id'>
-  ): void;
-  private submitTask(
-    instance: FileRendererInstance | DiffRendererInstance,
-    request: SubmitRequest
-  ): void {
-    if (this.initialized === false) {
-      this.queueInitialization();
-    }
-
-    const highlightKey = this.getHighlightKeyForRequest(request);
-    const existingTask =
-      highlightKey != null
-        ? this.getTaskByHighlightKey(highlightKey)
-        : undefined;
-    if (existingTask != null) {
-      this.detachInstanceFromQueuedTasks(instance, existingTask);
-      this.addInstanceToTask(existingTask, instance);
-      this.queueBroadcastStateChanges();
-      return;
-    }
-
-    this.detachInstanceFromQueuedTasks(instance);
-    const id = this.generateRequestId();
-    const requestStart = Date.now();
-    const { renderOptionsVersion } = this;
-    const task: RenderTask = (() => {
-      switch (request.type) {
-        case 'file':
-          return {
-            type: 'file',
-            id,
-            request: { ...request, id },
-            instances: new Set([instance as FileRendererInstance]),
-            primeCache: false,
-            highlightKey,
-            callbacks: new Set(),
-            renderOptionsVersion,
-            requestStart,
-          };
-        case 'diff':
-          return {
-            type: 'diff',
-            id,
-            request: { ...request, id },
-            instances: new Set([instance as DiffRendererInstance]),
-            primeCache: false,
-            highlightKey,
-            callbacks: new Set(),
-            renderOptionsVersion,
-            requestStart,
-          };
-      }
-    })();
-    this.enqueueRenderTask(task, instance);
+  // Plain text needs no worker, and a cached result rendered with the current
+  // options can be reused.
+  private isFileHighlighted(file: FileContents): boolean {
+    const cachedResult = this.getFileResultCache(file);
+    return (
+      isFilePlainText(file) ||
+      (cachedResult != null &&
+        areFileRenderOptionsEqual(
+          cachedResult.options,
+          this.getFileRenderOptions()
+        ))
+    );
   }
 
-  private submitCacheTask(
+  private isDiffHighlighted(diff: FileDiffMetadata): boolean {
+    const cachedResult = this.getDiffResultCache(diff);
+    return (
+      isDiffPlainText(diff) ||
+      (cachedResult != null &&
+        areDiffRenderOptionsEqual(
+          cachedResult.options,
+          this.getDiffRenderOptions()
+        ))
+    );
+  }
+
+  private primeHighlightCache(request: SubmitRequest): Promise<void> {
+    const task = this.submitTask(request);
+    return new Promise((resolve, reject) => {
+      task.callbacks.add({ resolve, reject });
+    });
+  }
+
+  // Join the current task for the same target, or queue a new one. Tasks
+  // submitted without an instance only prime the cache.
+  private submitTask(
     request: SubmitRequest,
-    highlightKey: string
+    instance?: RenderTaskInstance
   ): RenderTask {
     if (this.initialized === false) {
       this.queueInitialization();
     }
-    const id = this.generateRequestId();
-    const requestStart = Date.now();
-    const { renderOptionsVersion } = this;
-    const task: RenderTask = (() => {
-      switch (request.type) {
-        case 'file':
-          return {
-            type: 'file',
-            id,
-            request: { ...request, id },
-            instances: new Set<FileRendererInstance>(),
-            primeCache: true,
-            highlightKey,
-            callbacks: new Set(),
-            renderOptionsVersion,
-            requestStart,
-          };
-        case 'diff':
-          return {
-            type: 'diff',
-            id,
-            request: { ...request, id },
-            instances: new Set<DiffRendererInstance>(),
-            primeCache: true,
-            highlightKey,
-            callbacks: new Set(),
-            renderOptionsVersion,
-            requestStart,
-          };
-      }
-    })();
-    this.enqueueRenderTask(task);
-    return task;
-  }
-
-  private enqueueRenderTask(
-    task: RenderTask,
-    instance?: RenderTaskInstance
-  ): void {
-    this.queuedTasks.push(task);
+    const { cacheKey } = request.type === 'file' ? request.file : request.diff;
+    const highlightKey =
+      cacheKey != null
+        ? `${request.type}:${cacheKey}:${this.renderOptionsVersion}`
+        : undefined;
+    let task =
+      highlightKey != null
+        ? this.taskByHighlightKey.get(highlightKey)
+        : undefined;
+    if (task != null && !this.isCurrentRenderTask(task)) {
+      task = undefined;
+    }
     if (instance != null) {
-      this.queuedTaskByInstance.set(instance, task);
+      this.detachInstanceFromQueuedTasks(instance, task);
     }
-    if (task.highlightKey != null) {
-      this.taskByHighlightKey.set(task.highlightKey, task);
+    if (task == null) {
+      const id = this.generateRequestId();
+      task = {
+        type: request.type,
+        id,
+        request: { ...request, id },
+        instances: new Set(),
+        primeCache: instance == null,
+        highlightKey,
+        callbacks: new Set(),
+        renderOptionsVersion: this.renderOptionsVersion,
+        requestStart: Date.now(),
+      } as RenderTask;
+      this.queuedTasks.push(task);
+      if (highlightKey != null) {
+        this.taskByHighlightKey.set(highlightKey, task);
+      }
+      this.queueDrain();
+    } else if (instance == null) {
+      task.primeCache = true;
+    } else {
+      this.queueBroadcastStateChanges();
     }
-    this.queueDrain();
+    if (instance != null) {
+      (task.instances as Set<RenderTaskInstance>).add(instance);
+      if (this.activeTaskById.has(task.id)) {
+        this.activeRequestByInstance.set(instance, task.id);
+      } else {
+        this.queuedTaskByInstance.set(instance, task);
+      }
+    }
+    return task;
   }
 
   private async resolveLanguagesAndExecuteTask(
     availableWorker: ManagedWorker,
-    task: RenderFileTask | RenderDiffTask,
+    task: RenderTask,
     langs: SupportedLanguages[]
   ): Promise<void> {
     try {
@@ -1062,13 +997,11 @@ export class WorkerPoolManager {
           : langs.filter((lang) => !availableWorker.langs.has(lang));
 
       if (workerMissingLangs.length > 0) {
-        if (hasResolvedLanguages(workerMissingLangs)) {
-          task.request.resolvedLanguages =
-            getResolvedLanguages(workerMissingLangs);
-        } else {
-          task.request.resolvedLanguages =
-            await resolveLanguages(workerMissingLangs);
-        }
+        task.request.resolvedLanguages = hasResolvedLanguages(
+          workerMissingLangs
+        )
+          ? getResolvedLanguages(workerMissingLangs)
+          : await resolveLanguages(workerMissingLangs);
       }
       // If the task has been cleaned up after awaiting language resolving,
       // lets fully clean it up
@@ -1076,9 +1009,7 @@ export class WorkerPoolManager {
         if (availableWorker.requestId === task.id) {
           this.cleanWorkerAndTask(availableWorker, task);
           this.queueBroadcastStateChanges();
-          if (this.queuedTasks.length > 0) {
-            this.queueDrain();
-          }
+          this.queueDrain();
         }
         return;
       }
@@ -1087,9 +1018,7 @@ export class WorkerPoolManager {
       this.rejectRenderTaskCallbacks(task, normalizeWorkerError(error));
       this.cleanWorkerAndTask(availableWorker, task);
       this.queueBroadcastStateChanges();
-      if (this.queuedTasks.length > 0) {
-        this.queueDrain();
-      }
+      this.queueDrain();
     }
   }
 
@@ -1098,136 +1027,120 @@ export class WorkerPoolManager {
     response: WorkerWireResponse
   ): void {
     const task = this.activeTaskById.get(response.id);
-    try {
-      if (task == null) {
-        // If we can't find a task for this response, it probably means the
-        // component has been unmounted, so we should silently ignore it
-        throw IGNORE_RESPONSE;
-      } else if (response.type === 'error') {
-        const error = new Error(response.error);
-        if (response.stack) {
-          error.stack = response.stack;
-        }
-        if ('reject' in task) {
-          task.reject(error);
-        } else if (isRenderTask(task)) {
-          this.notifyHighlightError(task, error);
-          this.rejectRenderTaskCallbacks(task, error);
+    // A missing task usually means its component unmounted, so the response
+    // is ignored.
+    if (task != null) {
+      try {
+        if (response.type === 'error') {
+          const error = new Error(response.error);
+          if (response.stack) {
+            error.stack = response.stack;
+          }
+          if ('reject' in task) {
+            task.reject(error);
+          } else {
+            this.notifyHighlightError(task, error);
+            this.rejectRenderTaskCallbacks(task, error);
+          }
+          console.error(error, task, response);
         } else {
-          throw new Error('handleWorkerMessage: unknown task type');
-        }
-        throw error;
-      } else {
-        // A failed request may not have attached its languages. Only remember
-        // them after success so later tasks resend grammars that were rejected.
-        if (isRenderTask(task)) {
-          for (const { name } of task.request.resolvedLanguages ?? []) {
-            managedWorker.langs.add(name);
+          // A failed request may not have attached its languages. Only remember
+          // them after success so later tasks resend grammars that were rejected.
+          if (isRenderTask(task)) {
+            for (const { name } of task.request.resolvedLanguages ?? []) {
+              managedWorker.langs.add(name);
+            }
           }
-        }
-        switch (response.requestType) {
-          case 'initialize':
-            if (task.type !== 'initialize') {
-              throw new Error('handleWorkerMessage: task/response dont match');
-            }
-            this.syncCustomExtensionVersion(managedWorker, task.request);
-            task.resolve();
-            break;
-          case 'set-render-options':
-            if (task.type !== 'set-render-options') {
-              throw new Error('handleWorkerMessage: task/response dont match');
-            }
-            task.resolve();
-            break;
-          case 'file': {
-            if (task.type !== 'file') {
-              throw new Error('handleWorkerMessage: task/response dont match');
-            }
-            const { options } = response;
+          if (task.type !== response.requestType) {
+            throw new Error('handleWorkerMessage: task/response dont match');
+          }
+          if (task.type === 'file') {
+            const { options, result } = response as
+              | RenderFileSuccessResponse
+              | EncodedFileSuccessResponse;
             if (
-              !this.isCurrentRenderTask(task) ||
-              !areFileRenderOptionsEqual(options, this.getFileRenderOptions())
+              this.isCurrentRenderTask(task) &&
+              areFileRenderOptionsEqual(options, this.getFileRenderOptions())
             ) {
-              throw IGNORE_RESPONSE;
+              const decoded: ThemedFileResult = {
+                ...result,
+                code: decodeHastLines(result.code),
+              };
+              this.syncCustomExtensionVersion(managedWorker, task.request);
+              if (task.cacheKeyAtDispatch != null) {
+                this.fileCache.set(task.cacheKeyAtDispatch, {
+                  result: decoded,
+                  options,
+                });
+              }
+              this.resolveRenderTaskCallbacks(task);
+              for (const instance of task.instances) {
+                if (this.activeRequestByInstance.get(instance) === task.id) {
+                  instance.onHighlightSuccess(
+                    task.request.file,
+                    decoded,
+                    options
+                  );
+                }
+              }
             }
-            const { request } = task;
-            const result: ThemedFileResult = {
-              ...response.result,
-              code: decodeHastLines(response.result.code),
-            };
-            this.syncCustomExtensionVersion(managedWorker, request);
-            if (task.cacheKeyAtDispatch != null) {
-              this.fileCache.set(task.cacheKeyAtDispatch, { result, options });
-            }
-            this.resolveRenderTaskCallbacks(task);
-            this.notifyFileInstances(task, result, options);
-            break;
-          }
-          case 'diff': {
-            if (task.type !== 'diff') {
-              throw new Error('handleWorkerMessage: task/response dont match');
-            }
-            const { options } = response;
+          } else if (task.type === 'diff') {
+            const { options, result } = response as
+              | RenderDiffSuccessResponse
+              | EncodedDiffSuccessResponse;
             if (
-              !this.isCurrentRenderTask(task) ||
-              !areDiffRenderOptionsEqual(options, this.getDiffRenderOptions())
+              this.isCurrentRenderTask(task) &&
+              areDiffRenderOptionsEqual(options, this.getDiffRenderOptions())
             ) {
-              throw IGNORE_RESPONSE;
+              const decoded: ThemedDiffResult = {
+                ...result,
+                code: {
+                  deletionLines: decodeHastLines(result.code.deletionLines),
+                  additionLines: decodeHastLines(result.code.additionLines),
+                },
+              };
+              this.syncCustomExtensionVersion(managedWorker, task.request);
+              if (task.cacheKeyAtDispatch != null) {
+                this.diffCache.set(task.cacheKeyAtDispatch, {
+                  result: decoded,
+                  options,
+                });
+              }
+              this.resolveRenderTaskCallbacks(task);
+              for (const instance of task.instances) {
+                if (this.activeRequestByInstance.get(instance) === task.id) {
+                  instance.onHighlightSuccess(
+                    task.request.diff,
+                    decoded,
+                    options
+                  );
+                }
+              }
             }
-            const { request } = task;
-            const result: ThemedDiffResult = {
-              ...response.result,
-              code: {
-                deletionLines: decodeHastLines(
-                  response.result.code.deletionLines
-                ),
-                additionLines: decodeHastLines(
-                  response.result.code.additionLines
-                ),
-              },
-            };
-            this.syncCustomExtensionVersion(managedWorker, request);
-            if (task.cacheKeyAtDispatch != null) {
-              this.diffCache.set(task.cacheKeyAtDispatch, { result, options });
+          } else {
+            if (task.type === 'initialize') {
+              this.syncCustomExtensionVersion(managedWorker, task.request);
             }
-            this.resolveRenderTaskCallbacks(task);
-            this.notifyDiffInstances(task, result, options);
-            break;
+            task.resolve();
           }
         }
-      }
-    } catch (error) {
-      if (error !== IGNORE_RESPONSE) {
+      } catch (error) {
         console.error(error, task, response);
       }
     }
 
     this.cleanWorkerAndTask(managedWorker, task, response.id);
     this.queueBroadcastStateChanges();
-    if (this.queuedTasks.length > 0) {
-      // We queue drain so that potentially multiple workers can free up
-      // allowing for better language matches if possible
-      this.queueDrain();
-    }
+    // We queue drain so that potentially multiple workers can free up
+    // allowing for better language matches if possible
+    this.queueDrain();
   }
 
   private _queuedDrain: Promise<void> | undefined;
   private queueDrain() {
-    if (this._queuedDrain != null) return;
+    if (this._queuedDrain != null || this.queuedTasks.length === 0) return;
     this._queuedDrain = Promise.resolve().then(this.drainQueue);
     this.queueBroadcastStateChanges();
-  }
-
-  private assignWorkerToTask(
-    task: AllWorkerTasks,
-    managedWorker: ManagedWorker
-  ) {
-    managedWorker.requestId = task.id;
-    if (isRenderTask(task)) {
-      this.clearQueuedInstanceRequests(task);
-      this.trackInstanceRequests(task);
-    }
-    this.activeTaskById.set(task.id, task);
   }
 
   private cleanWorkerAndTask(
@@ -1241,25 +1154,24 @@ export class WorkerPoolManager {
     if (managedWorker.pendingSetupRequestId === requestId) {
       managedWorker.pendingSetupRequestId = undefined;
     }
-    if (task != null) {
-      if (isRenderTask(task)) {
-        this.rejectRenderTaskCallbacks(task, new WorkerPoolTaskCanceledError());
-        this.clearInstanceRequests(task);
-        this.clearHighlightKey(task);
-      }
+    if (isRenderTask(task)) {
+      this.removeActiveTask(task);
+    } else if (task != null) {
       this.activeTaskById.delete(task.id);
     }
   }
 
   private executeTask(
     managedWorker: ManagedWorker,
-    task: AllWorkerTasks
+    task: InitializeWorkerTask | RenderTask
   ): void {
-    if (shouldSyncCustomExtensions(task.request)) {
-      this.maybeAttachCustomExtensions(managedWorker, task.request);
-    }
-    if (!this.activeTaskById.has(task.id)) {
-      this.assignWorkerToTask(task, managedWorker);
+    const { request } = task;
+    if (request.customExtensionsVersion == null) {
+      const version = getCustomExtensionsVersion();
+      if (managedWorker.customExtensionsVersion < version) {
+        request.customExtensionsVersion = version;
+        request.customExtensionMap = getCustomExtensionsMap();
+      }
     }
     try {
       // postMessage clones the request now, so keep the matching cache key on
@@ -1269,126 +1181,37 @@ export class WorkerPoolManager {
       } else if (task.type === 'diff') {
         task.cacheKeyAtDispatch = task.request.diff.cacheKey;
       }
-      managedWorker.worker.postMessage(task.request);
+      managedWorker.worker.postMessage(request);
     } catch (error) {
       console.error('Failed to post message to worker:', error);
       if (isRenderTask(task)) {
         this.notifyHighlightError(task, error);
         this.rejectRenderTaskCallbacks(task, normalizeWorkerError(error));
-      } else if ('reject' in task) {
+      } else {
         task.reject(error as Error);
       }
       this.cleanWorkerAndTask(managedWorker, task);
-      if (this.queuedTasks.length > 0) {
-        this.queueDrain();
-      }
+      this.queueDrain();
     }
     this.queueBroadcastStateChanges();
-  }
-
-  private maybeAttachCustomExtensions(
-    managedWorker: ManagedWorker,
-    request: InitializeWorkerRequest | RenderFileRequest | RenderDiffRequest
-  ): void {
-    if (request.customExtensionsVersion != null) {
-      return;
-    }
-    const version = getCustomExtensionsVersion();
-    if (managedWorker.customExtensionsVersion >= version) {
-      return;
-    }
-    request.customExtensionsVersion = version;
-    request.customExtensionMap = getCustomExtensionsMap();
   }
 
   private syncCustomExtensionVersion(
     managedWorker: ManagedWorker,
     request: InitializeWorkerRequest | RenderFileRequest | RenderDiffRequest
   ): void {
-    if (request.customExtensionsVersion == null) {
-      return;
-    }
-    managedWorker.customExtensionsVersion = request.customExtensionsVersion;
-  }
-
-  private getAvailableWorker(
-    langs: SupportedLanguages[]
-  ): ManagedWorker | undefined {
-    let worker: ManagedWorker | undefined;
-    for (const managedWorker of this.workers) {
-      if (
-        managedWorker.requestId != null ||
-        managedWorker.pendingSetupRequestId != null ||
-        !managedWorker.initialized
-      ) {
-        continue;
-      }
-      worker = managedWorker;
-      if (langs.length === 0) {
-        break;
-      }
-      let hasEveryLang = true;
-      for (const lang of langs) {
-        if (!managedWorker.langs.has(lang)) {
-          hasEveryLang = false;
-          break;
-        }
-      }
-      if (hasEveryLang) {
-        break;
-      }
-    }
-    return worker;
-  }
-
-  private getFileHighlightKey(file: FileContents): string | undefined {
-    if (file.cacheKey == null) {
-      return undefined;
-    }
-    return `file:${file.cacheKey}:${this.renderOptionsVersion}`;
-  }
-
-  private getDiffHighlightKey(diff: FileDiffMetadata): string | undefined {
-    if (diff.cacheKey == null) {
-      return undefined;
-    }
-    return `diff:${diff.cacheKey}:${this.renderOptionsVersion}`;
-  }
-
-  private getHighlightKeyForRequest(
-    request: SubmitRequest
-  ): string | undefined {
-    switch (request.type) {
-      case 'file':
-        return this.getFileHighlightKey(request.file);
-      case 'diff':
-        return this.getDiffHighlightKey(request.diff);
+    if (request.customExtensionsVersion != null) {
+      managedWorker.customExtensionsVersion = request.customExtensionsVersion;
     }
   }
 
   private hasActiveRequest(task: RenderTask): boolean {
-    for (const instance of getInstances(task)) {
+    for (const instance of task.instances) {
       if (this.activeRequestByInstance.has(instance)) {
         return true;
       }
     }
     return false;
-  }
-
-  private addInstanceToTask(
-    task: RenderTask,
-    instance: FileRendererInstance | DiffRendererInstance
-  ): void {
-    if (task.type === 'file') {
-      task.instances.add(instance as FileRendererInstance);
-    } else {
-      task.instances.add(instance as DiffRendererInstance);
-    }
-    if (this.activeTaskById.has(task.id)) {
-      this.activeRequestByInstance.set(instance, task.id);
-    } else {
-      this.queuedTaskByInstance.set(instance, task);
-    }
   }
 
   private detachInstanceFromQueuedTasks(
@@ -1400,20 +1223,9 @@ export class WorkerPoolManager {
       return;
     }
     this.queuedTaskByInstance.delete(instance);
-    this.detachInstanceFromRenderTask(task, instance);
+    (task.instances as Set<RenderTaskInstance>).delete(instance);
     if (!task.primeCache && task.instances.size === 0) {
       this.removeQueuedTask(task);
-    }
-  }
-
-  private detachInstanceFromRenderTask(
-    task: RenderTask,
-    instance: RenderTaskInstance
-  ): void {
-    if (task.type === 'file') {
-      task.instances.delete(instance as FileRendererInstance);
-    } else {
-      task.instances.delete(instance as DiffRendererInstance);
     }
   }
 
@@ -1429,15 +1241,13 @@ export class WorkerPoolManager {
 
   private removeActiveTask(task: RenderTask): void {
     this.rejectRenderTaskCallbacks(task, new WorkerPoolTaskCanceledError());
-    this.clearInstanceRequests(task);
+    for (const instance of task.instances) {
+      if (this.activeRequestByInstance.get(instance) === task.id) {
+        this.activeRequestByInstance.delete(instance);
+      }
+    }
     this.clearHighlightKey(task);
     this.activeTaskById.delete(task.id);
-  }
-
-  private createRenderTaskCallbacks(task: RenderTask): Promise<void> {
-    return new Promise((resolve, reject) => {
-      task.callbacks.add({ resolve, reject });
-    });
   }
 
   private resolveRenderTaskCallbacks(task: RenderTask): void {
@@ -1454,26 +1264,8 @@ export class WorkerPoolManager {
     task.callbacks.clear();
   }
 
-  private invalidateRenderTasks(): void {
-    for (let index = this.queuedTasks.length - 1; index >= 0; index--) {
-      const task = this.queuedTasks[index];
-      if (task.renderOptionsVersion !== this.renderOptionsVersion) {
-        this.removeQueuedTask(task);
-      }
-    }
-
-    for (const task of Array.from(this.activeTaskById.values())) {
-      if (
-        isRenderTask(task) &&
-        task.renderOptionsVersion !== this.renderOptionsVersion
-      ) {
-        this.removeActiveTask(task);
-      }
-    }
-  }
-
   private clearQueuedInstanceRequests(task: RenderTask): void {
-    for (const instance of getInstances(task)) {
+    for (const instance of task.instances) {
       if (this.queuedTaskByInstance.get(instance) === task) {
         this.queuedTaskByInstance.delete(instance);
       }
@@ -1489,89 +1281,12 @@ export class WorkerPoolManager {
     }
   }
 
-  private trackInstanceRequests(task: RenderTask): void {
-    for (const instance of getInstances(task)) {
-      this.activeRequestByInstance.set(instance, task.id);
-    }
-  }
-
-  private clearInstanceRequests(task: RenderTask): void {
-    for (const instance of getInstances(task)) {
-      if (this.activeRequestByInstance.get(instance) === task.id) {
-        this.activeRequestByInstance.delete(instance);
-      }
-    }
-  }
-
-  private notifyFileInstances(
-    task: RenderFileTask,
-    result: ThemedFileResult,
-    options: RenderFileOptions
-  ): void {
-    for (const instance of task.instances) {
-      if (this.activeRequestByInstance.get(instance) === task.id) {
-        instance.onHighlightSuccess(task.request.file, result, options);
-      }
-    }
-  }
-
-  private notifyDiffInstances(
-    task: RenderDiffTask,
-    result: ThemedDiffResult,
-    options: RenderDiffOptions
-  ): void {
-    for (const instance of task.instances) {
-      if (this.activeRequestByInstance.get(instance) === task.id) {
-        instance.onHighlightSuccess(task.request.diff, result, options);
-      }
-    }
-  }
-
   private notifyHighlightError(task: RenderTask, error: unknown): void {
-    for (const instance of getInstances(task)) {
+    for (const instance of task.instances) {
       if (this.activeRequestByInstance.get(instance) === task.id) {
         instance.onHighlightError(error);
       }
     }
-  }
-
-  private hasMatchingFileInstanceTask(
-    instance: FileRendererInstance,
-    file: FileContents
-  ): boolean {
-    for (const task of this.iterateRenderTasks()) {
-      if (
-        task.type === 'file' &&
-        this.isCurrentRenderTask(task) &&
-        task.instances.has(instance) &&
-        areFilesEqual(file, task.request.file)
-      ) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private hasMatchingDiffInstanceTask(
-    instance: DiffRendererInstance,
-    diff: FileDiffMetadata
-  ): boolean {
-    for (const task of this.iterateRenderTasks()) {
-      if (
-        task.type === 'diff' &&
-        this.isCurrentRenderTask(task) &&
-        task.instances.has(instance) &&
-        areDiffTargetsEqual(task.request.diff, diff)
-      ) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private getTaskByHighlightKey(highlightKey: string): RenderTask | undefined {
-    const task = this.taskByHighlightKey.get(highlightKey);
-    return task != null && this.isCurrentRenderTask(task) ? task : undefined;
   }
 
   private isCurrentRenderTask(task: RenderTask): boolean {
@@ -1594,53 +1309,8 @@ export class WorkerPoolManager {
   }
 }
 
-function shouldSyncCustomExtensions(
-  request: AllWorkerTasks['request']
-): request is InitializeWorkerRequest | RenderFileRequest | RenderDiffRequest {
-  return (
-    request.type === 'initialize' ||
-    request.type === 'file' ||
-    request.type === 'diff'
-  );
-}
-
-function getLangsFromTask(task: AllWorkerTasks): SupportedLanguages[] {
-  const langs = new Set<SupportedLanguages>();
-  if (task.type === 'initialize' || task.type === 'set-render-options') {
-    return [];
-  }
-  switch (task.type) {
-    case 'file': {
-      langs.add(
-        task.request.file.lang ??
-          getFiletypeFromFileName(task.request.file.name)
-      );
-      break;
-    }
-    case 'diff': {
-      langs.add(
-        task.request.diff.lang ??
-          getFiletypeFromFileName(task.request.diff.name)
-      );
-      langs.add(
-        task.request.diff.lang ??
-          getFiletypeFromFileName(task.request.diff.prevName ?? '-')
-      );
-      break;
-    }
-  }
-  langs.delete('text');
-  return Array.from(langs);
-}
-
 function isRenderTask(task: AllWorkerTasks | undefined): task is RenderTask {
   return task?.type === 'file' || task?.type === 'diff';
-}
-
-function getInstances(
-  task: RenderTask
-): Set<FileRendererInstance | DiffRendererInstance> {
-  return task.instances;
 }
 
 function normalizeWorkerError(error: unknown): Error {
@@ -1656,25 +1326,4 @@ function normalizeWorkerError(error: unknown): Error {
     }
   }
   return new Error(String(error));
-}
-
-// Convert a worker error event into a startup error, preserving its cause.
-// Script load failures can provide a plain Event without an error or message,
-// so use a default message when no details are available.
-function errorFromWorkerErrorEvent(
-  event: ErrorEvent | Event
-): WorkerPoolWorkerError {
-  const cause: unknown = 'error' in event ? event.error : undefined;
-  const message =
-    'message' in event &&
-    typeof event.message === 'string' &&
-    event.message !== ''
-      ? event.message
-      : cause instanceof Error
-        ? cause.message
-        : 'the worker script failed to load (the error event carries no message)';
-  return new WorkerPoolWorkerError(
-    `WorkerPoolManager: worker failed: ${message}`,
-    cause instanceof Error ? { cause } : undefined
-  );
 }

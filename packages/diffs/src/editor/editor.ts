@@ -70,11 +70,7 @@ import {
   type SearchPanelMode,
   SearchPanelWidget,
 } from './searchPanel';
-import type {
-  AutoSurround,
-  CursorMoveOptions,
-  ResolveRenderableLine,
-} from './selection';
+import type { AutoSurround, CursorMoveOptions } from './selection';
 import {
   applyDeleteCharacterToSelections,
   applyDeleteHardLineForwardToSelections,
@@ -123,7 +119,6 @@ import { createSpriteElement } from './sprite';
 import { TextDocument, type TextDocumentChange } from './textDocument';
 import { getTextDocumentChangeTransaction } from './textDocumentChangeTransaction';
 import {
-  getExpandedAsciiTextColumns,
   getUnicodeMeasurementOffsets,
   Metrics,
   snapTextOffsetToUnicodeBoundary,
@@ -149,7 +144,6 @@ import type {
 import {
   addEventListener,
   clampDomOffset,
-  extend,
   getLineNumberAttr,
   h,
   lookupScrollContainer,
@@ -168,47 +162,6 @@ export type {
 type ShadowRootWithSelection = ShadowRoot & {
   getSelection?: () => Selection | null;
 };
-
-// Fallback for browsers without Selection.getComposedRanges: read the first
-// range from the shadow root's own selection so the editor can still map a
-// caret placed by a click inside its shadow tree. Normalized to a StaticRange
-// so it matches the getComposedRanges return shape the callers expect. Returns
-// undefined when the API or a live range is unavailable.
-function getShadowRootRange(shadowRoot: ShadowRoot): StaticRange | undefined {
-  const selection = (shadowRoot as ShadowRootWithSelection).getSelection?.();
-  if (selection == null || selection.rangeCount === 0) {
-    return undefined;
-  }
-  const range = selection.getRangeAt(0);
-  return {
-    collapsed: range.collapsed,
-    startContainer: range.startContainer,
-    startOffset: range.startOffset,
-    endContainer: range.endContainer,
-    endOffset: range.endOffset,
-  };
-}
-
-/** Describe replacing the complete document from its previous text. */
-function createFullDocumentChange(
-  previousContents: string,
-  contents: string
-): EditorChange {
-  const lineOffsets = computeLineOffsets(previousContents);
-  const lastLineOffset = lineOffsets[lineOffsets.length - 1] ?? 0;
-  return {
-    start: 0,
-    end: previousContents.length,
-    text: contents,
-    range: {
-      start: { line: 0, character: 0 },
-      end: {
-        line: lineOffsets.length - 1,
-        character: previousContents.length - lastLineOffset,
-      },
-    },
-  };
-}
 
 interface EditorAttachState {
   generation: number;
@@ -565,7 +518,6 @@ export class Editor<
   // handlers prefer this. Empty for a direct content drag (no gutter range).
   #deletedSelectionText = '';
   #reservedSelections?: EditorSelection[];
-  #initSelections?: EditorSelection[];
   #selections?: EditorSelection[];
   #matches?: MatchRange[];
   #scrollingToLine?: number;
@@ -680,7 +632,7 @@ export class Editor<
       this.#renderCarets();
     }
     if (previousEditPrediction !== this.#options.editPrediction) {
-      this.#cancelEditPrediction(true);
+      this.#cancelEditPrediction();
       this.#editPredictionHistory = [];
       this.#scheduleEditPrediction();
     }
@@ -698,12 +650,11 @@ export class Editor<
   }
 
   setCarets(carets: EditorCaret<Caret>[]): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (textDocument === undefined) return;
+    // #renderCarets below removes the highlight elements.
     this.#caretElements?.forEach((element) => element.remove());
     this.#caretElements = undefined;
-    this.#caretHighlightElements?.forEach((element) => element.remove());
-    this.#caretHighlightElements = undefined;
     this.#carets =
       carets.length === 0
         ? undefined
@@ -754,13 +705,25 @@ export class Editor<
     const initialState = this.#initialState;
     const initialEditorState = initialState?.editor;
     const editStateKey = this.#editStateKey;
-    const editSession = getEditSession({
-      type: this.type,
-      editStateKey,
-      owner: this,
-      initialState,
-      previousSession,
-    });
+    if (initialState != null && initialState.type !== this.type) {
+      throw new TypeError(
+        `Editor: initialState: a ${initialState.type} state cannot initialize a ${this.type} editor`
+      );
+    }
+    const initialSession = initialState as
+      | ManagedEditSession<EType, LAnnotation>
+      | undefined;
+    const editSession =
+      editStateKey != null
+        ? EditStateManager.activate(
+            this.type,
+            editStateKey,
+            this,
+            initialSession
+          )
+        : (initialSession ??
+          previousSession ??
+          ({ type: this.type } as ManagedEditSession<EType, LAnnotation>));
     const previousDiffSession = editSession.diffSession;
     this.#initialState = undefined;
     this.#editSession = editSession;
@@ -830,17 +793,11 @@ export class Editor<
       if (editSession.type === 'file-diff' && editSession.diffSession == null) {
         editSession.diffSession = previousDiffSession;
       }
+      this.#editSession = previousSession;
       // If we haven't ever attached, and failed to edit, release any edit
       // state lock
-      if (this.#detach == null && editStateKey != null) {
-        if (editor.type === 'file') {
-          EditStateManager.releaseFile(editStateKey, editor);
-        } else {
-          EditStateManager.releaseFileDiff(editStateKey, editor);
-        }
-      }
-      this.#editSession = previousSession;
       if (this.#detach == null) {
+        this.#releaseEditSession();
         this.#fileInstance = undefined;
         this.#applyDocumentChange = undefined;
         this.#applySuspendedDocumentChange = undefined;
@@ -868,7 +825,7 @@ export class Editor<
    * are remapped during replay and the text edit still joins the undo timeline.
    */
   applyEdits(edits: TextEdit[], updateHistory = true): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (textDocument == null) {
       throw new Error('Editor.applyEdits: Editor is not attached');
     }
@@ -1024,7 +981,7 @@ export class Editor<
     if (
       !this.#isRendering ||
       this.#fileInstance === undefined ||
-      this.#editSession?.document === undefined
+      this.#document === undefined
     ) {
       throw new Error('Editor.setViewState: Editor is not attached');
     }
@@ -1050,7 +1007,7 @@ export class Editor<
   setSelections(
     selections: (Range & { direction: 'none' | 'backward' | 'forward' })[]
   ): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (textDocument === undefined) {
       throw new Error('Editor.setSelections: Text document is not initialized');
     }
@@ -1085,7 +1042,7 @@ export class Editor<
   }
 
   setMarkers(markers: Marker[]): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (textDocument === undefined) {
       throw new Error('Editor.setMarkers: Text document is not initialized');
     }
@@ -1118,7 +1075,7 @@ export class Editor<
     const preventScroll = options?.preventScroll ?? false;
     const lineNumber = options?.lineNumber;
     if (lineNumber === 'first-visible' || typeof lineNumber === 'number') {
-      const textDocument = this.#editSession?.document;
+      const textDocument = this.#document;
       if (
         textDocument == null ||
         !this.#isRendering ||
@@ -1138,19 +1095,25 @@ export class Editor<
         character:
           lineNumber === 'first-visible' ? 0 : (options?.character ?? 0),
       });
-      this.#focusAtPosition(position, preventScroll);
+      this.#canMountSelectionAction = false;
+      this.#updateSelections([
+        { start: position, end: position, direction: DirectionNone },
+      ]);
+      this.#revealLineIfCollapsed(position.line);
+      if (preventScroll) {
+        this.#focus(position, true);
+      } else {
+        this.#scrollToPrimaryCaret();
+      }
       return;
     }
     const primarySelection = this.#selections?.at(-1);
-    if (primarySelection !== undefined) {
-      const pos =
-        primarySelection.direction === DirectionBackward
-          ? primarySelection.end
-          : primarySelection.start;
-      this.#focus(pos, preventScroll);
-    } else {
-      this.#focus(undefined, preventScroll);
-    }
+    this.#focus(
+      primarySelection === undefined
+        ? undefined
+        : getAnchorPosition(primarySelection),
+      preventScroll
+    );
   }
 
   blur(): void {
@@ -1173,7 +1136,7 @@ export class Editor<
   cleanUp(reason: 'discard' | 'recycle' | 'complete' = 'discard'): void {
     const fileInstance = this.#fileInstance;
     const recycle = reason === 'recycle';
-    this.#cancelEditPrediction(true, false);
+    this.#cancelEditPrediction(false);
     if (!recycle) {
       this.#editPredictionHistory = [];
     }
@@ -1206,13 +1169,9 @@ export class Editor<
       this.#detach = undefined;
     }
 
-    // cache
-    this.#gutterWidthCache = undefined;
-    this.#contentWidthCache = undefined;
-    this.#lineYCache.clear();
+    // cache (#resetState below drops the width caches)
+    this.#resetCache();
     this.#wrapLineOffsetsCache.clear();
-    this.#lineElementsCache.clear();
-    this.#lastAccessedCharX = undefined;
 
     // clean up dom elements
     this.#globalStyleElement?.remove();
@@ -1344,7 +1303,6 @@ export class Editor<
     if (
       contentElement != null &&
       (this.#contentHasFocus ||
-        shadowActiveElement === contentElement ||
         (shadowActiveElement != null &&
           contentElement.contains(shadowActiveElement)))
     ) {
@@ -1355,7 +1313,7 @@ export class Editor<
   /** @internal */
   __getDocumentContents(fallbackFile?: FileContents): FileContents | undefined {
     const fileInfo = this.#editSession?.fileInfo;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (textDocument == null) {
       return fileInfo == null || fallbackFile == null
         ? undefined
@@ -1497,12 +1455,29 @@ export class Editor<
         editSession.fileInfo != null &&
         (editSession.fileInfo.name !== fileOrDiff.name ||
           previousTextDocument.languageId !== languageId));
-    const documentChanges =
-      externalDocument &&
-      previousTextDocument !== undefined &&
-      previousTextDocument.getText() !== contents
-        ? [createFullDocumentChange(previousTextDocument.getText(), contents)]
-        : undefined;
+    // An external replacement is reported as one change over the whole
+    // previous document.
+    let documentChanges: EditorChange[] | undefined;
+    const previousContents = externalDocument
+      ? previousTextDocument?.getText()
+      : undefined;
+    if (previousContents !== undefined && previousContents !== contents) {
+      const lineOffsets = computeLineOffsets(previousContents);
+      documentChanges = [
+        {
+          start: 0,
+          end: previousContents.length,
+          text: contents,
+          range: {
+            start: { line: 0, character: 0 },
+            end: {
+              line: lineOffsets.length - 1,
+              character: previousContents.length - (lineOffsets.at(-1) ?? 0),
+            },
+          },
+        },
+      ];
+    }
 
     const resetForExternalDocument = externalDocument && resetHistory;
     const shouldRebuildDocument =
@@ -1513,7 +1488,7 @@ export class Editor<
           editSession.document.languageId !== languageId)) ||
       resetForExternalDocument;
     if (shouldRebuildDocument) {
-      this.#cancelEditPrediction(true);
+      this.#cancelEditPrediction();
       this.#editPredictionHistory = [];
       this.#invalidateOnAttach();
       const { name, lang } = fileOrDiff;
@@ -1548,7 +1523,6 @@ export class Editor<
       // Wrap offsets survive #resetCache, so a document swap on a reused
       // content element must drop the previous document's measurements here.
       this.#wrapLineOffsetsCache.clear();
-      this.#selections = this.#initSelections;
       if (this.#options.__debug === true) {
         console.log(
           '[diffs/editor] text document initialized from',
@@ -1583,10 +1557,20 @@ export class Editor<
       this.#tokenizer = new EditorTokenizer({
         highlighter,
         textDocument,
-        codeOptions: this.#fileInstance?.__getEffectiveCodeOptions() ?? {},
+        codeOptions: fileInstance.__getEffectiveCodeOptions() ?? {},
         matchBrackets: this.#options.matchBrackets,
         onDeferTokenize: this.#onDeferTokenize,
-        onThemeChange: () => this.#scheduleThemeSelectionRefresh(),
+        // Re-render the selection overlay after a theme swap so rounded corner
+        // masks recompute their `--diffs-selection-corner-bg`, which captures
+        // the line background when drawn. Deferred to the next frame because a
+        // host theme change fires this mid-sync, and the sync re-renders the
+        // overlay itself; the delay avoids re-entrancy.
+        onThemeChange: () => {
+          this.#themeSelectionRefreshFrame ??= requestAnimationFrame(() => {
+            this.#themeSelectionRefreshFrame = undefined;
+            this.#refreshOverlays();
+          });
+        },
         setStyle: (css) => {
           this.#themeStyleElement!.textContent = css;
         },
@@ -1596,7 +1580,7 @@ export class Editor<
 
     if (this.#contentElement !== contentEl) {
       this.#gutterElement = gutterEl;
-      this.#contentElement = extend(contentEl, {
+      this.#contentElement = Object.assign(contentEl, {
         contentEditable: 'true',
         role: 'textbox',
         ariaMultiLine: 'true',
@@ -1612,10 +1596,7 @@ export class Editor<
       this.#metrics.init(contentEl);
       this.#remeasureMetricsOnFontLoad();
       this.#listenContentElement(contentEl, gutterEl);
-      if (
-        this.#contentElement !== undefined &&
-        this.#options.__debug === true
-      ) {
+      if (this.#options.__debug === true) {
         console.log('[diffs/editor] full re-render triggered !!!');
       }
     }
@@ -1640,7 +1621,7 @@ export class Editor<
       (lineAnnotations !== undefined && lineAnnotations.length > 0) ||
       this.#isDiff
     ) {
-      for (const child of this.#contentElement.children) {
+      for (const child of contentEl.children) {
         const el = child as HTMLElement;
         const { lineAnnotation, lineType, separator } = el.dataset;
         if (
@@ -1659,9 +1640,7 @@ export class Editor<
     // re-renders, so a host-driven theme swap (theme picker, light/dark toggle)
     // wouldn't otherwise reach it. Re-apply the surface's current theme on every
     // sync so the editor's line-highlight/token colors track the active theme.
-    this.#tokenizer?.syncTheme(
-      this.#fileInstance?.__getEffectiveCodeOptions() ?? {}
-    );
+    this.#tokenizer?.syncTheme(fileInstance.__getEffectiveCodeOptions() ?? {});
 
     this.#lineAnnotations = lineAnnotations;
     this.#renderRange = renderRange;
@@ -1676,27 +1655,13 @@ export class Editor<
 
     try {
       this.#markerRenderer?.removePopover();
-
-      // re-render the existing selections, matches, and markers
-      if (
-        this.#selections !== undefined ||
-        this.#matches !== undefined ||
-        this.#markerRenderer !== undefined
-      ) {
-        this.#updateSelections(this.#selections ?? []);
-      }
+      this.#refreshOverlays();
       this.#renderCarets();
       if (this.#retryEditPredictionOnRender) {
         this.#scheduleEditPrediction();
       }
 
-      if (
-        this.#initSelections !== undefined &&
-        this.#primaryCaretElement !== undefined
-      ) {
-        this.#initSelections = undefined;
-        this.#scrollToPrimaryCaret(false, 'center');
-      } else if (this.#scrollingToLine !== undefined) {
+      if (this.#scrollingToLine !== undefined) {
         this.#scrollToLine(
           this.#scrollingToLine,
           this.#scrollingToLineChar,
@@ -1821,6 +1786,10 @@ export class Editor<
     }
   }
 
+  get #document(): TextDocument<EType, LAnnotation> | undefined {
+    return this.#editSession?.document;
+  }
+
   get #fileDiffInstance(): FileDiff<LAnnotation, Caret> | undefined {
     return this.#fileInstance?.type === 'file-diff'
       ? this.#fileInstance
@@ -1841,23 +1810,6 @@ export class Editor<
   // line as renderable.
   #isLineRenderable(line: number): boolean {
     return this.#fileDiffInstance?.isLineRenderable?.(line + 1) ?? true;
-  }
-
-  // Fold-skip resolver for vertical caret motion (zero-based lines), or
-  // undefined for hosts without collapsible regions so motion stays plain
-  // line arithmetic.
-  get #resolveRenderableLine(): ResolveRenderableLine | undefined {
-    const fileInstance = this.#fileDiffInstance;
-    if (fileInstance == null) {
-      return undefined;
-    }
-    return (line, direction) => {
-      const nearest = fileInstance.getNearestRenderableLine(
-        line + 1,
-        direction
-      );
-      return nearest == null ? undefined : nearest - 1;
-    };
   }
 
   // Jump targets (search matches, undo restores, setSelections, doc-end
@@ -1899,6 +1851,17 @@ export class Editor<
     this.#lineYCache.clear();
     this.#lineElementsCache.clear();
     this.#lastAccessedCharX = undefined;
+  }
+
+  // Repaint selections, search matches, and markers after geometry changes.
+  #refreshOverlays(): void {
+    if (
+      this.#selections !== undefined ||
+      this.#matches !== undefined ||
+      this.#markerRenderer !== undefined
+    ) {
+      this.#updateSelections(this.#selections ?? []);
+    }
   }
 
   #resetState(preserveCarets = false): void {
@@ -1943,7 +1906,7 @@ export class Editor<
     fileInstance: EditorComponent<EType, LAnnotation, Caret>
   ): void {
     const attachState = this.#attachState;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (
       attachState.delivered ||
       attachState.callback != null ||
@@ -1960,7 +1923,7 @@ export class Editor<
       if (
         generation !== attachState.generation ||
         this.#fileInstance !== fileInstance ||
-        this.#editSession?.document !== textDocument
+        this.#document !== textDocument
       ) {
         return;
       }
@@ -1982,29 +1945,12 @@ export class Editor<
     queueRender(callback);
   }
 
-  // Get the editor's scrolling viewport, return undefined if the Virtualizer
-  // is not present.`
-  #getScrollViewport(): HTMLElement | Document | undefined {
-    const viewport = this.#virtualizedInstance?.getEditorViewport?.();
-    if (viewport != null) {
-      return viewport;
-    }
-    const fileContainer = this.#fileContainer;
-    if (this.#fileInstance == null || fileContainer == null) {
-      return undefined;
-    }
-    return lookupScrollContainer(fileContainer);
-  }
-
   #getOwnedVerticalViewport(): HTMLElement | undefined {
     if (!this.#ownsVerticalViewport) {
       return undefined;
     }
     const viewport = this.#virtualizedInstance?.getEditorViewport?.();
-    if (viewport instanceof HTMLElement) {
-      return viewport;
-    }
-    return undefined;
+    return viewport instanceof HTMLElement ? viewport : undefined;
   }
 
   #initialize(): void {
@@ -2147,11 +2093,19 @@ export class Editor<
               shadowRoots: [shadowRoot],
             })?.[0];
           } else {
-            composedRange = getShadowRootRange(shadowRoot);
+            const shadowSelection = (
+              shadowRoot as ShadowRootWithSelection
+            ).getSelection?.();
+            if (shadowSelection != null && shadowSelection.rangeCount > 0) {
+              composedRange = shadowSelection.getRangeAt(0);
+            }
           }
+          const contentEl = this.#contentElement;
           if (
             composedRange === undefined ||
-            !this.#rangeBelongsToEditor(composedRange)
+            contentEl === undefined ||
+            !contentEl.contains(composedRange.startContainer) ||
+            !contentEl.contains(composedRange.endContainer)
           ) {
             return;
           }
@@ -2307,10 +2261,80 @@ export class Editor<
     const { onFocus, onBlur } = this.#options;
     const targetIsContentElement = (e: Event) => {
       const target = e.composedPath()[0] as HTMLElement | undefined;
-      return (
-        target !== undefined &&
-        (target === contentEl || contentEl.contains(target))
-      );
+      return target !== undefined && contentEl.contains(target);
+    };
+    const handleCopyOrCut = (e: ClipboardEvent) => {
+      if (!targetIsContentElement(e)) {
+        return;
+      }
+      e.preventDefault();
+      const { clipboardData } = e;
+      // A read-only deleted-text selection lives outside the editor's document
+      // and can't be removed, so copy and cut both copy its text unedited. A
+      // gutter selection recorded the full text; a direct content drag falls
+      // back to the native selection, which spans only the first deleted line.
+      if (
+        this.#fileContainer?.shadowRoot
+          ?.querySelector('pre')
+          ?.hasAttribute('data-deleted-text-selection') === true
+      ) {
+        clipboardData?.setData(
+          'text',
+          this.#deletedSelectionText !== ''
+            ? this.#deletedSelectionText
+            : (window.getSelection()?.toString() ?? '')
+        );
+        return;
+      }
+      const textDocument = this.#document;
+      const selections = this.#selections;
+      let text = '';
+      let selectionTexts: string[] = [];
+      if (textDocument !== undefined && selections !== undefined) {
+        selectionTexts = getSelectionClipboardTexts(textDocument, selections);
+        if (e.type === 'cut' && selections.some(isCollapsedSelection)) {
+          const cut = resolveSelectionCut(textDocument, selections);
+          text = cut.text;
+          const change =
+            cut.edits.length === 0
+              ? undefined
+              : textDocument.applyResolvedEdits(
+                  cut.edits,
+                  true,
+                  selections,
+                  undefined,
+                  true
+                );
+          if (change !== undefined) {
+            const nextSelections =
+              cut.nextSelectionOffsets.map<EditorSelection>((offset) => {
+                const caret = textDocument.positionAt(offset);
+                return { start: caret, end: caret, direction: DirectionNone };
+              });
+            textDocument.setLastUndoSelectionsAfter(nextSelections);
+            this.#applyChange(
+              change,
+              nextSelections,
+              this.#applyChangeToLineAnnotations(change)
+            );
+          }
+        } else {
+          text = getSelectionText(textDocument, selections);
+          if (e.type === 'cut') {
+            this.#replaceSelectionText('', undefined, true);
+          }
+        }
+      }
+      // Per-selection texts let a paste into as many selections split them back.
+      if (clipboardData !== null) {
+        clipboardData.setData('text', text);
+        if (selectionTexts.length > 1) {
+          clipboardData.setData(
+            MULTI_SELECTION_CLIPBOARD_TYPE,
+            JSON.stringify(selectionTexts)
+          );
+        }
+      }
     };
 
     this.#editorEventDisposes?.forEach((dispose) => dispose());
@@ -2373,7 +2397,12 @@ export class Editor<
           // natively. Hand the selection to the deleted text and drop the
           // editor's own selection, so only one region is highlighted at a
           // time and the deleted line is not swept into an editable selection.
-          if (this.#isDeletedLineTarget(e)) {
+          const target = e.composedPath()[0];
+          if (
+            target instanceof HTMLElement &&
+            target.closest('[data-line]')?.getAttribute('data-line-type') ===
+              'change-deletion'
+          ) {
             this.#setDeletedTextSelectionActive(true);
             if (this.#selections !== undefined) {
               this.#updateSelections([]);
@@ -2392,21 +2421,18 @@ export class Editor<
             this.#lineAnnotations !== undefined &&
             this.#lineAnnotations.length > 0
           ) {
-            const annotationDisposes = [
-              ...contentEl.querySelectorAll<HTMLElement>(
-                '[data-line-annotation]'
-              ),
-            ]
-              .map((el) => [
+            for (const el of contentEl.querySelectorAll<HTMLElement>(
+              '[data-line-annotation]'
+            )) {
+              selectEventDisposes.push(
                 addEventListener(el, 'mouseenter', () => {
                   this.#shouldIgnoreSelectionChange = true;
                 }),
                 addEventListener(el, 'mouseleave', () => {
                   this.#shouldIgnoreSelectionChange = false;
-                }),
-              ])
-              .flat();
-            selectEventDisposes.push(...annotationDisposes);
+                })
+              );
+            }
           }
 
           this.#isContentMouseDown = true;
@@ -2455,10 +2481,7 @@ export class Editor<
           if (e.shiftKey) {
             const primarySelection = this.#selections?.at(-1);
             if (primarySelection !== undefined) {
-              const pos =
-                primarySelection.direction === DirectionBackward
-                  ? primarySelection.end
-                  : primarySelection.start;
+              const pos = getAnchorPosition(primarySelection);
               // fix the window selection for shift mode
               this.#setWindowSelection({
                 start: pos,
@@ -2491,7 +2514,6 @@ export class Editor<
           !e.shiftKey &&
           !e.ctrlKey &&
           !e.metaKey &&
-          !e.isComposing &&
           !this.#isComposing &&
           (!e.altKey || this.#options.editPrediction?.mode === 'subtle') &&
           this.#editPrediction?.rendered === true
@@ -2504,7 +2526,7 @@ export class Editor<
         }
 
         if (e.key === 'Escape' && this.#editPrediction !== undefined) {
-          this.#cancelEditPrediction(true);
+          this.#cancelEditPrediction();
           e.preventDefault();
           return;
         }
@@ -2528,38 +2550,39 @@ export class Editor<
 
         // handle the cursor move events manually for multiple selections and virtual viewport
         const mvShortcut = isMoveCursorShortcut(e);
-        const textDocument = this.#editSession?.document;
+        const textDocument = this.#document;
         if (
           this.#selections !== undefined &&
           this.#selections.length > 0 &&
           mvShortcut !== undefined &&
           textDocument !== undefined
         ) {
+          // Fold-skip resolver for vertical caret motion (zero-based lines);
+          // hosts without collapsible regions keep plain line arithmetic.
+          const fileDiff = this.#fileDiffInstance;
           const cursorMoveOptions: CursorMoveOptions = {
             getSoftLineOffsets: this.#isWrap
               ? (line) => this.#wrapLineTextOrWholeLine(line)
               : undefined,
-            resolveRenderableLine: this.#resolveRenderableLine,
+            resolveRenderableLine:
+              fileDiff == null
+                ? undefined
+                : (line, direction) => {
+                    const nearest = fileDiff.getNearestRenderableLine(
+                      line + 1,
+                      direction
+                    );
+                    return nearest == null ? undefined : nearest - 1;
+                  },
           };
-          if (e.shiftKey) {
-            this.#updateSelections(
-              mapSelectionShift(
-                textDocument,
-                this.#selections,
-                mvShortcut,
-                cursorMoveOptions
-              )
-            );
-          } else {
-            this.#updateSelections(
-              mapCursorMove(
-                textDocument,
-                this.#selections,
-                mvShortcut,
-                cursorMoveOptions
-              )
-            );
-          }
+          this.#updateSelections(
+            (e.shiftKey ? mapSelectionShift : mapCursorMove)(
+              textDocument,
+              this.#selections,
+              mvShortcut,
+              cursorMoveOptions
+            )
+          );
           this.#scrollToPrimaryCaret();
           e.preventDefault();
           return;
@@ -2594,43 +2617,8 @@ export class Editor<
         }
       }),
 
-      addEventListener(contentEl, 'copy', (e) => {
-        if (!targetIsContentElement(e)) {
-          return;
-        }
-        e.preventDefault();
-        // A read-only deleted-text selection lives outside the editor's
-        // document, so #getSelectionText() would be empty. Copy the selected
-        // deleted text instead.
-        if (this.#isDeletedTextSelectionActive()) {
-          e.clipboardData?.setData('text', this.#deletedTextForClipboard());
-        } else {
-          this.#writeSelectionClipboardData(
-            e.clipboardData,
-            this.#getSelectionText(),
-            this.#getSelectionClipboardTexts()
-          );
-        }
-      }),
-
-      addEventListener(contentEl, 'cut', (e) => {
-        if (!targetIsContentElement(e)) {
-          return;
-        }
-        e.preventDefault();
-        // Deleted text is read-only and can't be removed, so a cut there copies
-        // the selected deleted text (like the copy handler) without editing.
-        if (this.#isDeletedTextSelectionActive()) {
-          e.clipboardData?.setData('text', this.#deletedTextForClipboard());
-        } else {
-          const selectionTexts = this.#getSelectionClipboardTexts();
-          this.#writeSelectionClipboardData(
-            e.clipboardData,
-            this.#cutSelectionText(),
-            selectionTexts
-          );
-        }
-      }),
+      addEventListener(contentEl, 'copy', handleCopyOrCut),
+      addEventListener(contentEl, 'cut', handleCopyOrCut),
 
       addEventListener(contentEl, 'paste', (e) => {
         if (!targetIsContentElement(e)) {
@@ -2638,42 +2626,16 @@ export class Editor<
         }
         e.preventDefault();
         const clipboardData = e.clipboardData;
-        const textDocument = this.#editSession?.document;
-        if (clipboardData === null || textDocument === undefined) {
+        if (clipboardData === null) {
           return;
         }
-
-        let text: string | string[] = clipboardData.getData('text');
-
         const selectionCount = this.#selections?.length ?? 0;
-        if (selectionCount > 1) {
-          const multiSelectionText = clipboardData.getData(
-            MULTI_SELECTION_CLIPBOARD_TYPE
-          );
-          if (multiSelectionText !== undefined) {
-            try {
-              const selectionTexts = JSON.parse(multiSelectionText);
-              if (
-                Array.isArray(selectionTexts) &&
-                selectionTexts.length === selectionCount
-              ) {
-                text = selectionTexts;
-              }
-            } catch {
-              // ignore the invalid custom clipboard data
-            }
-          }
-        }
-
-        // Rewrite clipboard line breaks to the document's EOL so a Windows
-        // clipboard (\r\n or \r) doesn't leave mixed line endings behind.
-        this.#replaceSelectionText(
-          Array.isArray(text)
-            ? text.map((t) => textDocument.normalizeEol(t))
-            : textDocument.normalizeEol(text),
-          undefined,
-          true,
-          'document'
+        this.#pasteText(
+          clipboardData.getData('text'),
+          selectionCount > 1
+            ? clipboardData.getData(MULTI_SELECTION_CLIPBOARD_TYPE)
+            : undefined,
+          selectionCount
         );
       }),
 
@@ -2682,7 +2644,7 @@ export class Editor<
           return;
         }
         if (e.inputType === 'insertCompositionText') {
-          this.#cancelEditPrediction(true);
+          this.#cancelEditPrediction();
           return;
         }
         e.preventDefault();
@@ -2704,7 +2666,7 @@ export class Editor<
           if (!targetIsContentElement(e)) {
             return;
           }
-          this.#cancelEditPrediction(true);
+          this.#cancelEditPrediction();
           this.#isComposing = true;
           this.#shouldIgnoreSelectionChange = true;
         },
@@ -2862,7 +2824,7 @@ export class Editor<
               return;
             }
 
-            const textDocument = this.#editSession?.document;
+            const textDocument = this.#document;
             const lineIndex = resolveEditableLine(gutterRow);
             if (lineIndex === undefined || textDocument === undefined) {
               return;
@@ -2893,7 +2855,7 @@ export class Editor<
                   if (!this.#isGutterMouseDown) {
                     return;
                   }
-                  const textDocument = this.#editSession?.document;
+                  const textDocument = this.#document;
                   const lineIndex = resolveEditableLine(
                     resolveGutterTarget(
                       e.composedPath()[0] as HTMLElement | undefined,
@@ -2917,11 +2879,7 @@ export class Editor<
                   );
                   this.#selectionStart ??= selection;
                   this.#updateSelections([selection]);
-                  this.#focus(
-                    selection.direction === DirectionBackward
-                      ? selection.start
-                      : selection.end
-                  );
+                  this.#focus(getCaretPosition(selection));
                 },
                 { passive: true }
               ),
@@ -2944,37 +2902,50 @@ export class Editor<
   #handleCustomPasteEvent = async () => {
     const clipboard = this.#options.clipboard;
     if (clipboard !== undefined) {
-      let text: string | string[] = await clipboard.readText();
+      const text = await clipboard.readText();
       const selectionCount = this.#selections?.length ?? 0;
-      if (selectionCount > 1) {
-        const multiSelectionText = await clipboard.readText(
-          MULTI_SELECTION_CLIPBOARD_TYPE
-        );
-        try {
-          const selectionTexts = JSON.parse(multiSelectionText);
-          if (
-            Array.isArray(selectionTexts) &&
-            selectionTexts.length === selectionCount
-          ) {
-            text = selectionTexts;
-          }
-        } catch {
-          // Invalid selection metadata falls back to the plain-text value.
-        }
-      }
-      const textDocument = this.#editSession?.document;
-      if (textDocument != null) {
-        this.#replaceSelectionText(
-          Array.isArray(text)
-            ? text.map((t) => textDocument.normalizeEol(t))
-            : textDocument.normalizeEol(text),
-          undefined,
-          true,
-          'document'
-        );
-      }
+      this.#pasteText(
+        text,
+        selectionCount > 1
+          ? await clipboard.readText(MULTI_SELECTION_CLIPBOARD_TYPE)
+          : undefined,
+        selectionCount
+      );
     }
   };
+
+  // Pastes `text`, or one text per selection when `selectionTexts` is JSON for
+  // exactly `selectionCount` texts. Line breaks are rewritten to the document's
+  // EOL so a Windows clipboard (\r\n or \r) doesn't leave mixed endings behind.
+  #pasteText(
+    text: string,
+    selectionTexts: string | undefined,
+    selectionCount: number
+  ): void {
+    const textDocument = this.#document;
+    if (textDocument === undefined) {
+      return;
+    }
+    let texts: string | string[] = text;
+    if (selectionTexts !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(selectionTexts);
+        if (Array.isArray(parsed) && parsed.length === selectionCount) {
+          texts = parsed;
+        }
+      } catch {
+        // Invalid selection metadata falls back to the plain-text value.
+      }
+    }
+    this.#replaceSelectionText(
+      Array.isArray(texts)
+        ? texts.map((t) => textDocument.normalizeEol(t))
+        : textDocument.normalizeEol(texts),
+      undefined,
+      true,
+      'document'
+    );
+  }
 
   // diff(split) treat the content element as grid item,
   // that breaks the overlay element positioning.
@@ -3001,14 +2972,13 @@ export class Editor<
   // the offset only while the live layout is the one that produced it, so a
   // stale value is never applied to caret, selection, or line-Y positions.
   get #activeContentOffset(): { left: number; top: number } | undefined {
-    if (this.#isDiff && this.#diffSyle === 'split' && this.#isWrap) {
-      return this.#contentOffset;
-    }
-    return undefined;
+    return this.#isDiff && this.#diffSyle === 'split' && this.#isWrap
+      ? this.#contentOffset
+      : undefined;
   }
 
   #runCommand(command: EditorCommand) {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (textDocument == null) {
       return;
     }
@@ -3027,15 +2997,14 @@ export class Editor<
         if (selections === undefined) {
           break;
         }
-        const hasCollapsed = selections.some(isCollapsedSelection);
-        if (hasCollapsed) {
-          const expanded: EditorSelection[] = selections.map((sel) => {
-            if (isCollapsedSelection(sel)) {
-              return expandCollapsedSelectionToWord(textDocument, sel);
-            }
-            return sel;
-          });
-          this.#updateSelections(expanded);
+        if (selections.some(isCollapsedSelection)) {
+          this.#updateSelections(
+            selections.map((sel) =>
+              isCollapsedSelection(sel)
+                ? expandCollapsedSelectionToWord(textDocument, sel)
+                : sel
+            )
+          );
           this.focus();
         } else {
           const nextMatch = findNextMatch(textDocument, selections);
@@ -3085,7 +3054,7 @@ export class Editor<
         break;
 
       case 'deleteHardLineForward':
-        this.#deleteHardLineForward();
+        this.#editSelections(applyDeleteHardLineForwardToSelections);
         break;
 
       case 'toggleComment':
@@ -3150,12 +3119,12 @@ export class Editor<
             addedLength: number;
             selectionIndex: number;
           }> = [];
+          const outdent = command === 'outdent' || command === 'indentLess';
           for (const selection of this.#selections) {
             const startLine = selection.start.line;
-            const outdent = command === 'outdent' || command === 'indentLess';
-            const lineBased =
-              command === 'indentLess' || command === 'indentMore';
-            if (startLine !== selection.end.line || outdent || lineBased) {
+            // Only a plain indent of a single-line selection inserts at the
+            // caret; everything else re-indents whole lines.
+            if (startLine !== selection.end.line || command !== 'indent') {
               const ret = resolveIndentEdits(
                 textDocument,
                 selection,
@@ -3272,104 +3241,85 @@ export class Editor<
 
       case 'moveCursorToDocStart':
       case 'moveCursorToDocEnd':
-        {
-          const atEnd = command === 'moveCursorToDocEnd';
-          const boundarySelection = getDocumentBoundarySelection(
-            textDocument,
-            atEnd,
-            this.#isDiff
-          );
-          this.#updateSelections([boundarySelection]);
-          this.#revealLineIfCollapsed(getCaretPosition(boundarySelection).line);
-          this.#scrollToPrimaryCaret();
-        }
-        break;
-
       case 'expandSelectionDocStart':
-      case 'expandSelectionDocEnd':
-        {
-          const atEnd = command === 'expandSelectionDocEnd';
-          const selections = this.#selections;
-          if (selections !== undefined) {
-            const boundarySelection = getDocumentBoundarySelection(
-              textDocument,
-              atEnd,
-              this.#isDiff
-            );
-            this.#updateSelections(
-              extendSelections(selections, boundarySelection)
-            );
-            this.#revealLineIfCollapsed(
-              getCaretPosition(boundarySelection).line
-            );
-            this.#scrollToPrimaryCaret();
-          }
+      case 'expandSelectionDocEnd': {
+        const boundarySelection = getDocumentBoundarySelection(
+          textDocument,
+          command.endsWith('End'),
+          this.#isDiff
+        );
+        if (command.startsWith('move')) {
+          this.#updateSelections([boundarySelection]);
+        } else if (this.#selections !== undefined) {
+          this.#updateSelections(
+            extendSelections(this.#selections, boundarySelection)
+          );
+        } else {
+          break;
         }
+        this.#revealLineIfCollapsed(getCaretPosition(boundarySelection).line);
+        this.#scrollToPrimaryCaret();
         break;
+      }
 
+      // Replays history and remaps live selections when the entry
+      // intentionally has no stored selection metadata.
       case 'undo':
-      case 'redo':
-        this.#applyHistoryChange(command);
+      case 'redo': {
+        if (
+          !(command === 'undo' ? textDocument.canUndo : textDocument.canRedo)
+        ) {
+          break;
+        }
+        const selections = this.#selections;
+        const selectionOffsets = selections?.map(
+          (selection) =>
+            [
+              textDocument.offsetAt(selection.start),
+              textDocument.offsetAt(selection.end),
+            ] as const
+        );
+        const result =
+          command === 'undo' ? textDocument.undo() : textDocument.redo();
+        if (result === undefined) {
+          break;
+        }
+        const [change, recordedSelections, lineAnnotations, selectionEdits] =
+          result;
+        this.#applyChange(
+          change,
+          recordedSelections ??
+            (selections !== undefined &&
+            selectionOffsets !== undefined &&
+            selectionEdits !== undefined
+              ? remapSelectionsAfterEdits(
+                  textDocument,
+                  selections,
+                  selectionOffsets,
+                  selectionEdits
+                )
+              : undefined),
+          lineAnnotations ??
+            (this.#lineAnnotations != null
+              ? applyDocumentChangeToLineAnnotations(
+                  change,
+                  this.#lineAnnotations
+                )
+              : undefined)
+        );
         break;
+      }
     }
   }
 
-  // Replays history and remaps live selections when the entry intentionally
-  // has no stored selection metadata.
-  #applyHistoryChange(command: 'undo' | 'redo'): void {
-    const textDocument = this.#editSession?.document;
-    if (textDocument == null) {
-      return;
-    }
-    if (
-      (command === 'undo' && !textDocument.canUndo) ||
-      (command === 'redo' && !textDocument.canRedo)
-    ) {
-      return;
-    }
-    const selections = this.#selections;
-    const selectionOffsets = selections?.map(
-      (selection) =>
-        [
-          textDocument.offsetAt(selection.start),
-          textDocument.offsetAt(selection.end),
-        ] as const
-    );
-    const result =
-      command === 'undo' ? textDocument.undo() : textDocument.redo();
-    if (result === undefined) {
-      return;
-    }
-    const [change, recordedSelections, lineAnnotations, selectionEdits] =
-      result;
-    const nextSelections =
-      recordedSelections ??
-      (selections !== undefined &&
-      selectionOffsets !== undefined &&
-      selectionEdits !== undefined
-        ? remapSelectionsAfterEdits(
-            textDocument,
-            selections,
-            selectionOffsets,
-            selectionEdits
-          )
-        : undefined);
-    const replayedLineAnnotations =
-      lineAnnotations ??
-      (this.#lineAnnotations != null
-        ? applyDocumentChangeToLineAnnotations(change, this.#lineAnnotations)
-        : undefined);
-    this.#applyChange(change, nextSelections, replayedLineAnnotations);
-  }
-
-  /** Applies one undoable command batch and records its resulting selections. */
+  // Applies one undoable command batch and records its resulting selections.
   #applyCommandEdits(
     edits: TextEdit[],
     resolveNextSelections?: (
       textDocument: TextDocument<EType, LAnnotation>
     ) => EditorSelection[]
   ): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const selections = this.#selections;
     if (textDocument === undefined || selections === undefined) {
       return;
@@ -3426,9 +3376,9 @@ export class Editor<
     );
   }
 
-  /** Copies selected line blocks and keeps the selection in the requested copy. */
+  // Copies selected line blocks and keeps the selection in the requested copy.
   #copySelectedLines(direction: -1 | 1): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const selections = this.#selections;
     if (textDocument === undefined || selections === undefined) {
       return;
@@ -3443,8 +3393,7 @@ export class Editor<
     const edits: TextEdit[] = [];
     for (const block of blocks) {
       copiedLinesBefore.push(copiedLineCount);
-      const blockLineCount = block.endLine - block.startLine + 1;
-      copiedLineCount += blockLineCount;
+      copiedLineCount += block.endLine - block.startLine + 1;
       const text = textDocument.getText({
         start: { line: block.startLine, character: 0 },
         end: {
@@ -3453,28 +3402,20 @@ export class Editor<
         },
       });
 
-      if (direction > 0) {
-        const position = { line: block.startLine, character: 0 };
-        edits.push({
-          range: { start: position, end: position },
-          newText: text + textDocument.eol,
-        });
-      } else if (block.endLine < textDocument.lineCount - 1) {
-        const position = { line: block.endLine + 1, character: 0 };
-        edits.push({
-          range: { start: position, end: position },
-          newText: text + textDocument.eol,
-        });
-      } else {
-        const position = {
-          line: block.endLine,
-          character: textDocument.getLineLength(block.endLine),
-        };
-        edits.push({
-          range: { start: position, end: position },
-          newText: textDocument.eol + text,
-        });
+      let position = { line: block.startLine, character: 0 };
+      let newText = text + textDocument.eol;
+      if (direction < 0) {
+        if (block.endLine < textDocument.lineCount - 1) {
+          position = { line: block.endLine + 1, character: 0 };
+        } else {
+          position = {
+            line: block.endLine,
+            character: textDocument.getLineLength(block.endLine),
+          };
+          newText = textDocument.eol + text;
+        }
       }
+      edits.push({ range: { start: position, end: position }, newText });
     }
 
     const nextSelections = selections.map((selection) => {
@@ -3507,9 +3448,9 @@ export class Editor<
     this.#applyCommandEdits(edits, () => nextSelections);
   }
 
-  /** Inserts an indented blank line after each selection's final line. */
+  // Inserts an indented blank line after each selection's final line.
   #insertBlankLine(): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const selections = this.#selections;
     if (textDocument === undefined || selections === undefined) {
       return;
@@ -3552,7 +3493,7 @@ export class Editor<
   }
 
   #moveSelectedLines(direction: -1 | 1): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const selections = this.#selections;
     if (textDocument === undefined || selections === undefined) {
       return;
@@ -3568,58 +3509,34 @@ export class Editor<
     }
 
     const lineCount = textDocument.lineCount;
-    const lineRangeEnd = (line: number): Position =>
-      line < lineCount - 1
-        ? { line: line + 1, character: 0 }
-        : { line, character: textDocument.getLineLength(line) };
-    const getLinesText = (
-      lines: number[],
-      appendFinalLineBreak: boolean
-    ): string => {
-      const text = lines
-        .map((line) => textDocument.getLineText(line))
-        .join(textDocument.eol);
-      return appendFinalLineBreak ? text + textDocument.eol : text;
-    };
-
+    const { eol } = textDocument;
     const edits: TextEdit[] = [];
-    if (direction < 0) {
-      for (const block of blocks) {
-        const previousLine = block.startLine - 1;
-        const blockLines: number[] = [];
-        for (let line = block.startLine; line <= block.endLine; line++) {
-          blockLines.push(line);
-        }
-        edits.push({
-          range: {
-            start: { line: previousLine, character: 0 },
-            end: lineRangeEnd(block.endLine),
-          },
-          newText: getLinesText(
-            [...blockLines, previousLine],
-            block.endLine < lineCount - 1
-          ),
-        });
+    // Each block swaps places with the neighbor line it moves over.
+    for (const { startLine, endLine } of direction < 0
+      ? blocks
+      : [...blocks].reverse()) {
+      const neighbor = direction < 0 ? startLine - 1 : endLine + 1;
+      const lastLine = Math.max(endLine, neighbor);
+      let text = textDocument.getLineText(startLine);
+      for (let line = startLine + 1; line <= endLine; line++) {
+        text += eol + textDocument.getLineText(line);
       }
-    } else {
-      for (let index = blocks.length - 1; index >= 0; index--) {
-        const block = blocks[index];
-        const nextLine = block.endLine + 1;
-        const blockLines: number[] = [];
-        for (let line = block.startLine; line <= block.endLine; line++) {
-          blockLines.push(line);
-        }
-        edits.push({
-          range: {
-            start: { line: block.startLine, character: 0 },
-            end: lineRangeEnd(nextLine),
-          },
-          newText: getLinesText(
-            [nextLine, ...blockLines],
-            nextLine < lineCount - 1
-          ),
-        });
-      }
+      const neighborText = textDocument.getLineText(neighbor);
+      text =
+        direction < 0 ? text + eol + neighborText : neighborText + eol + text;
+      edits.push({
+        range: {
+          start: { line: Math.min(startLine, neighbor), character: 0 },
+          end:
+            lastLine < lineCount - 1
+              ? { line: lastLine + 1, character: 0 }
+              : {
+                  line: lastLine,
+                  character: textDocument.getLineLength(lastLine),
+                },
+        },
+        newText: lastLine < lineCount - 1 ? text + eol : text,
+      });
     }
 
     const lastBlock = blocks.at(-1)!;
@@ -3647,7 +3564,6 @@ export class Editor<
   }
 
   #handleLayoutResize = () => {
-    const lineAnnotations = this.#lineAnnotations?.length ?? 0;
     const prevGutterWidth = this.#gutterWidthCache;
     const prevContentWidth = this.#contentWidthCache;
     this.#gutterWidthCache = undefined;
@@ -3669,21 +3585,15 @@ export class Editor<
       // even while wrap is off — the mode can be toggled back on before the
       // next width change.
       this.#wrapLineOffsetsCache.clear();
-      if (this.#isWrap || lineAnnotations > 0) {
+      if (this.#isWrap || (this.#lineAnnotations?.length ?? 0) > 0) {
         this.#lineYCache.clear();
       }
     }
-    if (
-      this.#selections !== undefined ||
-      this.#matches !== undefined ||
-      this.#markerRenderer !== undefined
-    ) {
-      this.#updateSelections(this.#selections ?? []);
-      // Virtualized row swaps can resize a blurred editor. Repaint its overlays
-      // without letting that layout work reclaim DOM focus.
-      if (this.#selections !== undefined && this.#contentHasFocus) {
-        this.focus();
-      }
+    this.#refreshOverlays();
+    // Virtualized row swaps can resize a blurred editor. Repaint its overlays
+    // without letting that layout work reclaim DOM focus.
+    if (this.#selections !== undefined && this.#contentHasFocus) {
+      this.focus();
     }
     this.#markerRenderer?.removePopover();
     this.#computeContentOffset(this.#contentElement!);
@@ -3720,13 +3630,7 @@ export class Editor<
       this.#resetCache();
       // The loaded font changes glyph widths, which moves every wrap point.
       this.#wrapLineOffsetsCache.clear();
-      if (
-        this.#selections !== undefined ||
-        this.#matches !== undefined ||
-        this.#markerRenderer !== undefined
-      ) {
-        this.#updateSelections(this.#selections ?? []);
-      }
+      this.#refreshOverlays();
       this.#renderCarets();
       this.#markerRenderer?.removePopover();
     });
@@ -3734,14 +3638,14 @@ export class Editor<
 
   #rerender(
     change: TextDocumentChange,
-    newLineAnnotations?: EditorLineAnnotation<EType, LAnnotation>[],
-    renderRange = this.#renderRange,
-    shouldUpdateBuffer?: boolean
+    newLineAnnotations: EditorLineAnnotation<EType, LAnnotation>[] | undefined,
+    renderRange: RenderRange | undefined,
+    shouldUpdateBuffer: boolean | undefined
   ) {
     const tokenizer = this.#tokenizer;
     const fileInstance = this.#fileInstance;
     const applyDocumentChange = this.#applyDocumentChange;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const gutterEl = this.#gutterElement;
     const contentEl = this.#contentElement;
     if (
@@ -3953,7 +3857,7 @@ export class Editor<
     switch (inputType) {
       case 'insertText': {
         const text = data ?? '';
-        const textDocument = this.#editSession?.document;
+        const textDocument = this.#document;
         const selections = this.#selections;
         const autoSurroundTexts =
           textDocument !== undefined && selections !== undefined
@@ -3971,14 +3875,20 @@ export class Editor<
         break;
       case 'insertLineBreak':
       case 'insertParagraph': {
-        this.#replaceSelectionText(this.#editSession?.document?.eol ?? '\n');
+        this.#replaceSelectionText(this.#document?.eol ?? '\n');
         break;
       }
       case 'deleteContentBackward':
-        this.#deleteSelectionText();
-        break;
       case 'deleteContentForward':
-        this.#deleteSelectionText(true);
+        this.#editSelections((textDocument, selections, lineAnnotations) =>
+          applyDeleteCharacterToSelections(
+            textDocument,
+            selections,
+            inputType === 'deleteContentForward',
+            lineAnnotations,
+            this.#metrics.tabSize
+          )
+        );
         break;
       case 'deleteSoftLineBackward':
       // Safari emits deleteHardLineBackward for cmd+backspace where Chrome emits
@@ -3987,13 +3897,33 @@ export class Editor<
       // the logical line start, soft to the visual one), and Chrome's soft
       // behavior is what we match.
       case 'deleteHardLineBackward':
-        this.#deleteSoftLineBackward();
+        this.#editSelections((textDocument, selections, lineAnnotations) =>
+          applyDeleteSoftLineBackwardToSelections(
+            textDocument,
+            selections,
+            this.#isWrap
+              ? (line, character) => {
+                  const wrapOffsets = this.#wrapLineTextOrWholeLine(line);
+                  for (let w = 0; w + 1 < wrapOffsets.length; w++) {
+                    if (
+                      character >= wrapOffsets[w] &&
+                      character <= wrapOffsets[w + 1]
+                    ) {
+                      return wrapOffsets[w];
+                    }
+                  }
+                  return 0;
+                }
+              : undefined,
+            lineAnnotations
+          )
+        );
         break;
       case 'deleteWordBackward':
-        this.#deleteWordBackward();
+        this.#editSelections(applyDeleteWordBackwardToSelections);
         break;
       case 'insertTranspose':
-        this.#insertTranspose();
+        this.#editSelections(applyTransposeToSelections);
         break;
       default:
         console.warn(`[diffs] Unknown input type: ${inputType}`, data);
@@ -4044,9 +3974,11 @@ export class Editor<
   // A full host render can remove the focused contenteditable before the
   // replacement view synchronizes. Restore only after the new content is live
   // and only while focus has not moved to another real control in the gap.
+  // Without a pending request this is a plain #focus(position).
   #restoreReplacementFocus(position?: Position): void {
     const request = this.#replacementFocusRequest;
     if (request == null) {
+      this.#focus(position);
       return;
     }
     if (this.#retainSearchPanelFocus) {
@@ -4073,20 +4005,15 @@ export class Editor<
       this.#replacementFocusRequest = undefined;
       return shouldRestore;
     };
-    if (position != null) {
-      this.#focus(position, true, shouldFocus);
-      return;
-    }
     const primarySelection = this.#selections?.at(-1);
-    if (primarySelection == null) {
-      this.#focus(undefined, true, shouldFocus);
-      return;
-    }
-    const primaryPosition =
-      primarySelection.direction === DirectionBackward
-        ? primarySelection.end
-        : primarySelection.start;
-    this.#focus(primaryPosition, true, shouldFocus);
+    this.#focus(
+      position ??
+        (primarySelection === undefined
+          ? undefined
+          : getAnchorPosition(primarySelection)),
+      true,
+      shouldFocus
+    );
   }
 
   #replacementFocusIsAvailable(contentElement: HTMLElement): boolean {
@@ -4101,15 +4028,8 @@ export class Editor<
       return false;
     }
     const { activeElement: shadowActiveElement } = shadowRoot;
-    if (
-      shadowActiveElement === contentElement ||
-      (shadowActiveElement != null &&
-        contentElement.contains(shadowActiveElement))
-    ) {
-      return true;
-    }
     if (shadowActiveElement != null) {
-      return false;
+      return contentElement.contains(shadowActiveElement);
     }
     const { ownerDocument } = fileContainer;
     const { activeElement } = ownerDocument;
@@ -4124,19 +4044,13 @@ export class Editor<
   #getFirstVisibleLineNumber(offset = 0): number | undefined {
     const contentElement = this.#contentElement;
     const fileContainer = this.#fileContainer;
-    if (
-      this.#editSession?.document == null ||
-      contentElement == null ||
-      fileContainer == null
-    ) {
+    if (contentElement == null || fileContainer == null) {
       return undefined;
     }
 
-    const viewport = this.#getScrollViewport();
-    if (viewport === undefined) {
-      return undefined;
-    }
-
+    const viewport =
+      this.#virtualizedInstance?.getEditorViewport?.() ??
+      lookupScrollContainer(fileContainer);
     let viewportTop: number;
     let viewportBottom: number;
     if (viewport instanceof HTMLElement) {
@@ -4182,22 +4096,6 @@ export class Editor<
     return undefined;
   }
 
-  #focusAtPosition(position: Position, preventScroll: boolean): void {
-    const selection: EditorSelection = {
-      start: position,
-      end: position,
-      direction: DirectionNone,
-    };
-    this.#canMountSelectionAction = false;
-    this.#updateSelections([selection]);
-    this.#revealLineIfCollapsed(position.line);
-    if (preventScroll) {
-      this.#focus(position, true);
-    } else {
-      this.#scrollToPrimaryCaret();
-    }
-  }
-
   // set window native selection to match the selection
   #setWindowSelection(selection: EditorSelection) {
     const winSelection = window.getSelection();
@@ -4241,10 +4139,7 @@ export class Editor<
     }
   }
 
-  #scrollToPrimaryCaret(
-    noFocus = false,
-    scrollPosition: ScrollLogicalPosition = 'nearest'
-  ) {
+  #scrollToPrimaryCaret(noFocus = false) {
     const primarySelection = this.#selections?.at(-1);
     if (primarySelection === undefined) {
       return;
@@ -4252,19 +4147,11 @@ export class Editor<
     const primaryCaretElement = this.#primaryCaretElement;
     if (primaryCaretElement !== undefined) {
       primaryCaretElement.scrollIntoView({
-        block: scrollPosition,
+        block: 'nearest',
         inline: 'nearest',
       });
       if (!noFocus) {
-        const position =
-          primarySelection.direction === DirectionBackward
-            ? primarySelection.end
-            : primarySelection.start;
-        if (this.#replacementFocusRequest !== undefined) {
-          this.#restoreReplacementFocus(position);
-        } else {
-          this.#focus(position);
-        }
+        this.#restoreReplacementFocus(getAnchorPosition(primarySelection));
       }
     } else {
       const pos = getCaretPosition(primarySelection);
@@ -4306,12 +4193,7 @@ export class Editor<
       this.#overlayElement?.appendChild(virtualCaret);
       virtualCaret.scrollIntoView({ block: 'center', inline: 'nearest' });
       if (!noFocus) {
-        const position = { line, character: char };
-        if (this.#replacementFocusRequest !== undefined) {
-          this.#restoreReplacementFocus(position);
-        } else {
-          this.#focus(position);
-        }
+        this.#restoreReplacementFocus({ line, character: char });
       }
       this.#scrollingToLine = undefined;
       this.#scrollingToLineChar = undefined;
@@ -4404,35 +4286,15 @@ export class Editor<
     focusLine: number,
     textDocument: TextDocument<EType, LAnnotation>
   ): EditorSelection {
-    const lineStart = (line: number): Position => ({ line, character: 0 });
-    const lineEnd = (line: number): Position => ({
-      line,
-      character: textDocument.getLineText(line).length,
-    });
-    if (focusLine < anchorLine) {
-      return {
-        start: lineStart(focusLine),
-        end: lineEnd(anchorLine),
-        direction: DirectionBackward,
-      };
-    }
+    const endLine = Math.max(anchorLine, focusLine);
     return {
-      start: lineStart(anchorLine),
-      end: lineEnd(focusLine),
-      direction: DirectionForward,
+      start: { line: Math.min(anchorLine, focusLine), character: 0 },
+      end: {
+        line: endLine,
+        character: textDocument.getLineText(endLine).length,
+      },
+      direction: focusLine < anchorLine ? DirectionBackward : DirectionForward,
     };
-  }
-
-  // A pointer gesture targets read-only deleted text when its closest row is a
-  // change-deletion. Used to route a click in unified view's deleted text to a
-  // native selection instead of the editor's own.
-  #isDeletedLineTarget(event: Event): boolean {
-    const target = event.composedPath()[0];
-    return (
-      target instanceof HTMLElement &&
-      target.closest('[data-line]')?.getAttribute('data-line-type') ===
-        'change-deletion'
-    );
   }
 
   // Select read-only deleted text with the native selection, spanning from the
@@ -4565,27 +4427,6 @@ export class Editor<
     return true;
   }
 
-  // Whether a read-only deleted-text selection is currently active (the marker
-  // #setDeletedTextSelectionActive sets). The copy/cut handlers read this to
-  // copy the native selection instead of the editor's empty document selection.
-  #isDeletedTextSelectionActive(): boolean {
-    return (
-      this.#fileContainer?.shadowRoot
-        ?.querySelector('pre')
-        ?.hasAttribute('data-deleted-text-selection') ?? false
-    );
-  }
-
-  // The clipboard text for a read-only deleted-text selection. A gutter
-  // selection records the full multi-line text in #deletedSelectionText; a
-  // direct content drag leaves it empty, so fall back to the browser's native
-  // selection (which spans only the first deleted line — its separate host).
-  #deletedTextForClipboard(): string {
-    return this.#deletedSelectionText !== ''
-      ? this.#deletedSelectionText
-      : (window.getSelection()?.toString() ?? '');
-  }
-
   // Toggle the marker that reveals the native selection inside read-only
   // deleted text (see the gated ::selection rule). It stays on only while the
   // user is actively selecting within deleted lines, so a normal selection of
@@ -4596,16 +4437,12 @@ export class Editor<
     if (pre == null) {
       return;
     }
+    pre.toggleAttribute('data-deleted-text-selection', active);
+    // #selectDeletedLines refills this for a gutter selection; a content drag
+    // leaves it empty so the copy/cut handlers fall back to the native selection.
+    this.#deletedSelectionText = '';
     if (active) {
-      pre.setAttribute('data-deleted-text-selection', '');
       this.#setEditorActiveLineSafe(null);
-      // Reset the captured selection text. #selectDeletedLines refills it for a
-      // gutter selection; a content drag leaves it empty so the copy/cut
-      // handlers fall back to the native selection.
-      this.#deletedSelectionText = '';
-    } else {
-      pre.removeAttribute('data-deleted-text-selection');
-      this.#deletedSelectionText = '';
     }
   }
 
@@ -4627,37 +4464,12 @@ export class Editor<
     }
   }
 
-  // Re-render the selection overlay after a theme swap so rounded corner masks
-  // recompute their `--diffs-selection-corner-bg`. Those masks capture the
-  // resolved line-background color when the selection is drawn; a light/dark or
-  // theme-name change updates the line CSS but leaves the captured color stale,
-  // showing wrong-colored corners on diff-colored lines until the selection
-  // moves. Deferred to the next frame because a host-driven theme change fires
-  // this mid-`#sync` (before the render range is refreshed), and `#sync`
-  // re-renders the overlay itself; the frame delay avoids re-entrancy and is
-  // imperceptible.
-  #scheduleThemeSelectionRefresh(): void {
-    if (this.#themeSelectionRefreshFrame !== undefined) {
-      return;
-    }
-    this.#themeSelectionRefreshFrame = requestAnimationFrame(() => {
-      this.#themeSelectionRefreshFrame = undefined;
-      if (
-        this.#selections !== undefined ||
-        this.#matches !== undefined ||
-        this.#markerRenderer !== undefined
-      ) {
-        this.#updateSelections(this.#selections ?? []);
-      }
-    });
-  }
-
   // Keep the drag's horizontal goal in pointer space so a native caret that
   // briefly clamps to a short line cannot move every generated selection.
   #updateAltColumnSelections(): boolean {
     const drag = this.#altColumnDrag;
     const selectionStart = this.#selectionStart;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (
       drag === undefined ||
       drag.focusLine === undefined ||
@@ -4667,10 +4479,7 @@ export class Editor<
       return false;
     }
 
-    const anchor =
-      selectionStart.direction === DirectionBackward
-        ? selectionStart.end
-        : selectionStart.start;
+    const anchor = getAnchorPosition(selectionStart);
     const scrollLeft = this.#contentElement?.parentElement?.scrollLeft ?? 0;
     const characterDeltaRaw =
       (drag.clientX - drag.startClientX + scrollLeft - drag.startScrollLeft) /
@@ -4730,64 +4539,6 @@ export class Editor<
     return true;
   }
 
-  #removeRenderedEditPrediction(): void {
-    for (const [key, element] of this.#overlayElements ?? []) {
-      if (key.startsWith('editPrediction')) {
-        element.remove();
-        this.#overlayElements?.delete(key);
-      }
-    }
-  }
-
-  // Combines edits that share source lines into the exact text range rendered
-  // by one ghost preview. A non-deletion replacement also includes the
-  // preserved line suffix so it reflows after the ghost text. Spacing and
-  // rendering both use this geometry so they cannot disagree about how many
-  // continuation lines the preview contains.
-  #composeEditPredictionGroup(
-    textDocument: TextDocument<EType, LAnnotation>,
-    edits: readonly TextEdit[],
-    startIndex: number
-  ): { edit: TextEdit; endIndex: number } {
-    const firstEdit = edits[startIndex];
-    let endIndex = startIndex;
-    let endLine = firstEdit.range.end.line;
-    while (
-      endIndex + 1 < edits.length &&
-      edits[endIndex + 1].range.start.line <= endLine
-    ) {
-      endIndex++;
-      endLine = Math.max(endLine, edits[endIndex].range.end.line);
-    }
-    if (
-      endIndex === startIndex &&
-      (firstEdit.newText.length === 0 ||
-        comparePosition(firstEdit.range.start, firstEdit.range.end) === 0)
-    ) {
-      return { edit: firstEdit, endIndex };
-    }
-
-    const start = firstEdit.range.start;
-    const end = {
-      line: endLine,
-      character: textDocument.getLineLength(endLine),
-    };
-    const parts: string[] = [];
-    let consumed = textDocument.offsetAt(start);
-    for (let index = startIndex; index <= endIndex; index++) {
-      const edit = edits[index];
-      const editStart = textDocument.offsetAt(edit.range.start);
-      const editEnd = textDocument.offsetAt(edit.range.end);
-      parts.push(textDocument.getTextSlice(consumed, editStart), edit.newText);
-      consumed = editEnd;
-    }
-    parts.push(textDocument.getTextSlice(consumed, textDocument.offsetAt(end)));
-    return {
-      edit: { range: { start, end }, newText: parts.join('') },
-      endIndex,
-    };
-  }
-
   // Composes the active prediction into ghost groups and decides, once, whether
   // every group has rendered rows. Spacers and ghost rendering read this result
   // directly; Tab acceptance reads the `rendered` flag that rendering sets only
@@ -4800,7 +4551,7 @@ export class Editor<
     | { groups: EditPredictionGroup[]; allVisible: boolean }
     | undefined {
     const prediction = this.#editPrediction;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (
       prediction == null ||
       textDocument == null ||
@@ -4815,11 +4566,48 @@ export class Editor<
     const groups: EditPredictionGroup[] = [];
     let allVisible = edits.length > 0;
     for (let startIndex = 0; startIndex < edits.length; ) {
-      const { edit, endIndex } = this.#composeEditPredictionGroup(
-        textDocument,
-        edits,
-        startIndex
-      );
+      // Combine edits that share source lines into the exact text range one
+      // ghost preview renders. A non-deletion replacement also includes the
+      // preserved line suffix so it reflows after the ghost text. Spacing and
+      // rendering both use this geometry so they cannot disagree about how
+      // many continuation lines the preview contains.
+      let edit = edits[startIndex];
+      let endIndex = startIndex;
+      let endLine = edit.range.end.line;
+      while (
+        endIndex + 1 < edits.length &&
+        edits[endIndex + 1].range.start.line <= endLine
+      ) {
+        endIndex++;
+        endLine = Math.max(endLine, edits[endIndex].range.end.line);
+      }
+      if (
+        endIndex !== startIndex ||
+        (edit.newText.length !== 0 &&
+          comparePosition(edit.range.start, edit.range.end) !== 0)
+      ) {
+        const start = edit.range.start;
+        const end = {
+          line: endLine,
+          character: textDocument.getLineLength(endLine),
+        };
+        let newText = '';
+        let consumed = textDocument.offsetAt(start);
+        for (let index = startIndex; index <= endIndex; index++) {
+          const { range } = edits[index];
+          newText +=
+            textDocument.getTextSlice(
+              consumed,
+              textDocument.offsetAt(range.start)
+            ) + edits[index].newText;
+          consumed = textDocument.offsetAt(range.end);
+        }
+        newText += textDocument.getTextSlice(
+          consumed,
+          textDocument.offsetAt(end)
+        );
+        edit = { range: { start, end }, newText };
+      }
       for (
         let line = edit.range.start.line;
         allVisible && line <= edit.range.end.line;
@@ -4868,14 +4656,7 @@ export class Editor<
         element
       );
       if (suffix !== undefined) {
-        const suffixElement = h(
-          'span',
-          {
-            dataset: 'editPredictionSuffix',
-          },
-          line
-        );
-        suffixElement.append(suffix);
+        h('span', { dataset: 'editPredictionSuffix' }, line).append(suffix);
       }
       // Indent only the first visual line to the caret; when the line wraps,
       // its continuation rows start at the column's left edge like document
@@ -4892,7 +4673,7 @@ export class Editor<
   // neighbouring edit on the same line would move it.
   #cloneInsertionSuffix(group: EditPredictionGroup): Node | undefined {
     const prediction = this.#editPrediction;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (prediction == null || textDocument == null) {
       return undefined;
     }
@@ -5121,7 +4902,7 @@ export class Editor<
     return undefined;
   }
 
-  #cancelEditPrediction(removeRendered: boolean, notifyComponent = true): void {
+  #cancelEditPrediction(notifyComponent = true): void {
     if (this.#editPredictionTimer !== undefined) {
       clearTimeout(this.#editPredictionTimer);
       this.#editPredictionTimer = undefined;
@@ -5133,8 +4914,11 @@ export class Editor<
     this.#retryEditPredictionOnRender = false;
     this.#editPrediction = undefined;
     this.#syncEditPredictionSpacers(notifyComponent);
-    if (removeRendered) {
-      this.#removeRenderedEditPrediction();
+    for (const [key, element] of this.#overlayElements ?? []) {
+      if (key.startsWith('editPrediction')) {
+        element.remove();
+        this.#overlayElements?.delete(key);
+      }
     }
   }
 
@@ -5155,12 +4939,29 @@ export class Editor<
     );
   }
 
-  #scheduleEditPrediction(): void {
-    this.#cancelEditPrediction(true);
+  // The editor's only selection when it is a caret at `offset` in the current
+  // `document`. Edit predictions apply only to that exact state.
+  #getSoleCaretAt(
+    document: TextDocument<EType, LAnnotation>,
+    offset: number
+  ): EditorSelection | undefined {
     const selection = this.#selections?.[0];
+    return this.#document === document &&
+      this.#selections?.length === 1 &&
+      selection !== undefined &&
+      isCollapsedSelection(selection) &&
+      document.offsetAt(getCaretPosition(selection)) === offset
+      ? selection
+      : undefined;
+  }
+
+  #scheduleEditPrediction(): void {
+    this.#cancelEditPrediction();
+    const selection = this.#selections?.[0];
+    const document = this.#document;
     if (
       this.#options.editPrediction === undefined ||
-      this.#editSession?.document === undefined ||
+      document === undefined ||
       this.#editSession?.fileInfo === undefined ||
       this.#selections?.length !== 1 ||
       selection === undefined ||
@@ -5169,21 +4970,16 @@ export class Editor<
       return;
     }
 
-    const document = this.#editSession?.document;
     const cursorOffset = document.offsetAt(getCaretPosition(selection));
     this.#editPredictionTimer = setTimeout(() => {
       this.#editPredictionTimer = undefined;
       const options = this.#options.editPrediction;
-      const currentSelection = this.#selections?.[0];
+      const currentSelection = this.#getSoleCaretAt(document, cursorOffset);
       const path = this.#editSession?.fileInfo?.name;
       if (
         options === undefined ||
         path === undefined ||
-        this.#editSession?.document !== document ||
-        this.#selections?.length !== 1 ||
-        currentSelection === undefined ||
-        !isCollapsedSelection(currentSelection) ||
-        document.offsetAt(getCaretPosition(currentSelection)) !== cursorOffset
+        currentSelection === undefined
       ) {
         return;
       }
@@ -5230,17 +5026,12 @@ export class Editor<
 
       void Promise.resolve(prediction)
         .then((response) => {
-          const selection = this.#selections?.[0];
           if (
             controller.signal.aborted ||
             generation !== this.#editPredictionGeneration ||
             this.#editPredictionAbortController !== controller ||
-            this.#editSession?.document !== document ||
             document.version !== request.version ||
-            this.#selections?.length !== 1 ||
-            selection === undefined ||
-            !isCollapsedSelection(selection) ||
-            document.offsetAt(getCaretPosition(selection)) !== cursorOffset
+            this.#getSoleCaretAt(document, cursorOffset) === undefined
           ) {
             return;
           }
@@ -5311,17 +5102,16 @@ export class Editor<
             line: lastEditPosition.line,
             character: document.getLineLength(lastEditPosition.line),
           });
-          const predictedParts: string[] = [];
+          let predictedText = '';
           let consumed = affectedStart;
           for (const edit of edits) {
-            predictedParts.push(
-              document.getTextSlice(consumed, edit.start),
-              edit.text
-            );
+            predictedText +=
+              document.getTextSlice(consumed, edit.start) + edit.text;
             consumed = edit.end;
           }
-          predictedParts.push(document.getTextSlice(consumed, affectedEnd));
-          const predictedLines = predictedParts.join('').split(/\r\n|\r|\n/);
+          const predictedLines = (
+            predictedText + document.getTextSlice(consumed, affectedEnd)
+          ).split(/\r\n|\r|\n/);
           const affectedEndLine =
             firstEditPosition.line + predictedLines.length - 1;
           const lineDelta =
@@ -5391,7 +5181,7 @@ export class Editor<
               newCursor: { ...newCursor },
             },
           };
-          this.#updateSelections(this.#selections);
+          this.#updateSelections(this.#selections ?? []);
         })
         .catch(() => {})
         .finally(() => {
@@ -5406,7 +5196,7 @@ export class Editor<
     change: TextDocumentChange,
     source: 'user' | 'prediction'
   ): void {
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const path = this.#editSession?.fileInfo?.name;
     const transaction = getTextDocumentChangeTransaction(change);
     if (
@@ -5428,25 +5218,19 @@ export class Editor<
 
   #acceptEditPrediction(): void {
     const prediction = this.#editPrediction;
-    const textDocument = this.#editSession?.document;
-    const selection = this.#selections?.[0];
     if (
       prediction === undefined ||
       !prediction.rendered ||
-      textDocument === undefined ||
-      prediction.document !== textDocument ||
-      prediction.version !== textDocument.version ||
-      this.#selections?.length !== 1 ||
-      selection === undefined ||
-      !isCollapsedSelection(selection) ||
-      textDocument.offsetAt(getCaretPosition(selection)) !==
-        prediction.cursorOffset
+      prediction.version !== prediction.document.version ||
+      this.#getSoleCaretAt(prediction.document, prediction.cursorOffset) ===
+        undefined
     ) {
       return;
     }
 
+    const textDocument = prediction.document;
     const { edits, newCursor } = prediction.response;
-    this.#cancelEditPrediction(true);
+    this.#cancelEditPrediction();
     const change = textDocument.applyEdits(
       edits.map((edit) => ({
         range: {
@@ -5483,7 +5267,7 @@ export class Editor<
     elements: Map<string, HTMLElement>;
   }): void {
     const prediction = this.#editPrediction;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (prediction !== undefined) {
       prediction.rendered = false;
     }
@@ -5591,7 +5375,7 @@ export class Editor<
       }
     }
     if (selectionsChanged) {
-      this.#cancelEditPrediction(true);
+      this.#cancelEditPrediction();
     }
     this.#syncEditPredictionSpacers();
 
@@ -5620,6 +5404,7 @@ export class Editor<
       elements: new Map<string, HTMLElement>(),
     };
 
+    const textDocument = this.#document;
     if (selections.length > 0) {
       const normalizedSelections = mergeOverlappingSelections(selections);
       const primarySelection = normalizedSelections.at(-1)!;
@@ -5628,12 +5413,12 @@ export class Editor<
       // caret it also gets the full-line background; once any selection spans
       // text, the background is dropped (lineNumberOnly) so the text selection
       // is the only line-level highlight.
-      const hasNonEmptySelection = normalizedSelections.some(
-        (selection) => !isCollapsedSelection(selection)
+      this.#setEditorActiveLineSafe(
+        getCaretPosition(primarySelection).line + 1,
+        normalizedSelections.some(
+          (selection) => !isCollapsedSelection(selection)
+        )
       );
-      const caretLine = getCaretPosition(primarySelection).line + 1;
-
-      this.#setEditorActiveLineSafe(caretLine, hasNonEmptySelection);
 
       for (const selection of normalizedSelections) {
         if (!isCollapsedSelection(selection)) {
@@ -5642,25 +5427,22 @@ export class Editor<
         this.#renderCaret(renderCtx, selection, selection === primarySelection);
       }
 
-      const bracketMatchRanges =
+      if (
         this.#options.matchBrackets !== false &&
-        this.#editSession?.document != null &&
+        textDocument !== undefined &&
         this.#tokenizer !== undefined &&
         isCollapsedSelection(primarySelection)
-          ? findBracketMatchRanges(
-              this.#editSession?.document,
-              this.#tokenizer,
-              primarySelection.start
-            )
-          : undefined;
-      if (bracketMatchRanges !== undefined) {
-        for (const range of bracketMatchRanges) {
+      ) {
+        for (const range of findBracketMatchRanges(
+          textDocument,
+          this.#tokenizer,
+          primarySelection.start
+        ) ?? []) {
           this.#renderSelection(renderCtx, 'bracketMatch', range);
         }
       }
     }
 
-    const textDocument = this.#editSession?.document;
     if (this.#matches !== undefined && textDocument !== undefined) {
       const matches = this.#matches;
       const renderRange = this.#renderRange;
@@ -5844,7 +5626,8 @@ export class Editor<
     extraDataset?: string,
     connectedCaret?: Position
   ) {
-    if (this.#editSession?.document == null) {
+    const textDocument = this.#document;
+    if (textDocument == null) {
       return;
     }
 
@@ -5865,7 +5648,7 @@ export class Editor<
       const startChar = line === start.line ? start.character : 0;
       const endChar = isLastLine
         ? end.character
-        : this.#editSession?.document.getLineLength(line);
+        : textDocument.getLineLength(line);
 
       // A predicted deletion of an empty line or of a lone line break has no
       // text to strike through; draw a one-character mark at the boundary so
@@ -5895,7 +5678,7 @@ export class Editor<
 
       if (this.#isWrap) {
         const contentWidth = this.#getContentWidth();
-        const lineText = this.#editSession?.document.getLineText(line);
+        const lineText = textDocument.getLineText(line);
         const textWidth =
           2 * this.#metrics.ch + this.#metrics.measureTextWidth(lineText);
         if (textWidth > contentWidth) {
@@ -5914,28 +5697,21 @@ export class Editor<
         }
       }
 
-      let left = 0;
-      let width = 0;
-      let paddingEnd = 0;
-      if (startChar === 0) {
-        // gutter width + inline padding (1ch), plus the split-diff content
-        // offset so a column-0 selection lines up with the content panel the
-        // same way #getCharX (used for startChar > 0 and the caret) does.
-        left =
-          this.#getGutterWidth() +
-          this.#metrics.ch +
-          (this.#activeContentOffset?.left ?? 0);
-      } else {
-        left = this.#getCharX(line, startChar)[0];
-      }
-      if (!isLastLine && type === 'selection') {
-        paddingEnd = this.#metrics.ch;
-      }
-      if (startChar === endChar) {
-        width = paddingEnd;
-      } else {
-        width = this.#getCharX(line, endChar)[0] - left + paddingEnd;
-      }
+      // At column 0: gutter width + inline padding (1ch), plus the split-diff
+      // content offset so a column-0 selection lines up with the content panel
+      // the same way #getCharX (used for startChar > 0 and the caret) does.
+      const left =
+        startChar === 0
+          ? this.#getGutterWidth() +
+            this.#metrics.ch +
+            (this.#activeContentOffset?.left ?? 0)
+          : this.#getCharX(line, startChar)[0];
+      const paddingEnd =
+        !isLastLine && type === 'selection' ? this.#metrics.ch : 0;
+      const width =
+        startChar === endChar
+          ? paddingEnd
+          : this.#getCharX(line, endChar)[0] - left + paddingEnd;
       this.#renderSelectionBlock(
         renderCtx,
         type,
@@ -6001,27 +5777,27 @@ export class Editor<
         continue;
       }
 
-      const segmentStartWidth = this.#segmentTextWidth(
+      const segmentStartWidth = this.#metrics.segmentTextWidth(
         lineText,
         segmentStart,
         wrapStartChar
       );
       const segmentLeft = offsetLeft + segmentStartWidth;
-      let paddingEnd = 0;
-      if (
-        !isLastLine &&
-        wrapLine === segmentCount - 1 &&
-        type === 'selection'
-      ) {
-        paddingEnd = this.#metrics.ch;
-      }
+      const paddingEnd =
+        !isLastLine && wrapLine === segmentCount - 1 && type === 'selection'
+          ? this.#metrics.ch
+          : 0;
       // Measure the selection width as the gap between two segment-relative
       // offsets so a tab inside the selection advances from its real column,
       // not from the start of the sliced selection text.
       const segmentWidth =
         wrapStartChar === wrapEndChar
           ? paddingEnd
-          : this.#segmentTextWidth(lineText, segmentStart, wrapEndChar) -
+          : this.#metrics.segmentTextWidth(
+              lineText,
+              segmentStart,
+              wrapEndChar
+            ) -
             segmentStartWidth +
             paddingEnd;
 
@@ -6045,27 +5821,6 @@ export class Editor<
         }
       );
     }
-  }
-
-  // Pixel width of the text from a wrapped segment's start up to a character,
-  // relative to the segment's left edge. Tabs advance from the segment start,
-  // which sits on a tab stop, so tab stops line up with the rendered text.
-  #segmentTextWidth(
-    lineText: string,
-    segmentStart: number,
-    character: number
-  ): number {
-    if (character <= segmentStart) {
-      return 0;
-    }
-    const segmentText = lineText.slice(segmentStart, character);
-    const asciiColumns = getExpandedAsciiTextColumns(
-      segmentText,
-      this.#metrics.tabSize
-    );
-    return asciiColumns !== -1
-      ? asciiColumns * this.#metrics.ch
-      : this.#metrics.measureTextWidth(segmentText);
   }
 
   // Render one selection block for a single visual line.
@@ -6137,15 +5892,11 @@ export class Editor<
           dataset.rtl = '';
         }
       }
-      let cornerEl = renderCtx.elements.get(cacheKey);
-      if (cornerEl !== undefined) {
+      if (renderCtx.elements.has(cacheKey)) {
         return;
       }
-      if (overlayEls?.has(cacheKey) === true) {
-        cornerEl = overlayEls.get(cacheKey)!;
-        cornerEl.style.cssText = css;
-        overlayEls.delete(cacheKey);
-      } else {
+      let cornerEl = overlayEls?.get(cacheKey);
+      if (cornerEl === undefined) {
         cornerEl = h(
           'div',
           {
@@ -6154,14 +5905,13 @@ export class Editor<
                 ? 'caretHighlightRange'
                 : 'selectionRange',
             style: { cssText: css },
-            children: [
-              h('div', {
-                dataset: dataset,
-              }),
-            ],
+            children: [h('div', { dataset })],
           },
           renderCtx.fragment
         );
+      } else {
+        cornerEl.style.cssText = css;
+        overlayEls?.delete(cacheKey);
       }
       renderCtx.elements.set(cacheKey, cornerEl);
     };
@@ -6237,10 +5987,8 @@ export class Editor<
       return;
     }
 
-    if (overlayEls?.has(cacheKey) === true) {
-      rangeEl = overlayEls.get(cacheKey)!;
-      overlayEls.delete(cacheKey);
-    } else {
+    rangeEl = overlayEls?.get(cacheKey);
+    if (rangeEl === undefined) {
       rangeEl = h(
         'div',
         {
@@ -6250,6 +5998,8 @@ export class Editor<
         },
         renderCtx.fragment
       );
+    } else {
+      overlayEls?.delete(cacheKey);
     }
 
     rangeEl.style.width = `${width}px`;
@@ -6313,7 +6063,7 @@ export class Editor<
   #updateSelectionActionPopover(): void {
     const primarySelection = this.#selections?.at(-1);
     const overlayElement = this.#overlayElement;
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const renderSelectionAction = this.#options.renderSelectionAction;
     const cleanup = () => {
       this.#selectionAction?.cleanup();
@@ -6327,17 +6077,14 @@ export class Editor<
       isCollapsedSelection(primarySelection) ||
       this.#isContentMouseDown ||
       overlayElement === undefined ||
-      textDocument === undefined
+      textDocument === undefined ||
+      !this.#isLineVisible(getCaretPosition(primarySelection).line)
     ) {
       cleanup();
       return;
     }
 
     const head = getCaretPosition(primarySelection);
-    if (!this.#isLineVisible(head.line)) {
-      cleanup();
-      return;
-    }
 
     if (this.#selectionAction === undefined) {
       if (!this.#canMountSelectionAction) {
@@ -6352,7 +6099,7 @@ export class Editor<
         },
         applyEdits: (edits: TextEdit[]) => this.applyEdits(edits),
         getSelectionText: () =>
-          this.#editSession?.document?.getText(getActiveSelection()) ?? '',
+          this.#document?.getText(getActiveSelection()) ?? '',
         replaceSelectionText: (text: string) => {
           this.#replaceSelectionText(text, [getActiveSelection()]);
         },
@@ -6378,9 +6125,10 @@ export class Editor<
       placeAbove: isBackward,
       anchor: head,
     };
-    const fallback: typeof preferred = isBackward
-      ? { placeAbove: false, anchor: primarySelection.end }
-      : { placeAbove: true, anchor: primarySelection.start };
+    const fallback: typeof preferred = {
+      placeAbove: !isBackward,
+      anchor: getAnchorPosition(primarySelection),
+    };
 
     // Resolve each candidate's [left, top, bottom] in overlay coordinate space
     // up front so both the viewport fit-check and the final reposition() call
@@ -6473,14 +6221,8 @@ export class Editor<
       this.#searchPanel.setMode(mode);
       return;
     }
-    this.#renderSearchPanel(mode);
-  }
 
-  #renderSearchPanel(mode: SearchPanelMode) {
-    // cleanup the existing search panel
-    this.#searchPanel?.cleanup();
-
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     const preElement =
       this.#fileContainer?.shadowRoot?.querySelector<HTMLElement>('pre');
     const selections = this.#selections;
@@ -6489,7 +6231,7 @@ export class Editor<
     }
 
     let defaultQuery = '';
-    let initialMatch: [number, number] | undefined = undefined;
+    let initialMatch: [number, number] | undefined;
 
     if (selections !== undefined && selections.length > 0) {
       let primarySelection = selections.at(-1)!;
@@ -6572,30 +6314,22 @@ export class Editor<
         if (options?.syncSelection === false) {
           this.#updateSelections(this.#selections ?? []);
           const primarySelection = this.#selections?.at(-1);
-          if (primarySelection !== undefined) {
-            const startOffset = textDocument.offsetAt(primarySelection.start);
-            const endOffset = textDocument.offsetAt(primarySelection.end);
-            for (const match of allMatches) {
-              if (match[0] === startOffset && match[1] === endOffset) {
-                return match;
-              }
-            }
+          if (primarySelection === undefined) {
+            return undefined;
           }
-          return undefined;
+          const startOffset = textDocument.offsetAt(primarySelection.start);
+          const endOffset = textDocument.offsetAt(primarySelection.end);
+          return allMatches.find(
+            (match) => match[0] === startOffset && match[1] === endOffset
+          );
         }
 
         const primarySelection = this.#selections?.at(-1);
-        let searchOffset = 0;
-        let nextMatch: MatchRange | undefined;
-        if (primarySelection !== undefined) {
-          searchOffset = textDocument.offsetAt(primarySelection.start);
-        }
-        for (const m of allMatches) {
-          if (m[0] >= searchOffset) {
-            nextMatch = m;
-            break;
-          }
-        }
+        const searchOffset =
+          primarySelection === undefined
+            ? 0
+            : textDocument.offsetAt(primarySelection.start);
+        const nextMatch = allMatches.find((m) => m[0] >= searchOffset);
         if (nextMatch !== undefined) {
           scrollToMatch(nextMatch, true);
         } else {
@@ -6615,107 +6349,6 @@ export class Editor<
     this.#retainSearchPanelFocus = false;
   }
 
-  #getSelectionText() {
-    const textDocument = this.#editSession?.document;
-    const selections = this.#selections;
-    if (textDocument === undefined || selections === undefined) {
-      return '';
-    }
-    return getSelectionText(textDocument, selections);
-  }
-
-  #getSelectionClipboardTexts(): string[] {
-    const textDocument = this.#editSession?.document;
-    const selections = this.#selections;
-    if (textDocument === undefined || selections === undefined) {
-      return [];
-    }
-    return getSelectionClipboardTexts(textDocument, selections);
-  }
-
-  /** Writes both the portable text and the selection pairing metadata. */
-  #writeSelectionClipboardData(
-    clipboardData: DataTransfer | null,
-    text: string,
-    selectionTexts: string[]
-  ): void {
-    if (clipboardData === null) {
-      return;
-    }
-    clipboardData.setData('text', text);
-    if (selectionTexts.length > 1) {
-      clipboardData.setData(
-        MULTI_SELECTION_CLIPBOARD_TYPE,
-        JSON.stringify(selectionTexts)
-      );
-    }
-  }
-
-  #cutSelectionText(): string {
-    const textDocument = this.#editSession?.document;
-    const selections = this.#selections;
-    if (
-      textDocument === undefined ||
-      selections === undefined ||
-      selections.length === 0
-    ) {
-      return '';
-    }
-
-    if (selections.some((selection) => isCollapsedSelection(selection))) {
-      const cut = resolveSelectionCut(textDocument, selections);
-      this.#applySelectionCutEdits(cut.edits, cut.nextSelectionOffsets);
-      return cut.text;
-    }
-
-    const text = getSelectionText(textDocument, selections);
-    this.#replaceSelectionText('', undefined, true);
-    return text;
-  }
-
-  #applySelectionCutEdits(
-    edits: ResolvedTextEdit[],
-    nextSelectionOffsets: number[]
-  ): void {
-    const textDocument = this.#editSession?.document;
-    const selections = this.#selections;
-    if (
-      textDocument === undefined ||
-      selections === undefined ||
-      edits.length === 0
-    ) {
-      return;
-    }
-
-    const change = textDocument.applyResolvedEdits(
-      edits,
-      true,
-      selections,
-      undefined,
-      true
-    );
-    if (change === undefined) {
-      return;
-    }
-
-    const nextSelections = nextSelectionOffsets.map<EditorSelection>(
-      (offset) => {
-        const caret = textDocument.positionAt(offset);
-        return {
-          start: caret,
-          end: caret,
-          direction: DirectionNone,
-        };
-      }
-    );
-    textDocument.setLastUndoSelectionsAfter(nextSelections);
-    this.#applyChange(
-      change,
-      nextSelections,
-      this.#applyChangeToLineAnnotations(change)
-    );
-  }
-
   // replace the selection text
   #replaceSelectionText(
     text: string | string[],
@@ -6723,152 +6356,56 @@ export class Editor<
     undoBoundary = false,
     textOrder: 'selection' | 'document' = 'selection'
   ) {
-    if (selections === undefined) {
+    const primarySelection = selections?.at(-1);
+    if (primarySelection === undefined) {
       return;
     }
-    const textDocument = this.#editSession?.document;
-    const primarySelection = selections.at(-1);
-    if (textDocument === undefined || primarySelection === undefined) {
-      return;
-    }
-    const { nextSelections, change } =
-      Array.isArray(text) && text.length === selections.length
-        ? applyTextReplaceToSelections<EType, LAnnotation>(
-            textDocument,
-            selections,
-            text,
-            this.#lineAnnotations,
-            undoBoundary,
-            textOrder
-          )
-        : applyTextChangeToSelections<EType, LAnnotation>(
-            textDocument,
-            selections,
-            {
-              start: textDocument.offsetAt(primarySelection.start),
-              end: textDocument.offsetAt(primarySelection.end),
-              text: Array.isArray(text) ? text.join(textDocument.eol) : text,
-            },
-            this.#lineAnnotations,
-            undefined,
-            undoBoundary
-          );
-
-    if (change !== undefined) {
-      this.#applyChange(
-        change,
-        nextSelections,
-        this.#applyChangeToLineAnnotations(change)
-      );
-    }
+    this.#editSelections(
+      (textDocument, selections, lineAnnotations) =>
+        Array.isArray(text) && text.length === selections.length
+          ? applyTextReplaceToSelections(
+              textDocument,
+              selections,
+              text,
+              lineAnnotations,
+              undoBoundary,
+              textOrder
+            )
+          : applyTextChangeToSelections(
+              textDocument,
+              selections,
+              {
+                start: textDocument.offsetAt(primarySelection.start),
+                end: textDocument.offsetAt(primarySelection.end),
+                text: Array.isArray(text) ? text.join(textDocument.eol) : text,
+              },
+              lineAnnotations,
+              undefined,
+              undoBoundary
+            ),
+      selections
+    );
   }
 
-  #deleteSelectionText(forward: boolean = false) {
-    const selections = this.#selections;
-    const textDocument = this.#editSession?.document;
+  // Runs a selection edit from selection.ts over the current selections and
+  // applies the resulting change.
+  #editSelections(
+    edit: (
+      textDocument: TextDocument<EType, LAnnotation>,
+      selections: EditorSelection[],
+      lineAnnotations: EditorLineAnnotation<EType, LAnnotation>[] | undefined
+    ) => { nextSelections: EditorSelection[]; change?: TextDocumentChange },
+    selections = this.#selections
+  ): void {
+    const textDocument = this.#document;
     if (selections === undefined || textDocument === undefined) {
       return;
     }
-
-    const { nextSelections, change } = applyDeleteCharacterToSelections<
-      EType,
-      LAnnotation
-    >(
+    const { nextSelections, change } = edit(
       textDocument,
       selections,
-      forward,
-      this.#lineAnnotations,
-      this.#metrics.tabSize
+      this.#lineAnnotations
     );
-    if (change !== undefined) {
-      this.#applyChange(
-        change,
-        nextSelections,
-        this.#applyChangeToLineAnnotations(change)
-      );
-    }
-  }
-
-  #deleteSoftLineBackward() {
-    const selections = this.#selections;
-    const textDocument = this.#editSession?.document;
-    if (selections === undefined || textDocument === undefined) {
-      return;
-    }
-    const getSoftLineStart = this.#isWrap
-      ? (line: number, character: number) => {
-          const wrapOffsets = this.#wrapLineTextOrWholeLine(line);
-          for (let w = 0; w + 1 < wrapOffsets.length; w++) {
-            const segmentStart = wrapOffsets[w];
-            const segmentEnd = wrapOffsets[w + 1];
-            if (character >= segmentStart && character <= segmentEnd) {
-              return segmentStart;
-            }
-          }
-          return 0;
-        }
-      : undefined;
-    const { nextSelections, change } = applyDeleteSoftLineBackwardToSelections<
-      EType,
-      LAnnotation
-    >(textDocument, selections, getSoftLineStart, this.#lineAnnotations);
-    if (change !== undefined) {
-      this.#applyChange(
-        change,
-        nextSelections,
-        this.#applyChangeToLineAnnotations(change)
-      );
-    }
-  }
-
-  #deleteWordBackward() {
-    const selections = this.#selections;
-    const textDocument = this.#editSession?.document;
-    if (selections === undefined || textDocument === undefined) {
-      return;
-    }
-    const { nextSelections, change } = applyDeleteWordBackwardToSelections<
-      EType,
-      LAnnotation
-    >(textDocument, selections, this.#lineAnnotations);
-    if (change !== undefined) {
-      this.#applyChange(
-        change,
-        nextSelections,
-        this.#applyChangeToLineAnnotations(change)
-      );
-    }
-  }
-
-  #deleteHardLineForward() {
-    const selections = this.#selections;
-    const textDocument = this.#editSession?.document;
-    if (selections === undefined || textDocument === undefined) {
-      return;
-    }
-    const { nextSelections, change } = applyDeleteHardLineForwardToSelections<
-      EType,
-      LAnnotation
-    >(textDocument, selections, this.#lineAnnotations);
-    if (change !== undefined) {
-      this.#applyChange(
-        change,
-        nextSelections,
-        this.#applyChangeToLineAnnotations(change)
-      );
-    }
-  }
-
-  #insertTranspose() {
-    const selections = this.#selections;
-    const textDocument = this.#editSession?.document;
-    if (selections === undefined || textDocument === undefined) {
-      return;
-    }
-    const { nextSelections, change } = applyTransposeToSelections<
-      EType,
-      LAnnotation
-    >(textDocument, selections, this.#lineAnnotations);
     if (change !== undefined) {
       this.#applyChange(
         change,
@@ -6892,9 +6429,9 @@ export class Editor<
     // layout, folds the now-empty ghost rows rather than rows keyed by pre-edit
     // lines. Every change ends the prediction anyway.
     if (this.#editPrediction != null) {
-      this.#cancelEditPrediction(true);
+      this.#cancelEditPrediction();
     }
-    const textDocument = this.#editSession?.document;
+    const textDocument = this.#document;
     if (textDocument !== undefined && this.#carets !== undefined) {
       for (const trackedCaret of this.#carets) {
         trackedCaret.anchorOffset = remapOffsetThroughEdits(
@@ -7102,8 +6639,8 @@ export class Editor<
               inline: 'nearest',
             });
           });
-        } else if (newSelections.length > 0) {
-          const pos = getCaretPosition(newSelections.at(-1)!);
+        } else if (revealTarget !== undefined) {
+          const pos = getCaretPosition(revealTarget);
           this.#scrollToLine(pos.line, pos.character);
         }
         this.focus({ preventScroll: true });
@@ -7132,7 +6669,7 @@ export class Editor<
         this.#lineAnnotations
       );
       if (nextLineAnnotations != null) {
-        this.#editSession?.document?.setLastUndoLineAnnotations(
+        this.#document?.setLastUndoLineAnnotations(
           this.#lineAnnotations,
           nextLineAnnotations
         );
@@ -7213,7 +6750,6 @@ export class Editor<
         const lineNumber = getLineNumberAttr(child);
         const lineType = child.dataset.lineType;
         if (
-          lineNumber !== undefined &&
           lineNumber === line + 1 &&
           lineType !== undefined &&
           isLineEditable(lineType)
@@ -7253,10 +6789,7 @@ export class Editor<
         diffsColumnNumberWidth.length > 2 &&
         diffsColumnNumberWidth.endsWith('px')
       ) {
-        this.#gutterWidthCache = parseInt(
-          diffsColumnNumberWidth.slice(0, -2),
-          10
-        );
+        this.#gutterWidthCache = parseInt(diffsColumnNumberWidth, 10);
       } else {
         this.#gutterWidthCache = this.#gutterElement.offsetWidth;
       }
@@ -7280,9 +6813,7 @@ export class Editor<
         diffsColumnContentWidth.length > 2 &&
         diffsColumnContentWidth.endsWith('px')
       ) {
-        this.#contentWidthCache = parseFloat(
-          diffsColumnContentWidth.slice(0, -2)
-        );
+        this.#contentWidthCache = parseFloat(diffsColumnContentWidth);
       } else {
         this.#contentWidthCache = this.#contentElement.offsetWidth;
       }
@@ -7312,15 +6843,12 @@ export class Editor<
   // Return the visual position for a character. Wrapped lines include the
   // visual line index so carets can be placed on the correct row.
   #getCharX(line: number, char: number): [x: number, wrapLine: number] {
-    if (
-      this.#lastAccessedCharX !== undefined &&
-      this.#lastAccessedCharX[0] === line &&
-      this.#lastAccessedCharX[1] === char
-    ) {
-      return [this.#lastAccessedCharX[2], this.#lastAccessedCharX[3]];
+    const last = this.#lastAccessedCharX;
+    if (last !== undefined && last[0] === line && last[1] === char) {
+      return [last[2], last[3]];
     }
 
-    const lineText = this.#editSession?.document?.getLineText(line);
+    const lineText = this.#document?.getLineText(line);
     const offsetLeft = this.#getGutterWidth() + this.#metrics.ch; // gutter width + inline padding (1ch)
     if (lineText === undefined || lineText.length === 0 || char <= 0) {
       return [offsetLeft + (this.#activeContentOffset?.left ?? 0), 0];
@@ -7330,19 +6858,10 @@ export class Editor<
       lineText,
       Math.min(char, lineText.length)
     );
-    const textBeforeCharacter = lineText.slice(0, boundedCharacter);
-    const asciiColumns = getExpandedAsciiTextColumns(
-      textBeforeCharacter,
-      this.#metrics.tabSize
-    );
-
-    let left = 0;
+    let left =
+      offsetLeft +
+      this.#metrics.segmentTextWidth(lineText, 0, boundedCharacter);
     let wrapLine = 0;
-    if (asciiColumns !== -1) {
-      left = offsetLeft + asciiColumns * this.#metrics.ch;
-    } else {
-      left = offsetLeft + this.#metrics.measureTextWidth(textBeforeCharacter);
-    }
 
     if (this.#isWrap) {
       const contentWidth = this.#getContentWidth();
@@ -7360,24 +6879,15 @@ export class Editor<
           return [left + (this.#activeContentOffset?.left ?? 0), 0];
         }
         for (let w = 0; w + 1 < wrapOffsets.length; w++) {
-          const segmentStart = wrapOffsets[w];
-          const segmentEnd = wrapOffsets[w + 1];
-          if (boundedCharacter <= segmentEnd) {
+          if (boundedCharacter <= wrapOffsets[w + 1]) {
             wrapLine = w;
-            const prefixInSegment = lineText.slice(
-              segmentStart,
-              boundedCharacter
-            );
-            const segmentAsciiColumns = getExpandedAsciiTextColumns(
-              prefixInSegment,
-              this.#metrics.tabSize
-            );
-            if (segmentAsciiColumns !== -1) {
-              left = offsetLeft + segmentAsciiColumns * this.#metrics.ch;
-            } else {
-              left =
-                offsetLeft + this.#metrics.measureTextWidth(prefixInSegment);
-            }
+            left =
+              offsetLeft +
+              this.#metrics.segmentTextWidth(
+                lineText,
+                wrapOffsets[w],
+                boundedCharacter
+              );
             break;
           }
         }
@@ -7418,7 +6928,7 @@ export class Editor<
       this.#wrapLineOffsetsCache.clear();
     }
 
-    const lineText = this.#editSession?.document?.getLineText(line);
+    const lineText = this.#document?.getLineText(line);
     if (lineText === undefined || lineText.length === 0) {
       const offsets = new Uint32Array([0]);
       this.#wrapLineOffsetsCache.set(line, offsets);
@@ -7518,11 +7028,8 @@ export class Editor<
         searchStart = low + 1;
       }
 
-      const offsets = new Uint32Array(starts.length + 1);
-      for (let i = 0; i < starts.length; i++) {
-        offsets[i] = starts[i]!;
-      }
-      offsets[starts.length] = lineText.length;
+      starts.push(lineText.length);
+      const offsets = Uint32Array.from(starts);
       this.#wrapLineOffsetsCache.set(line, offsets);
       return offsets;
     } finally {
@@ -7539,24 +7046,13 @@ export class Editor<
     if (offsets !== undefined) {
       return offsets;
     }
-    const length = this.#editSession?.document?.getLineText(line)?.length ?? 0;
+    const length = this.#document?.getLineText(line)?.length ?? 0;
     return Uint32Array.of(0, length);
-  }
-
-  // check if the web selection belongs to editor
-  #rangeBelongsToEditor({ startContainer, endContainer }: StaticRange) {
-    const contentEl = this.#contentElement;
-    if (contentEl === undefined) {
-      return false;
-    }
-    return (
-      contentEl.contains(startContainer) && contentEl.contains(endContainer)
-    );
   }
 
   // Check whether a line is visible in the currently rendered line window.
   #isLineVisible(line: number): boolean {
-    const lineCount = this.#editSession?.document?.lineCount ?? 0;
+    const lineCount = this.#document?.lineCount ?? 0;
     if (line < 0 || line >= lineCount) {
       return false;
     }
@@ -7564,44 +7060,11 @@ export class Editor<
   }
 }
 
-interface GetEditSessionProps<EType extends EditorType, LAnnotation, Caret> {
-  type: EType;
-  editStateKey: string | undefined;
-  owner: Editor<EType, LAnnotation, Caret>;
-  initialState: EditorInitialState<EType, LAnnotation> | undefined;
-  previousSession: ManagedEditSession<EType, LAnnotation> | undefined;
-}
-
-function getEditSession<EType extends EditorType, LAnnotation, Caret>({
-  type,
-  editStateKey,
-  owner,
-  initialState,
-  previousSession,
-}: GetEditSessionProps<EType, LAnnotation, Caret>): ManagedEditSession<
-  EType,
-  LAnnotation
-> {
-  if (initialState != null && initialState.type !== type) {
-    throw new TypeError(
-      `Editor: initialState: a ${initialState.type} state cannot initialize a ${type} editor`
-    );
-  }
-  const initialSession = initialState as
-    | ManagedEditSession<EType, LAnnotation>
-    | undefined;
-  if (editStateKey != null) {
-    return EditStateManager.activate(type, editStateKey, owner, initialSession);
-  }
-  if (initialSession != null) {
-    return initialSession;
-  }
-  if (previousSession != null) {
-    return previousSession;
-  }
-  return (
-    type === 'file' ? { type: 'file' } : { type: 'file-diff' }
-  ) as ManagedEditSession<EType, LAnnotation>;
+// The fixed end of a selection: its end when backward, otherwise its start.
+function getAnchorPosition(selection: EditorSelection): Position {
+  return selection.direction === DirectionBackward
+    ? selection.end
+    : selection.start;
 }
 
 // Grid tracks a rendered column child occupies: rows take one, empty buffers

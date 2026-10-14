@@ -1,5 +1,4 @@
 import {
-  type RefObject,
   useCallback,
   useContext,
   useEffect,
@@ -136,35 +135,25 @@ export function useFileInstance<LAnnotation, Caret>({
           'File: An instance should not already exist when a node is created'
         );
       }
-      if (simpleVirtualizer != null) {
-        instanceRef.current = new VirtualizedFile(
-          mergeFileOptions({
-            controlledSelection,
-            hasCustomHeader,
-            hasGutterRenderUtility,
-            onEditChange,
-            onEditComplete,
-            options,
-          }),
-          simpleVirtualizer,
-          metrics,
-          !disableWorkerPool ? poolManager : undefined,
-          true
-        );
-      } else {
-        instanceRef.current = new File(
-          mergeFileOptions({
-            controlledSelection,
-            hasCustomHeader,
-            hasGutterRenderUtility,
-            onEditChange,
-            onEditComplete,
-            options,
-          }),
-          !disableWorkerPool ? poolManager : undefined,
-          true
-        );
-      }
+      const mergedOptions = mergeFileOptions({
+        controlledSelection,
+        hasCustomHeader,
+        hasGutterRenderUtility,
+        onEditChange,
+        onEditComplete,
+        options,
+      });
+      const workerManager = !disableWorkerPool ? poolManager : undefined;
+      instanceRef.current =
+        simpleVirtualizer != null
+          ? new VirtualizedFile(
+              mergedOptions,
+              simpleVirtualizer,
+              metrics,
+              workerManager,
+              true
+            )
+          : new File(mergedOptions, workerManager, true);
       if (edit && disposeEditorRef.current == null) {
         disposeEditorRef.current = applyEdit(instanceRef.current, getEditor);
       }
@@ -208,14 +197,36 @@ export function useFileInstance<LAnnotation, Caret>({
       disposeEditorRef.current = null;
       disposeEditor();
     }
-    const resolved = resolveAcceptedValues(
-      file,
-      lineAnnotations,
-      acceptedCache
-    );
+    // Render the installed values in place of props that still match their
+    // stale counterparts. Any other prop value clears its half, and the ref
+    // clears once both halves have.
+    let resolvedFile = file;
+    let resolvedAnnotations = lineAnnotations;
+    const { current: accepted } = acceptedCache;
+    if (accepted != null) {
+      const { file: acceptedFiles, annotations: acceptedAnnotations } =
+        accepted;
+      if (acceptedFiles != null) {
+        if (areFileTargetsEqual(file, acceptedFiles.stale)) {
+          resolvedFile = acceptedFiles.installed;
+        } else {
+          accepted.file = null;
+        }
+      }
+      if (acceptedAnnotations != null) {
+        if (lineAnnotations === acceptedAnnotations.stale) {
+          resolvedAnnotations = acceptedAnnotations.installed;
+        } else {
+          accepted.annotations = null;
+        }
+      }
+      if (accepted.file == null && accepted.annotations == null) {
+        acceptedCache.current = null;
+      }
+    }
     void instance.render({
-      file: resolved.file,
-      lineAnnotations: resolved.lineAnnotations,
+      file: resolvedFile,
+      lineAnnotations: resolvedAnnotations,
       forceRender,
     });
     if (selectedLines !== undefined) {
@@ -227,11 +238,11 @@ export function useFileInstance<LAnnotation, Caret>({
     }
   });
 
-  const getHoveredLine = useCallback(():
-    | GetHoveredLineResult<'file'>
-    | undefined => {
-    return instanceRef.current?.getHoveredLine();
-  }, []);
+  const getHoveredLine = useCallback(
+    (): GetHoveredLineResult<'file'> | undefined =>
+      instanceRef.current?.getHoveredLine(),
+    []
+  );
   const getAnnotationSlotName = useCallback(
     (annotation: LineAnnotation<LAnnotation>): string =>
       instanceRef.current?.getAnnotationSlotName(annotation) ??
@@ -239,44 +250,6 @@ export function useFileInstance<LAnnotation, Caret>({
     []
   );
   return { ref, getHoveredLine, getAnnotationSlotName };
-}
-
-// Return the installed values in place of props that still match their stale
-// counterparts. Any other prop value clears its half, and the ref clears once
-// both halves have.
-function resolveAcceptedValues<LAnnotation>(
-  file: FileContents,
-  lineAnnotations: LineAnnotation<LAnnotation>[] | undefined,
-  acceptedCache: RefObject<AcceptedCompletion<LAnnotation> | null>
-): {
-  file: FileContents;
-  lineAnnotations: LineAnnotation<LAnnotation>[] | undefined;
-} {
-  const { current: accepted } = acceptedCache;
-  if (accepted == null) {
-    return { file, lineAnnotations };
-  }
-  const { file: acceptedFiles, annotations: acceptedAnnotations } = accepted;
-  let resolvedFile = file;
-  if (acceptedFiles != null) {
-    if (areFileTargetsEqual(file, acceptedFiles.stale)) {
-      resolvedFile = acceptedFiles.installed;
-    } else {
-      accepted.file = null;
-    }
-  }
-  let resolvedAnnotations = lineAnnotations;
-  if (acceptedAnnotations != null) {
-    if (lineAnnotations === acceptedAnnotations.stale) {
-      resolvedAnnotations = acceptedAnnotations.installed;
-    } else {
-      accepted.annotations = null;
-    }
-  }
-  if (accepted.file == null && accepted.annotations == null) {
-    acceptedCache.current = null;
-  }
-  return { file: resolvedFile, lineAnnotations: resolvedAnnotations };
 }
 
 interface MergeFileOptionsProps<LAnnotation, Caret> {

@@ -1,9 +1,4 @@
-import type {
-  ChangeContent,
-  ContextContent,
-  FileDiffMetadata,
-  Hunk,
-} from '../types';
+import type { FileDiffMetadata, Hunk } from '../types';
 import {
   getHunkSideEndBoundary,
   getHunkSideStartBoundary,
@@ -15,15 +10,6 @@ interface RegionResolutionTarget {
   endContentIndex: number;
   resolution: 'deletions' | 'additions' | 'both';
   indexesToDelete?: Set<number>;
-}
-
-interface CursorState {
-  nextAdditionLineIndex: number;
-  nextDeletionLineIndex: number;
-  nextAdditionStart: number;
-  nextDeletionStart: number;
-  splitLineCount: number;
-  unifiedLineCount: number;
 }
 
 export function resolveRegion(
@@ -53,7 +39,7 @@ export function resolveRegion(
     );
   }
 
-  const { hunks, additionLines, deletionLines } = diff;
+  const { hunks, additionLines, deletionLines, isPartial } = diff;
   const resolvedDiff: FileDiffMetadata = {
     ...diff,
     hunks: [],
@@ -67,120 +53,192 @@ export function resolveRegion(
         : undefined,
   };
 
-  const cursor: CursorState = {
-    nextAdditionLineIndex: 0,
-    nextDeletionLineIndex: 0,
-    nextAdditionStart: 1,
-    nextDeletionStart: 1,
-    splitLineCount: 0,
-    unifiedLineCount: 0,
-  };
+  // Where the next line lands in the resolved diff
+  let nextAdditionLineIndex = 0;
+  let nextDeletionLineIndex = 0;
+  let nextAdditionStart = 1;
+  let nextDeletionStart = 1;
+  let splitLineCount = 0;
+  let unifiedLineCount = 0;
   const updatesEOFState =
     hunkIndex === hunks.length - 1 &&
     endContentIndex === currentHunk.hunkContent.length - 1;
-  const shouldProcessCollapsedContext = !diff.isPartial;
 
   for (const [index, hunk] of hunks.entries()) {
-    processCollapsedContext(
-      diff,
-      resolvedDiff,
-      cursor,
-      getHunkSideStartBoundary(hunk.deletionStart, hunk.deletionCount) -
-        hunk.collapsedBefore,
-      getHunkSideStartBoundary(hunk.additionStart, hunk.additionCount) -
-        hunk.collapsedBefore,
-      hunk.collapsedBefore,
-      shouldProcessCollapsedContext
-    );
+    const { collapsedBefore } = hunk;
+    if (collapsedBefore > 0) {
+      // Partial patches track omitted context in `collapsedBefore`, but those
+      // lines do not exist in the diff's line arrays. Keep the virtual row
+      // counts and file positions in sync without inventing hidden lines.
+      if (!isPartial) {
+        pushCollapsedContextLines(
+          resolvedDiff,
+          deletionLines,
+          additionLines,
+          getHunkSideStartBoundary(hunk.deletionStart, hunk.deletionCount) -
+            collapsedBefore,
+          getHunkSideStartBoundary(hunk.additionStart, hunk.additionCount) -
+            collapsedBefore,
+          collapsedBefore
+        );
+        nextAdditionLineIndex += collapsedBefore;
+        nextDeletionLineIndex += collapsedBefore;
+      }
+      nextAdditionStart += collapsedBefore;
+      nextDeletionStart += collapsedBefore;
+      splitLineCount += collapsedBefore;
+      unifiedLineCount += collapsedBefore;
+    }
 
     const newHunk: Hunk = {
       ...hunk,
       hunkContent: [],
-      additionStart: cursor.nextAdditionStart,
-      deletionStart: cursor.nextDeletionStart,
-      additionLineIndex: cursor.nextAdditionLineIndex,
-      deletionLineIndex: cursor.nextDeletionLineIndex,
+      additionStart: nextAdditionStart,
+      deletionStart: nextDeletionStart,
+      additionLineIndex: nextAdditionLineIndex,
+      deletionLineIndex: nextDeletionLineIndex,
       additionCount: 0,
       deletionCount: 0,
       deletionLines: 0,
       additionLines: 0,
-      splitLineStart: cursor.splitLineCount,
-      unifiedLineStart: cursor.unifiedLineCount,
+      splitLineStart: splitLineCount,
+      unifiedLineStart: unifiedLineCount,
       splitLineCount: 0,
       unifiedLineCount: 0,
     };
 
     for (const [contentIndex, content] of hunk.hunkContent.entries()) {
-      // If we are outside of the targeted hunk or content region
-      if (
-        index !== hunkIndex ||
-        contentIndex < startContentIndex ||
-        contentIndex > endContentIndex
-      ) {
-        pushContentLinesToDiff(
-          content,
-          resolvedDiff,
-          deletionLines,
-          additionLines
-        );
-        const newContent = {
-          ...content,
-          additionLineIndex: cursor.nextAdditionLineIndex,
-          deletionLineIndex: cursor.nextDeletionLineIndex,
-        };
-        newHunk.hunkContent.push(newContent);
-        advanceCursor(newContent, cursor, newHunk);
-      }
+      const isTargeted =
+        index === hunkIndex &&
+        contentIndex >= startContentIndex &&
+        contentIndex <= endContentIndex;
       // If we are at an index to delete, replace with an empty context node
-      else if (indexesToDelete.has(contentIndex)) {
+      if (isTargeted && indexesToDelete.has(contentIndex)) {
         newHunk.hunkContent.push({
           type: 'context',
           lines: 0,
-          deletionLineIndex: cursor.nextDeletionLineIndex,
-          additionLineIndex: cursor.nextAdditionLineIndex,
+          deletionLineIndex: nextDeletionLineIndex,
+          additionLineIndex: nextAdditionLineIndex,
         });
+        continue;
       }
+
+      let lines: number;
       // There's nothing to `resolve` with context nodes, so just push them as
       // they are
-      else if (content.type === 'context') {
-        pushContentLinesToDiff(
-          content,
-          resolvedDiff,
-          deletionLines,
-          additionLines
-        );
-        const newContent: ContextContent = {
+      if (content.type === 'context') {
+        for (let i = 0; i < content.lines; i++) {
+          const line = additionLines[content.additionLineIndex + i];
+          if (line == null) {
+            console.error({ additionLines, content, i });
+            throw new Error(
+              'pushContentLinesToDiff: Context line does not exist'
+            );
+          }
+          resolvedDiff.deletionLines.push(line);
+          resolvedDiff.additionLines.push(line);
+        }
+        newHunk.hunkContent.push({
           ...content,
-          deletionLineIndex: cursor.nextDeletionLineIndex,
-          additionLineIndex: cursor.nextAdditionLineIndex,
-        };
-        newHunk.hunkContent.push(newContent);
-        advanceCursor(newContent, cursor, newHunk);
+          additionLineIndex: nextAdditionLineIndex,
+          deletionLineIndex: nextDeletionLineIndex,
+        });
+        lines = content.lines;
       }
-      // Looks like we have a change to resolve and push
+      // Changes outside of the targeted region are pushed as they are
+      else if (!isTargeted) {
+        const { additions, deletions } = content;
+        for (let i = 0; i < Math.max(deletions, additions); i++) {
+          if (i < deletions) {
+            const line = deletionLines[content.deletionLineIndex + i];
+            if (line == null) {
+              console.error({ deletionLines, content, i });
+              throw new Error(
+                'pushContentLinesToDiff: Deletion line does not exist'
+              );
+            }
+            resolvedDiff.deletionLines.push(line);
+          }
+          if (i < additions) {
+            const line = additionLines[content.additionLineIndex + i];
+            if (line == null) {
+              console.error({ additionLines, content, i });
+              throw new Error(
+                'pushContentLinesToDiff: Addition line does not exist'
+              );
+            }
+            resolvedDiff.additionLines.push(line);
+          }
+        }
+        newHunk.hunkContent.push({
+          ...content,
+          additionLineIndex: nextAdditionLineIndex,
+          deletionLineIndex: nextDeletionLineIndex,
+        });
+        nextAdditionLineIndex += additions;
+        nextDeletionLineIndex += deletions;
+        nextAdditionStart += additions;
+        nextDeletionStart += deletions;
+        splitLineCount += Math.max(deletions, additions);
+        unifiedLineCount += deletions + additions;
+        newHunk.deletionLines += deletions;
+        newHunk.additionLines += additions;
+        continue;
+      }
+      // Looks like we have a change to resolve, the kept lines become context
       else {
-        pushResolveLinesToDiff(
-          resolution,
-          content,
-          resolvedDiff,
-          deletionLines,
-          additionLines
-        );
-        const newContent: ContextContent = {
+        if (resolution === 'deletions' || resolution === 'both') {
+          for (let i = 0; i < content.deletions; i++) {
+            const line = deletionLines[content.deletionLineIndex + i];
+            if (line == null) {
+              console.error({ deletionLines, content, i });
+              throw new Error(
+                'pushResolveLinesToDiff: Deletion line does not exist'
+              );
+            }
+            resolvedDiff.deletionLines.push(line);
+            resolvedDiff.additionLines.push(line);
+          }
+        }
+        if (resolution === 'additions' || resolution === 'both') {
+          for (let i = 0; i < content.additions; i++) {
+            const line = additionLines[content.additionLineIndex + i];
+            if (line == null) {
+              console.error({ additionLines, content, i });
+              throw new Error(
+                'pushResolveLinesToDiff: Addition line does not exist'
+              );
+            }
+            resolvedDiff.deletionLines.push(line);
+            resolvedDiff.additionLines.push(line);
+          }
+        }
+        lines =
+          resolution === 'deletions'
+            ? content.deletions
+            : resolution === 'additions'
+              ? content.additions
+              : content.deletions + content.additions;
+        newHunk.hunkContent.push({
           type: 'context',
-          lines:
-            resolution === 'deletions'
-              ? content.deletions
-              : resolution === 'additions'
-                ? content.additions
-                : content.deletions + content.additions,
-          deletionLineIndex: cursor.nextDeletionLineIndex,
-          additionLineIndex: cursor.nextAdditionLineIndex,
-        };
-        newHunk.hunkContent.push(newContent);
-        advanceCursor(newContent, cursor, newHunk);
+          lines,
+          deletionLineIndex: nextDeletionLineIndex,
+          additionLineIndex: nextAdditionLineIndex,
+        });
       }
+      nextAdditionLineIndex += lines;
+      nextDeletionLineIndex += lines;
+      nextAdditionStart += lines;
+      nextDeletionStart += lines;
+      splitLineCount += lines;
+      unifiedLineCount += lines;
     }
+
+    // Everything the hunk consumed since its start
+    newHunk.additionCount = nextAdditionStart - newHunk.additionStart;
+    newHunk.deletionCount = nextDeletionStart - newHunk.deletionStart;
+    newHunk.splitLineCount = splitLineCount - newHunk.splitLineStart;
+    newHunk.unifiedLineCount = unifiedLineCount - newHunk.unifiedLineStart;
 
     if (index === hunkIndex && updatesEOFState) {
       const noEOFCR =
@@ -193,13 +251,13 @@ export function resolveRegion(
 
     if (newHunk.additionCount === 0) {
       newHunk.additionStart--;
-      if (!diff.isPartial) {
+      if (!isPartial) {
         newHunk.additionLineIndex--;
       }
     }
     if (newHunk.deletionCount === 0) {
       newHunk.deletionStart--;
-      if (!diff.isPartial) {
+      if (!isPartial) {
         newHunk.deletionLineIndex--;
       }
     }
@@ -208,7 +266,7 @@ export function resolveRegion(
   }
 
   const finalHunk = hunks.at(-1);
-  if (finalHunk != null && !diff.isPartial) {
+  if (finalHunk != null && !isPartial) {
     const finalDeletionEnd = getHunkSideEndBoundary(
       finalHunk.deletionStart,
       finalHunk.deletionCount
@@ -229,12 +287,12 @@ export function resolveRegion(
       finalAdditionEnd,
       trailingContext
     );
-    cursor.splitLineCount += trailingContext;
-    cursor.unifiedLineCount += trailingContext;
+    splitLineCount += trailingContext;
+    unifiedLineCount += trailingContext;
   }
 
-  resolvedDiff.splitLineCount = cursor.splitLineCount;
-  resolvedDiff.unifiedLineCount = cursor.unifiedLineCount;
+  resolvedDiff.splitLineCount = splitLineCount;
+  resolvedDiff.unifiedLineCount = unifiedLineCount;
 
   return resolvedDiff;
 }
@@ -257,148 +315,5 @@ function pushCollapsedContextLines(
     }
     diff.deletionLines.push(deletionLine);
     diff.additionLines.push(additionLine);
-  }
-}
-
-// Partial patches track omitted context in `collapsedBefore`, but those lines do
-// not exist in the diff's line arrays. Keep the virtual row counts and file
-// positions in sync without inventing hidden lines.
-function processCollapsedContext(
-  sourceDiff: FileDiffMetadata,
-  resolvedDiff: FileDiffMetadata,
-  cursor: CursorState,
-  deletionLineIndex: number,
-  additionLineIndex: number,
-  lineCount: number,
-  shouldProcessContent: boolean
-) {
-  if (lineCount <= 0) {
-    return;
-  }
-
-  if (shouldProcessContent) {
-    pushCollapsedContextLines(
-      resolvedDiff,
-      sourceDiff.deletionLines,
-      sourceDiff.additionLines,
-      deletionLineIndex,
-      additionLineIndex,
-      lineCount
-    );
-    cursor.nextAdditionLineIndex += lineCount;
-    cursor.nextDeletionLineIndex += lineCount;
-  }
-
-  cursor.nextAdditionStart += lineCount;
-  cursor.nextDeletionStart += lineCount;
-  cursor.splitLineCount += lineCount;
-  cursor.unifiedLineCount += lineCount;
-}
-
-function pushContentLinesToDiff(
-  content: ContextContent | ChangeContent,
-  diff: FileDiffMetadata,
-  deletionLines: string[],
-  additionLines: string[]
-) {
-  if (content.type === 'context') {
-    for (let i = 0; i < content.lines; i++) {
-      const line = additionLines[content.additionLineIndex + i];
-      if (line == null) {
-        console.error({ additionLines, content, i });
-        throw new Error('pushContentLinesToDiff: Context line does not exist');
-      }
-      diff.deletionLines.push(line);
-      diff.additionLines.push(line);
-    }
-  } else {
-    const len = Math.max(content.deletions, content.additions);
-    for (let i = 0; i < len; i++) {
-      if (i < content.deletions) {
-        const line = deletionLines[content.deletionLineIndex + i];
-        if (line == null) {
-          console.error({ deletionLines, content, i });
-          throw new Error(
-            'pushContentLinesToDiff: Deletion line does not exist'
-          );
-        }
-        diff.deletionLines.push(line);
-      }
-      if (i < content.additions) {
-        const line = additionLines[content.additionLineIndex + i];
-        if (line == null) {
-          console.error({ additionLines, content, i });
-          throw new Error(
-            'pushContentLinesToDiff: Addition line does not exist'
-          );
-        }
-        diff.additionLines.push(line);
-      }
-    }
-  }
-}
-
-function pushResolveLinesToDiff(
-  resolution: 'deletions' | 'additions' | 'both',
-  content: ChangeContent,
-  diff: FileDiffMetadata,
-  deletionLines: string[],
-  additionLines: string[]
-) {
-  if (resolution === 'deletions' || resolution === 'both') {
-    for (let i = 0; i < content.deletions; i++) {
-      const line = deletionLines[content.deletionLineIndex + i];
-      if (line == null) {
-        console.error({ deletionLines, content, i });
-        throw new Error('pushResolveLinesToDiff: Deletion line does not exist');
-      }
-      diff.deletionLines.push(line);
-      diff.additionLines.push(line);
-    }
-  }
-  if (resolution === 'additions' || resolution === 'both') {
-    for (let i = 0; i < content.additions; i++) {
-      const line = additionLines[content.additionLineIndex + i];
-      if (line == null) {
-        console.error({ additionLines, content, i });
-        throw new Error('pushResolveLinesToDiff: Addition line does not exist');
-      }
-      diff.deletionLines.push(line);
-      diff.additionLines.push(line);
-    }
-  }
-}
-
-function advanceCursor(
-  content: ChangeContent | ContextContent,
-  cursor: CursorState,
-  hunk: Hunk
-) {
-  if (content.type === 'context') {
-    cursor.nextAdditionLineIndex += content.lines;
-    cursor.nextDeletionLineIndex += content.lines;
-    cursor.nextAdditionStart += content.lines;
-    cursor.nextDeletionStart += content.lines;
-    cursor.splitLineCount += content.lines;
-    cursor.unifiedLineCount += content.lines;
-
-    hunk.additionCount += content.lines;
-    hunk.deletionCount += content.lines;
-    hunk.splitLineCount += content.lines;
-    hunk.unifiedLineCount += content.lines;
-  } else {
-    cursor.nextAdditionLineIndex += content.additions;
-    cursor.nextDeletionLineIndex += content.deletions;
-    cursor.nextAdditionStart += content.additions;
-    cursor.nextDeletionStart += content.deletions;
-    cursor.splitLineCount += Math.max(content.deletions, content.additions);
-    cursor.unifiedLineCount += content.deletions + content.additions;
-
-    hunk.deletionCount += content.deletions;
-    hunk.deletionLines += content.deletions;
-    hunk.additionCount += content.additions;
-    hunk.additionLines += content.additions;
-    hunk.splitLineCount += Math.max(content.deletions, content.additions);
-    hunk.unifiedLineCount += content.deletions + content.additions;
   }
 }

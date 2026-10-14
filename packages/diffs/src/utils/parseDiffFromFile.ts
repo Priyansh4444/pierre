@@ -4,8 +4,6 @@ import type { FileContents, FileDiffMetadata } from '../types';
 import { composeCacheKey } from './composeCacheKey';
 import { processFile } from './parsePatchFiles';
 
-const MISSING_FILE_NAME = '/dev/null';
-
 /**
  * Parses a diff from two file contents objects.
  *
@@ -24,8 +22,8 @@ export function parseDiffFromFile(
     );
   }
 
-  const resolvedOldFile = oldFile ?? createMissingFile();
-  const resolvedNewFile = newFile ?? createMissingFile();
+  const resolvedOldFile = oldFile ?? { name: '/dev/null', contents: '' };
+  const resolvedNewFile = newFile ?? { name: '/dev/null', contents: '' };
   const patch = createTwoFilesPatch(
     resolvedOldFile.name,
     resolvedNewFile.name,
@@ -37,13 +35,10 @@ export function parseDiffFromFile(
   );
 
   const fileData = processFile(patch, {
-    cacheKey: (() => {
-      const oldCacheKey = oldFile?.cacheKey;
-      const newCacheKey = newFile?.cacheKey;
-      return oldCacheKey != null && newCacheKey != null
-        ? composeCacheKey('diff', oldCacheKey, newCacheKey)
-        : undefined;
-    })(),
+    cacheKey:
+      oldFile?.cacheKey != null && newFile?.cacheKey != null
+        ? composeCacheKey('diff', oldFile.cacheKey, newFile.cacheKey)
+        : undefined,
     oldFile: resolvedOldFile,
     newFile: resolvedNewFile,
     throwOnError,
@@ -68,8 +63,4 @@ export function parseDiffFromFile(
     fileData.lang = language;
   }
   return fileData;
-}
-
-function createMissingFile(): FileContents {
-  return { name: MISSING_FILE_NAME, contents: '' };
 }

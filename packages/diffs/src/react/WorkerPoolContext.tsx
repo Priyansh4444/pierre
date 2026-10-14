@@ -35,15 +35,11 @@ export function WorkerPoolContextProvider({
   poolOptions,
   highlighterOptions,
 }: WorkerPoolContextProps): React.JSX.Element {
-  const [poolManager] = useState(() => {
-    if (typeof window === 'undefined') {
-      return undefined;
-    }
-    return getOrCreateWorkerPoolSingleton({
-      poolOptions,
-      highlighterOptions,
-    });
-  });
+  const [poolManager] = useState(() =>
+    typeof window !== 'undefined'
+      ? getOrCreateWorkerPoolSingleton({ poolOptions, highlighterOptions })
+      : undefined
+  );
   // We use insertion effect for the instance counting to essentially debounce
   // potentially conflicting mount/unmounts
   useInsertionEffect(() => {

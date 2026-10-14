@@ -17,14 +17,8 @@ export function getDiffFileInput(
       `${context}: Pass null for an intentionally missing oldFile or newFile side`
     );
   }
-  if (oldFile === null) {
-    if (newFile === null) {
-      throw new Error(`${context}: You must pass oldFile, newFile, or both`);
-    }
-    return { oldFile, newFile };
+  if (oldFile === null && newFile === null) {
+    throw new Error(`${context}: You must pass oldFile, newFile, or both`);
   }
-  if (newFile === null) {
-    return { oldFile, newFile };
-  }
-  return { oldFile, newFile };
+  return { oldFile, newFile } as DiffFileInput;
 }

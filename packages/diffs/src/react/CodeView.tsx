@@ -35,7 +35,6 @@ import {
   type CodeViewMode,
   type CodeViewModeItemMap,
   type CodeViewOptions,
-  type CodeViewRenderedItem,
   type CodeViewScrollTarget,
   type CodeViewSlotSnapshot,
   type DiffLineAnnotation,
@@ -274,17 +273,15 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
       if (contextCreateEditor == null) {
         throw new Error('CodeView: EditContext is not attached');
       }
-
-      const resolvedOptions = {
-        ...editorOptions,
-        ...options,
-      } as EditorOptions<EType, LAnnotation, Caret>;
-      const editor = contextCreateEditor(
+      return contextCreateEditor(
         editorType,
-        resolvedOptions,
+        { ...editorOptions, ...options } as EditorOptions<
+          EType,
+          LAnnotation,
+          Caret
+        >,
         editStateKey
       );
-      return editor;
     }
   );
   const emitItemEditChange = useStableCallback(
@@ -303,45 +300,85 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
     ) => onItemEditComplete?.(event, item, nextItem) ?? 'reject'
   );
 
-  const managedOptions = useMemo(
-    () =>
-      createManagedCodeViewOptions({
-        options,
-        hasCustomHeader,
-        hasGutterRenderer,
-        hasCodeViewHeader,
-        hasCodeViewFooter,
-        onSelectedLinesChange:
-          onSelectedLinesChange != null ? emitSelectedLinesChange : undefined,
-        controlledSelection,
-        getEditStateKey,
-        createEditor: contextCreateEditor != null ? createEditor : undefined,
-        onItemEditChange:
-          onItemEditChange != null ? emitItemEditChange : undefined,
-        onItemEditComplete:
-          onItemEditComplete != null ? emitItemEditComplete : undefined,
-      }),
-    [
-      contextCreateEditor,
+  const managedOptions = useMemo(() => {
+    const managed: CodeViewOptions<LAnnotation, Caret> = {
+      ...options,
       controlledSelection,
-      createEditor,
-      emitItemEditChange,
-      emitItemEditComplete,
-      emitSelectedLinesChange,
-      hasCodeViewFooter,
-      hasCodeViewHeader,
-      hasCustomHeader,
-      hasGutterRenderer,
-      getEditStateKey,
-      onItemEditChange,
-      onItemEditComplete,
-      onSelectedLinesChange,
-      options,
-    ]
-  );
+      onSelectedLinesChange:
+        onSelectedLinesChange != null ? emitSelectedLinesChange : undefined,
+      createEditor: contextCreateEditor != null ? createEditor : undefined,
+    };
+    if (getEditStateKey != null) {
+      managed.getEditStateKey = getEditStateKey;
+    }
+    // Prop-level editor callbacks win over their options-object counterparts,
+    // but an absent prop must not clobber a value provided via `options`.
+    if (onItemEditChange != null) {
+      managed.onItemEditChange = emitItemEditChange;
+    }
+    if (onItemEditComplete != null) {
+      managed.onItemEditComplete = emitItemEditComplete;
+    }
+    // The imperative CodeView uses these callbacks' presence to switch headers
+    // into custom-slot mode and to create the gutter utility slot and the
+    // header/footer hosts. React portals provide the actual content, so these
+    // placeholders intentionally return nothing.
+    if (hasCustomHeader) {
+      managed.renderCustomHeader = noopRender;
+    }
+    if (hasGutterRenderer) {
+      managed.renderGutterUtility = noopRender;
+    }
+    if (hasCodeViewHeader) {
+      managed.renderCodeViewHeader = noopRender;
+    }
+    if (hasCodeViewFooter) {
+      managed.renderCodeViewFooter = noopRender;
+    }
+    return managed;
+  }, [
+    contextCreateEditor,
+    controlledSelection,
+    createEditor,
+    emitItemEditChange,
+    emitItemEditComplete,
+    emitSelectedLinesChange,
+    hasCodeViewFooter,
+    hasCodeViewHeader,
+    hasCustomHeader,
+    hasGutterRenderer,
+    getEditStateKey,
+    onItemEditChange,
+    onItemEditComplete,
+    onSelectedLinesChange,
+    options,
+  ]);
 
-  const [slotContentStore] = useState<ManagedContentStore<LAnnotation, Caret>>(
-    () => createSlotContentStore()
+  const [slotContentStore] = useState(
+    (): ManagedContentStore<LAnnotation, Caret> => {
+      let snapshot: CodeViewSlotSnapshot<LAnnotation, Caret> | undefined;
+      const listeners = new Set<() => void>();
+      return {
+        getSnapshot() {
+          return snapshot;
+        },
+        publish(nextSnapshot) {
+          if (areManagedSnapshotsEqual(snapshot, nextSnapshot)) {
+            return;
+          }
+          snapshot = nextSnapshot;
+          for (const listener of listeners) {
+            listener();
+          }
+        },
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
+        },
+      };
+    }
   );
   const [, forceUpdate] = useState<unknown>({});
 
@@ -404,14 +441,13 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
         !hasCodeViewFooter
       ) {
         return undefined;
-      } else {
-        return {
-          hasHeaderRenderers,
-          hasAnnotationRenderer,
-          hasGutterRenderer,
-          onSnapshotChange,
-        };
       }
+      return {
+        hasHeaderRenderers,
+        hasAnnotationRenderer,
+        hasGutterRenderer,
+        onSnapshotChange,
+      };
     }, [
       onSnapshotChange,
       hasAnnotationRenderer,
@@ -458,15 +494,18 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
 
       if (controlled) {
         if (controlledItems !== prevItems) {
-          if (areItemListsEqual(prevItems, controlledItems)) {
-            cachedDataRef.current.items = controlledItems;
-          } else if (isAppendOnlyItemUpdate(prevItems, controlledItems)) {
-            cachedDataRef.current.items = controlledItems;
-            instance.addItems(controlledItems.slice(prevItems.length));
-          } else {
-            cachedDataRef.current.items = controlledItems;
+          cachedDataRef.current.items = controlledItems;
+          // Same items, or the same items with new ones appended, keep the
+          // current records; anything else reconciles the whole list.
+          const keepsPrefix =
+            prevItems != null &&
+            controlledItems.length >= prevItems.length &&
+            prevItems.every((item, index) => item === controlledItems[index]);
+          if (!keepsPrefix) {
             instance.setItems(controlledItems);
             shouldRender = true;
+          } else if (controlledItems.length > prevItems.length) {
+            instance.addItems(controlledItems.slice(prevItems.length));
           }
         }
       }
@@ -526,18 +565,17 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
             'CodeView.addItems: no valid instance to append items with',
             items
           );
-        } else {
-          instance.addItems(items);
+          return;
         }
+        instance.addItems(items);
       },
       getItem(id) {
         const { instance } = cachedDataRef.current;
         if (instance == null) {
           console.error('CodeView.getItem: no valid instance exists', id);
           return undefined;
-        } else {
-          return instance.getItem(id);
         }
+        return instance.getItem(id);
       },
       removeItem(id) {
         const { controlled, instance } = cachedDataRef.current;
@@ -586,9 +624,9 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
             'CodeView.scrollTo: no valid instance to scroll with',
             target
           );
-        } else {
-          instance.scrollTo(target);
+          return;
         }
+        instance.scrollTo(target);
       },
       setSelectedLines(selection) {
         const { instance } = cachedDataRef.current;
@@ -597,19 +635,18 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
             'CodeView.setSelectedLines: no valid instance to update selection with',
             selection
           );
-        } else {
-          instance.setSelectedLines(selection, { notify: false });
-          emitSelectedLinesChange(selection);
+          return;
         }
+        instance.setSelectedLines(selection, { notify: false });
+        emitSelectedLinesChange(selection);
       },
       getSelectedLines() {
         const { instance } = cachedDataRef.current;
         if (instance == null) {
           console.error('CodeView.getSelectedLines: no valid instance exists');
           return null;
-        } else {
-          return instance.getSelectedLines();
         }
+        return instance.getSelectedLines();
       },
       clearSelectedLines() {
         const { instance } = cachedDataRef.current;
@@ -617,10 +654,10 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
           console.error(
             'CodeView.clearSelectedLines: no valid instance to update selection with'
           );
-        } else {
-          instance.clearSelectedLines({ notify: false });
-          emitSelectedLinesChange(null);
+          return;
         }
+        instance.clearSelectedLines({ notify: false });
+        emitSelectedLinesChange(null);
       },
       getEditor(id) {
         const { instance } = cachedDataRef.current;
@@ -661,44 +698,6 @@ function CodeViewInner<LAnnotation = undefined, Caret = undefined>(
 // React was a mistake
 export const CodeView = forwardRef(CodeViewInner) as CodeViewComponent;
 
-function isAppendOnlyItemUpdate<LAnnotation>(
-  previousItems: readonly CodeViewItem<LAnnotation>[] | undefined,
-  nextItems: readonly CodeViewItem<LAnnotation>[]
-): previousItems is readonly CodeViewItem<LAnnotation>[] {
-  if (previousItems == null || nextItems.length <= previousItems.length) {
-    return false;
-  }
-
-  if (previousItems.length === 0) {
-    return true;
-  }
-
-  for (let index = 0; index < previousItems.length; index++) {
-    if (nextItems[index] !== previousItems[index]) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-function areItemListsEqual<LAnnotation>(
-  previousItems: readonly CodeViewItem<LAnnotation>[] | undefined,
-  nextItems: readonly CodeViewItem<LAnnotation>[]
-): boolean {
-  if (previousItems == null || previousItems.length !== nextItems.length) {
-    return false;
-  }
-
-  for (let index = 0; index < previousItems.length; index++) {
-    if (previousItems[index] !== nextItems[index]) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 function assertUncontrolledCodeViewAction(
   controlled: boolean,
   action: string
@@ -710,139 +709,6 @@ function assertUncontrolledCodeViewAction(
   throw new Error(
     `CodeView.${action} cannot be used when CodeView is controlled. Use initialItems for imperative item updates.`
   );
-}
-
-function createSlotContentStore<LAnnotation, Caret>(): ManagedContentStore<
-  LAnnotation,
-  Caret
-> {
-  let snapshot: CodeViewSlotSnapshot<LAnnotation, Caret> | undefined;
-  const listeners = new Set<() => void>();
-
-  return {
-    getSnapshot() {
-      return snapshot;
-    },
-    publish(nextSnapshot) {
-      if (areManagedSnapshotsEqual(snapshot, nextSnapshot)) {
-        return;
-      }
-
-      snapshot = nextSnapshot;
-      for (const listener of listeners) {
-        listener();
-      }
-    },
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-  };
-}
-
-interface CreateManagedCodeViewOptionsProps<LAnnotation, Caret> {
-  options: CodeViewReactOptions<LAnnotation, Caret> | undefined;
-  hasCustomHeader: boolean;
-  hasGutterRenderer: boolean;
-  hasCodeViewHeader: boolean;
-  hasCodeViewFooter: boolean;
-  onSelectedLinesChange?(selection: CodeViewLineSelection | null): void;
-  controlledSelection: boolean;
-  getEditStateKey: CodeViewOptions<LAnnotation, Caret>['getEditStateKey'];
-  createEditor: CodeViewOptions<LAnnotation, Caret>['createEditor'];
-  onItemEditChange: CodeViewOptions<LAnnotation, Caret>['onItemEditChange'];
-  onItemEditComplete: CodeViewOptions<LAnnotation, Caret>['onItemEditComplete'];
-}
-
-function createManagedCodeViewOptions<LAnnotation, Caret>({
-  options,
-  hasCustomHeader,
-  hasGutterRenderer,
-  hasCodeViewHeader,
-  hasCodeViewFooter,
-  onSelectedLinesChange,
-  controlledSelection,
-  getEditStateKey,
-  createEditor,
-  onItemEditChange,
-  onItemEditComplete,
-}: CreateManagedCodeViewOptionsProps<LAnnotation, Caret>): CodeViewOptions<
-  LAnnotation,
-  Caret
-> {
-  const managedOptions: CodeViewOptions<LAnnotation, Caret> = {
-    ...options,
-    controlledSelection,
-    onSelectedLinesChange,
-    createEditor,
-  };
-
-  if (getEditStateKey != null) {
-    managedOptions.getEditStateKey = getEditStateKey;
-  }
-
-  // Prop-level editor callbacks win over their options-object counterparts,
-  // but an absent prop must not clobber a value provided via `options`.
-  if (onItemEditChange != null) {
-    managedOptions.onItemEditChange = onItemEditChange;
-  }
-  if (onItemEditComplete != null) {
-    managedOptions.onItemEditComplete = onItemEditComplete;
-  }
-
-  // The imperative CodeView adapters use this callback's presence to
-  // switch file and diff headers into custom-slot mode. React portals
-  // provide the actual header content, so this placeholder
-  // intentionally returns nothing.
-  if (hasCustomHeader) {
-    managedOptions.renderCustomHeader = noopRender;
-  }
-
-  // The imperative CodeView adapters use this callback's presence to
-  // create the custom gutter utility slot. React portals provide the
-  // actual content, so this placeholder intentionally returns nothing.
-  if (hasGutterRenderer) {
-    managedOptions.renderGutterUtility = noopRender;
-  }
-
-  // The imperative CodeView adapters use these callbacks' presence to create the
-  // header/footer host elements. React portals the actual content into them (via
-  // the slot snapshot), so these placeholders intentionally return nothing.
-  if (hasCodeViewHeader) {
-    managedOptions.renderCodeViewHeader = noopRender;
-  }
-  if (hasCodeViewFooter) {
-    managedOptions.renderCodeViewFooter = noopRender;
-  }
-
-  return managedOptions;
-}
-
-interface RenderCodeViewItemChildrenProps<LAnnotation, Caret> {
-  renderedItem: CodeViewRenderedItem<LAnnotation, Caret>;
-  renderCustomHeader: CodeViewBaseProps<
-    LAnnotation,
-    Caret
-  >['renderCustomHeader'];
-  renderHeaderPrefix: CodeViewBaseProps<
-    LAnnotation,
-    Caret
-  >['renderHeaderPrefix'];
-  renderHeaderFilenameSuffix: CodeViewBaseProps<
-    LAnnotation,
-    Caret
-  >['renderHeaderFilenameSuffix'];
-  renderHeaderMetadata: CodeViewBaseProps<
-    LAnnotation,
-    Caret
-  >['renderHeaderMetadata'];
-  renderAnnotation: CodeViewBaseProps<LAnnotation, Caret>['renderAnnotation'];
-  renderGutterUtility: CodeViewBaseProps<
-    LAnnotation,
-    Caret
-  >['renderGutterUtility'];
 }
 
 interface SlotPortalsProps<LAnnotation, Caret> {
@@ -907,23 +773,63 @@ const SlotPortals = memo(function SlotPortals<LAnnotation, Caret>({
   // lol... we need to pre-render everything for items, headers and footers to
   // not trigger needless renders while scrolling
   const renderedItems = useMemo(
-    () => {
-      return snapshot?.items?.map((renderedItem) =>
-        createPortal(
-          renderCodeViewItemChildren({
-            renderedItem,
-            renderCustomHeader,
-            renderHeaderPrefix,
-            renderHeaderFilenameSuffix,
-            renderHeaderMetadata,
-            renderAnnotation,
-            renderGutterUtility,
-          }),
+    () =>
+      snapshot?.items?.map((renderedItem) => {
+        const { item } = renderedItem;
+        // The slot renderers, bound to this item.
+        const renderers = {
+          renderCustomHeader:
+            renderCustomHeader != null
+              ? () => renderCustomHeader(item)
+              : undefined,
+          renderHeaderPrefix:
+            renderHeaderPrefix != null
+              ? () => renderHeaderPrefix(item)
+              : undefined,
+          renderHeaderFilenameSuffix:
+            renderHeaderFilenameSuffix != null
+              ? () => renderHeaderFilenameSuffix(item)
+              : undefined,
+          renderHeaderMetadata:
+            renderHeaderMetadata != null
+              ? () => renderHeaderMetadata(item)
+              : undefined,
+          renderAnnotation:
+            renderAnnotation != null
+              ? (
+                  annotation:
+                    | LineAnnotation<LAnnotation>
+                    | DiffLineAnnotation<LAnnotation>
+                ) => renderAnnotation(annotation, item)
+              : undefined,
+          renderGutterUtility:
+            renderGutterUtility != null
+              ? (getHoveredLine: CodeViewGutterUtilityGetter) =>
+                  renderGutterUtility(getHoveredLine, item)
+              : undefined,
+        };
+        return createPortal(
+          renderedItem.type === 'diff'
+            ? renderDiffChildren({
+                ...renderers,
+                fileDiff: renderedItem.item.fileDiff,
+                lineAnnotations: renderedItem.item.annotations,
+                getHoveredLine: renderedItem.instance.getHoveredLine,
+                getAnnotationSlotName:
+                  renderedItem.instance.getAnnotationSlotName,
+              })
+            : renderFileChildren({
+                ...renderers,
+                file: renderedItem.item.file,
+                lineAnnotations: renderedItem.item.annotations,
+                getHoveredLine: renderedItem.instance.getHoveredLine,
+                getAnnotationSlotName:
+                  renderedItem.instance.getAnnotationSlotName,
+              }),
           renderedItem.element,
           renderedItem.id
-        )
-      );
-    },
+        );
+      }),
     // oxlint-disable-next-line react-hooks/exhaustive-deps
     [
       renderCustomHeader,
@@ -935,16 +841,20 @@ const SlotPortals = memo(function SlotPortals<LAnnotation, Caret>({
       itemKeys,
     ]
   );
-  const renderedHeader = useMemo(() => {
-    return renderCodeViewHeader != null && snapshot?.header != null
-      ? createPortal(renderCodeViewHeader(), snapshot.header)
-      : null;
-  }, [renderCodeViewHeader, snapshot?.header]);
-  const renderedFooter = useMemo(() => {
-    return renderCodeViewFooter != null && snapshot?.footer != null
-      ? createPortal(renderCodeViewFooter(), snapshot.footer)
-      : null;
-  }, [renderCodeViewFooter, snapshot?.footer]);
+  const renderedHeader = useMemo(
+    () =>
+      renderCodeViewHeader != null && snapshot?.header != null
+        ? createPortal(renderCodeViewHeader(), snapshot.header)
+        : null,
+    [renderCodeViewHeader, snapshot?.header]
+  );
+  const renderedFooter = useMemo(
+    () =>
+      renderCodeViewFooter != null && snapshot?.footer != null
+        ? createPortal(renderCodeViewFooter(), snapshot.footer)
+        : null,
+    [renderCodeViewFooter, snapshot?.footer]
+  );
   return (
     <>
       {renderedItems}
@@ -953,74 +863,6 @@ const SlotPortals = memo(function SlotPortals<LAnnotation, Caret>({
     </>
   );
 }) as SlotPortalsComponent;
-
-function renderCodeViewItemChildren<LAnnotation, Caret>({
-  renderedItem,
-  renderCustomHeader,
-  renderHeaderPrefix,
-  renderHeaderFilenameSuffix,
-  renderHeaderMetadata,
-  renderAnnotation,
-  renderGutterUtility,
-}: RenderCodeViewItemChildrenProps<LAnnotation, Caret>): ReactNode {
-  if (renderedItem.type === 'diff') {
-    const { item, instance } = renderedItem;
-    return renderDiffChildren({
-      fileDiff: item.fileDiff,
-      renderCustomHeader:
-        renderCustomHeader != null ? () => renderCustomHeader(item) : undefined,
-      renderHeaderPrefix:
-        renderHeaderPrefix != null ? () => renderHeaderPrefix(item) : undefined,
-      renderHeaderFilenameSuffix:
-        renderHeaderFilenameSuffix != null
-          ? () => renderHeaderFilenameSuffix(item)
-          : undefined,
-      renderHeaderMetadata:
-        renderHeaderMetadata != null
-          ? () => renderHeaderMetadata(item)
-          : undefined,
-      renderAnnotation:
-        renderAnnotation != null
-          ? (annotation) => renderAnnotation(annotation, item)
-          : undefined,
-      lineAnnotations: item.annotations,
-      renderGutterUtility:
-        renderGutterUtility != null
-          ? (getHoveredLine) => renderGutterUtility(getHoveredLine, item)
-          : undefined,
-      getHoveredLine: instance.getHoveredLine,
-      getAnnotationSlotName: instance.getAnnotationSlotName,
-    });
-  } else {
-    const { item, instance } = renderedItem;
-    return renderFileChildren({
-      file: item.file,
-      renderCustomHeader:
-        renderCustomHeader != null ? () => renderCustomHeader(item) : undefined,
-      renderHeaderPrefix:
-        renderHeaderPrefix != null ? () => renderHeaderPrefix(item) : undefined,
-      renderHeaderFilenameSuffix:
-        renderHeaderFilenameSuffix != null
-          ? () => renderHeaderFilenameSuffix(item)
-          : undefined,
-      renderHeaderMetadata:
-        renderHeaderMetadata != null
-          ? () => renderHeaderMetadata(item)
-          : undefined,
-      renderAnnotation:
-        renderAnnotation != null
-          ? (annotation) => renderAnnotation(annotation, item)
-          : undefined,
-      lineAnnotations: item.annotations,
-      renderGutterUtility:
-        renderGutterUtility != null
-          ? (getHoveredLine) => renderGutterUtility(getHoveredLine, item)
-          : undefined,
-      getHoveredLine: instance.getHoveredLine,
-      getAnnotationSlotName: instance.getAnnotationSlotName,
-    });
-  }
-}
 
 function noopRender() {
   return undefined;

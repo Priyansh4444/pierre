@@ -6,11 +6,7 @@ export function getLineNodes(nodes: Root): ElementContent[] {
     if (firstChild.type === 'element' && firstChild.tagName === 'code') {
       return firstChild.children;
     }
-    if ('children' in firstChild) {
-      firstChild = firstChild.children[0];
-    } else {
-      firstChild = null;
-    }
+    firstChild = 'children' in firstChild ? firstChild.children[0] : null;
   }
   console.error(nodes);
   throw new Error('getLineNodes: Unable to find children');

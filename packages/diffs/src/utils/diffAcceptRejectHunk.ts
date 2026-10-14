@@ -21,20 +21,13 @@ export function diffAcceptRejectHunk(
     throw new Error('diffAcceptRejectHunk: Invalid hunk index');
   }
 
+  const isConfig = typeof options === 'object';
   return resolveRegion(diff, {
     resolution: normalizeDiffResolution(options),
     hunkIndex,
-    ...(() => {
-      if (typeof options === 'object') {
-        return {
-          startContentIndex: options.changeIndex,
-          endContentIndex: options.changeIndex,
-        };
-      }
-      return {
-        startContentIndex: 0,
-        endContentIndex: Math.max(0, (hunk.hunkContent.length ?? 1) - 1),
-      };
-    })(),
+    startContentIndex: isConfig ? options.changeIndex : 0,
+    endContentIndex: isConfig
+      ? options.changeIndex
+      : Math.max(0, hunk.hunkContent.length - 1),
   });
 }

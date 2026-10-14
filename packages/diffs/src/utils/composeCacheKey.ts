@@ -1,6 +1,6 @@
 const CACHE_KEY_VERSION = 1;
 
-/** Encodes caller-controlled segments without delimiter ambiguity. */
+// Encodes caller-controlled segments without delimiter ambiguity.
 export function composeCacheKey(
   scope: string,
   ...segments: readonly string[]

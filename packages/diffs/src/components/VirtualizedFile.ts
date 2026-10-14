@@ -61,22 +61,6 @@ const NO_GHOST_TEXT_ROWS: ReadonlyMap<number, number> = new Map();
 
 let instanceId = -1;
 
-function hasFileLayoutOptionChanged<LAnnotation, Caret>(
-  previousOptions: FileOptions<LAnnotation, Caret>,
-  nextOptions: FileOptions<LAnnotation, Caret>
-): boolean {
-  return (
-    (previousOptions.overflow ?? 'scroll') !==
-      (nextOptions.overflow ?? 'scroll') ||
-    (previousOptions.collapsed ?? false) !== (nextOptions.collapsed ?? false) ||
-    (previousOptions.disableLineNumbers ?? false) !==
-      (nextOptions.disableLineNumbers ?? false) ||
-    (previousOptions.disableFileHeader ?? false) !==
-      (nextOptions.disableFileHeader ?? false) ||
-    previousOptions.unsafeCSS !== nextOptions.unsafeCSS
-  );
-}
-
 export class VirtualizedFile<
   LAnnotation = undefined,
   Caret = undefined,
@@ -139,12 +123,10 @@ export class VirtualizedFile<
   private syncLineAnnotations(
     lineAnnotations: LineAnnotation<LAnnotation>[] | undefined
   ): boolean {
-    if (lineAnnotations == null || !this.isNewAnnotations(lineAnnotations)) {
-      return false;
-    }
     if (
-      lineAnnotations.length === 0 &&
-      this.getLatestAnnotations().length === 0
+      lineAnnotations == null ||
+      !this.isNewAnnotations(lineAnnotations) ||
+      (lineAnnotations.length === 0 && this.getLatestAnnotations().length === 0)
     ) {
       return false;
     }
@@ -156,17 +138,11 @@ export class VirtualizedFile<
   protected override syncEditSessionAnnotationsFromEditor(
     lineAnnotations: LineAnnotation<LAnnotation>[]
   ): boolean {
-    if (super.syncEditSessionAnnotationsFromEditor(lineAnnotations)) {
+    const changed = super.syncEditSessionAnnotationsFromEditor(lineAnnotations);
+    if (changed) {
       this.forceRenderOverride = true;
-      return true;
     }
-    return false;
-  }
-
-  private hasLineAnnotations(): boolean {
-    return this.getLatestAnnotations().some(
-      (annotation) => annotation.lineNumber > FILE_ANNOTATION_LINE_NUMBER
-    );
+    return changed;
   }
 
   // Every line is exactly one line height tall, so positions can be multiplied
@@ -176,7 +152,9 @@ export class VirtualizedFile<
     const { overflow = 'scroll' } = this.options;
     return (
       overflow === 'scroll' &&
-      !this.hasLineAnnotations() &&
+      !this.getLatestAnnotations().some(
+        (annotation) => annotation.lineNumber > FILE_ANNOTATION_LINE_NUMBER
+      ) &&
       this.cache.heights.size === 0
     );
   }
@@ -185,12 +163,10 @@ export class VirtualizedFile<
   // If not cached and hasMetadataLine is true, adds lineHeight for the
   // metadata.
   public getLineHeight(lineIndex: number, hasMetadataLine = false): number {
-    const cached = this.cache.heights.get(lineIndex);
-    if (cached != null) {
-      return cached;
-    }
-    const multiplier = hasMetadataLine ? 2 : 1;
-    return this.metrics.lineHeight * multiplier;
+    return (
+      this.cache.heights.get(lineIndex) ??
+      this.metrics.lineHeight * (hasMetadataLine ? 2 : 1)
+    );
   }
 
   override setOptions(
@@ -205,7 +181,15 @@ export class VirtualizedFile<
     if (options == null) return;
     const { options: previousOptions } = this;
     const optionsChanged = !areOptionsEqual(previousOptions, options);
-    const layoutChanged = hasFileLayoutOptionChanged(previousOptions, options);
+    const layoutChanged =
+      (previousOptions.overflow ?? 'scroll') !==
+        (options.overflow ?? 'scroll') ||
+      (previousOptions.collapsed ?? false) !== (options.collapsed ?? false) ||
+      (previousOptions.disableLineNumbers ?? false) !==
+        (options.disableLineNumbers ?? false) ||
+      (previousOptions.disableFileHeader ?? false) !==
+        (options.disableFileHeader ?? false) ||
+      previousOptions.unsafeCSS !== options.unsafeCSS;
 
     super.setOptions(options);
 
@@ -216,8 +200,6 @@ export class VirtualizedFile<
     // the measured height cache above.
     if (optionsChanged) {
       this.forceRenderOverride = true;
-    }
-    if (optionsChanged) {
       this.virtualizer.instanceChanged(this, layoutChanged);
     }
   }
@@ -235,14 +217,10 @@ export class VirtualizedFile<
   private resetLayoutCache(recompute = false, resetRenderRange = true): void {
     this.layoutDirty = true;
     this.cache.fileAnnotationHeight = 0;
-    if (this.cache.heights.size > 0) {
-      this.cache.heights.clear();
-    }
-    if (this.cache.checkpoints.length > 0) {
-      this.cache.checkpoints.length = 0;
-    }
+    this.cache.heights.clear();
+    this.cache.checkpoints.length = 0;
     this.cache.ghostTextRows = NO_GHOST_TEXT_ROWS;
-    if (this.renderRange != null && resetRenderRange) {
+    if (resetRenderRange) {
       this.renderRange = undefined;
     }
     // NOTE(amadeus): In CodeView we intentionally batch computes to all happen
@@ -275,9 +253,10 @@ export class VirtualizedFile<
       if (rows === previousRows) {
         continue;
       }
-      const ownHeight =
-        (heights.get(lineIndex) ?? lineHeight) - previousRows * lineHeight;
-      const height = ownHeight + rows * lineHeight;
+      const height =
+        (heights.get(lineIndex) ?? lineHeight) -
+        previousRows * lineHeight +
+        rows * lineHeight;
       if (height === lineHeight) {
         heights.delete(lineIndex);
       } else {
@@ -292,19 +271,16 @@ export class VirtualizedFile<
   // Measure rendered lines and update height cache.
   // Called after render to reconcile estimated vs actual heights.
   public reconcileHeights(): boolean {
-    let hasHeightChange = false;
     if (this.fileContainer == null || this.getLayoutFile() == null) {
-      if (this.height !== 0) {
-        hasHeightChange = true;
-      }
+      const hadHeight = this.height !== 0;
       this.height = 0;
-      return hasHeightChange;
+      return hadHeight;
     }
     const { overflow = 'scroll' } = this.options;
     this.top = this.getVirtualizedTop();
     const ghostTextRows =
       this.editor?.__getGhostTextRows() ?? NO_GHOST_TEXT_ROWS;
-    hasHeightChange = this.applyGhostTextRows(ghostTextRows);
+    let hasHeightChange = this.applyGhostTextRows(ghostTextRows);
     const measureAllRows =
       overflow !== 'scroll' ||
       this.getLatestAnnotations().length > 0 ||
@@ -327,11 +303,8 @@ export class VirtualizedFile<
     }
     const { lineHeight } = this.metrics;
 
-    // Single code element (no split mode)
-    if (this.code == null) {
-      return hasHeightChange;
-    }
-    const content = this.code.children[1]; // Content column (gutter is [0])
+    // Single code element (no split mode): content column, gutter is [0]
+    const content = this.code?.children[1];
     if (!(content instanceof HTMLElement)) {
       return hasHeightChange;
     }
@@ -342,10 +315,20 @@ export class VirtualizedFile<
       this.renderRange != null &&
       shouldRenderFileAnnotations(this.renderRange)
     ) {
-      const fileAnnotationHeight = measureFileAnnotationHeight(content);
-      const nextFileAnnotationHeight = fileAnnotationHeight ?? 0;
-      if (nextFileAnnotationHeight !== this.cache.fileAnnotationHeight) {
-        this.cache.fileAnnotationHeight = nextFileAnnotationHeight;
+      let fileAnnotationHeight = 0;
+      for (const child of content.children) {
+        if (
+          child instanceof HTMLElement &&
+          child.dataset.lineAnnotation === FILE_ANNOTATION_DOM_KEY
+        ) {
+          fileAnnotationHeight = Math.max(
+            fileAnnotationHeight,
+            child.getBoundingClientRect().height
+          );
+        }
+      }
+      if (fileAnnotationHeight !== this.cache.fileAnnotationHeight) {
+        this.cache.fileAnnotationHeight = fileAnnotationHeight;
         hasHeightChange = true;
       }
     }
@@ -371,28 +354,22 @@ export class VirtualizedFile<
       let hasMetadata = false;
 
       // Annotations or noNewline metadata increase the size of their attached line
-      if (
-        line.nextElementSibling instanceof HTMLElement &&
-        ('lineAnnotation' in line.nextElementSibling.dataset ||
-          'noNewline' in line.nextElementSibling.dataset)
-      ) {
-        if ('noNewline' in line.nextElementSibling.dataset) {
-          hasMetadata = true;
+      const next = line.nextElementSibling;
+      if (next instanceof HTMLElement) {
+        hasMetadata = 'noNewline' in next.dataset;
+        if (hasMetadata || 'lineAnnotation' in next.dataset) {
+          measuredHeight += next.getBoundingClientRect().height;
         }
-        measuredHeight +=
-          line.nextElementSibling.getBoundingClientRect().height;
       }
 
-      const expectedHeight = this.getLineHeight(lineIndex, hasMetadata);
-
-      if (measuredHeight === expectedHeight) {
+      if (measuredHeight === this.getLineHeight(lineIndex, hasMetadata)) {
         continue;
       }
 
       hasHeightChange = true;
       // Line is back to standard height (e.g., after window resize)
       // Remove from cache
-      if (measuredHeight === this.metrics.lineHeight * (hasMetadata ? 2 : 1)) {
+      if (measuredHeight === lineHeight * (hasMetadata ? 2 : 1)) {
         this.cache.heights.delete(lineIndex);
       }
       // Non-standard height, cache it
@@ -455,10 +432,7 @@ export class VirtualizedFile<
     if (targetChanged) {
       this.layoutDirty = true;
     }
-    if (
-      !this.forceRenderOverride &&
-      (targetChanged || renderedFileChanged || annotationsChanged)
-    ) {
+    if (targetChanged || renderedFileChanged || annotationsChanged) {
       this.forceRenderOverride = true;
     }
     this.top = top;
@@ -509,20 +483,21 @@ export class VirtualizedFile<
     }
 
     const checkpoint =
-      this.getLayoutCheckpointBeforeLineIndex(clampedLineIndex);
+      clampedLineIndex > 0
+        ? this.cache.checkpoints[
+            this.findLayoutCheckpointIndex('lineIndex', clampedLineIndex)
+          ]
+        : undefined;
     top = checkpoint?.top ?? top;
     for (
       let lineIndex = checkpoint?.lineIndex ?? 0;
       lineIndex < clampedLineIndex;
       lineIndex++
     ) {
-      top += this.getLineHeight(lineIndex, false);
+      top += this.getLineHeight(lineIndex);
     }
 
-    return {
-      top,
-      height: this.getLineHeight(clampedLineIndex, false),
-    };
+    return { top, height: this.getLineHeight(clampedLineIndex) };
   }
 
   public getEditorViewport(): HTMLElement | Document | undefined {
@@ -565,18 +540,18 @@ export class VirtualizedFile<
       return undefined;
     }
     const { fileAnnotationHeight } = this.cache;
+    let top =
+      headerRegion +
+      (firstRenderedLineIndex === 0
+        ? fileAnnotationHeight
+        : this.renderRange.bufferBefore);
 
     // When we have uniform line heights we can just multiply our way to the
     // correct value
     if (this.hasUniformLineHeights()) {
       const { lineHeight } = this.metrics;
-      const firstRenderedLineTop =
-        headerRegion +
-        (firstRenderedLineIndex === 0
-          ? fileAnnotationHeight
-          : this.renderRange.bufferBefore);
       const deltaLineCount = Math.max(
-        Math.ceil((localViewportTop - firstRenderedLineTop) / lineHeight),
+        Math.ceil((localViewportTop - top) / lineHeight),
         0
       );
       const lineIndex = firstRenderedLineIndex + deltaLineCount;
@@ -591,21 +566,13 @@ export class VirtualizedFile<
     }
 
     // Otherwise we gotta iterate through the range
-    let top =
-      headerRegion +
-      (firstRenderedLineIndex === 0
-        ? fileAnnotationHeight
-        : this.renderRange.bufferBefore);
     for (
       let lineIndex = firstRenderedLineIndex;
       lineIndex <= lastRenderedLineIndex;
       lineIndex++
     ) {
       if (top >= localViewportTop) {
-        return {
-          lineNumber: lineIndex + 1,
-          top,
-        };
+        return { lineNumber: lineIndex + 1, top };
       }
       top += this.getLineHeight(lineIndex);
     }
@@ -647,13 +614,11 @@ export class VirtualizedFile<
     //    item's top with nothing after it, so no offset. Always adding
     //    bufferAfter here made getStickyBounds over-measure the sticky
     //    container for that trailing case.
-    let headerOnlyOffset = 0;
-    if (totalLines === 0) {
-      const activeWindow = windowSpecs ?? this.virtualizer.getWindowSpecs();
-      if (this.top < activeWindow.top) {
-        headerOnlyOffset = bufferAfter;
-      }
-    }
+    const headerOnlyOffset =
+      totalLines === 0 &&
+      this.top < (windowSpecs ?? this.virtualizer.getWindowSpecs()).top
+        ? bufferAfter
+        : 0;
     return {
       topOffset: this.top + bufferBefore + headerOnlyOffset,
       height: this.height - (bufferBefore + bufferAfter),
@@ -674,7 +639,7 @@ export class VirtualizedFile<
       this.fileContainer != null &&
       (hadGhostTextRows ||
         !areFileTargetsEqual(this.getRenderedFile(), this.getLatestFile()));
-    if (this.fileContainer != null && this.isSimpleMode()) {
+    if (this.fileContainer != null) {
       this.getSimpleVirtualizer()?.disconnect(this.fileContainer);
     }
     if (!recycle) {
@@ -714,37 +679,30 @@ export class VirtualizedFile<
     );
 
     const { disableFileHeader = false, collapsed = false } = this.options;
-    const { lineHeight } = this.metrics;
     const lineCount = this.fileRenderer.getLineCount(file);
     if (collapsed) {
-      this.height += getVirtualFileHeaderHeight(
-        this.metrics,
-        disableFileHeader
-      );
+      this.height = getVirtualFileHeaderHeight(this.metrics, disableFileHeader);
       this.layoutDirty = false;
       return;
     }
 
-    const headerRegion = getVirtualFileHeaderRegion(
-      this.metrics,
-      disableFileHeader
-    );
-    const paddingBottom = getVirtualFilePaddingBottom(this.metrics);
-    this.height += headerRegion;
-
-    this.height += this.cache.fileAnnotationHeight;
+    this.height =
+      getVirtualFileHeaderRegion(this.metrics, disableFileHeader) +
+      this.cache.fileAnnotationHeight;
 
     if (this.hasUniformLineHeights()) {
-      this.height += lineCount * lineHeight;
+      this.height += lineCount * this.metrics.lineHeight;
     } else {
       for (let lineIndex = 0; lineIndex < lineCount; lineIndex++) {
-        this.addLayoutCheckpoint(lineIndex, this.height);
-        this.height += this.getLineHeight(lineIndex, false);
+        if (lineIndex % LAYOUT_CHECKPOINT_INTERVAL === 0) {
+          this.cache.checkpoints.push({ lineIndex, top: this.height });
+        }
+        this.height += this.getLineHeight(lineIndex);
       }
     }
 
     if (lineCount > 0) {
-      this.height += paddingBottom;
+      this.height += getVirtualFilePaddingBottom(this.metrics);
     }
 
     if (this.fileContainer != null && shouldValidateSize && !isFirstCompute) {
@@ -841,11 +799,10 @@ export class VirtualizedFile<
     ) {
       // Update the buffers caused by the line-count change to ensure the host
       // scrolls to the correct position before re-rendering.
-      const windowSpecs = this.virtualizer.getWindowSpecs();
       const renderRange = this.computeRenderRangeFromWindow(
         file,
         this.top ?? 0,
-        windowSpecs
+        this.virtualizer.getWindowSpecs()
       );
       if (renderRange.bufferAfter !== previousRenderRange.bufferAfter) {
         this.updateBuffers(renderRange);
@@ -873,20 +830,16 @@ export class VirtualizedFile<
       layoutFileChanged,
       renderedFileChanged,
       annotationsChanged,
-    } = (() => {
-      if (
-        this.pendingRender != null &&
-        this.pendingRender.latestFile === (this.getLatestFile(file) ?? file)
-      ) {
-        return {
-          pendingRenderFile: this.pendingRender.file,
-          layoutFileChanged: false,
-          renderedFileChanged: false,
-          annotationsChanged: this.syncLineAnnotations(lineAnnotations),
-        };
-      }
-      return this.updatePendingRender(file, lineAnnotations);
-    })();
+    } =
+      this.pendingRender != null &&
+      this.pendingRender.latestFile === (this.getLatestFile(file) ?? file)
+        ? {
+            pendingRenderFile: this.pendingRender.file,
+            layoutFileChanged: false,
+            renderedFileChanged: false,
+            annotationsChanged: this.syncLineAnnotations(lineAnnotations),
+          }
+        : this.updatePendingRender(file, lineAnnotations);
     const { forceRenderOverride, isSetup } = this;
     this.forceRenderOverride = undefined;
     if (layoutFileChanged) {
@@ -899,19 +852,11 @@ export class VirtualizedFile<
       this.computeApproximateSize(false, pendingRenderFile);
       const virtualizer = this.getSimpleVirtualizer();
       this.top ??= this.getVirtualizedTop();
-      if (this.isAdvancedMode()) {
+      if (virtualizer == null) {
         this.isVisible = true;
       } else {
-        if (virtualizer == null) {
-          throw new Error(
-            'VirtualizedFile.render: simple virtualizer is not available'
-          );
-        }
         virtualizer.connect(fileContainer, this);
-        this.isVisible = virtualizer.isInstanceVisible(
-          this.top ?? 0,
-          this.height
-        );
+        this.isVisible = virtualizer.isInstanceVisible(this.top, this.height);
       }
       this.isSetup = true;
     } else {
@@ -933,12 +878,10 @@ export class VirtualizedFile<
       return this.renderPlaceholder(this.height);
     }
 
-    const windowSpecs = this.virtualizer.getWindowSpecs();
-    const fileTop = this.top ?? 0;
     const renderRange = this.computeRenderRangeFromWindow(
       pendingRenderFile,
-      fileTop,
-      windowSpecs
+      this.top,
+      this.virtualizer.getWindowSpecs()
     );
     return super.render({
       file,
@@ -966,9 +909,7 @@ export class VirtualizedFile<
     // auto-reconciles renders it initiated. Queue a measured-height
     // reconciliation for every applied content render so line deltas
     // (wrapped lines, annotation heights) survive layout resets.
-    if (this.isSimpleMode()) {
-      this.getSimpleVirtualizer()?.requestHeightReconcile(this);
-    }
+    this.getSimpleVirtualizer()?.requestHeightReconcile(this);
   }
 
   private updatePendingRender(
@@ -1019,87 +960,28 @@ export class VirtualizedFile<
     return this.virtualizer.type === 'advanced';
   }
 
-  private addLayoutCheckpoint(lineIndex: number, top: number): void {
-    if (lineIndex % LAYOUT_CHECKPOINT_INTERVAL !== 0) {
-      return;
-    }
-    this.cache.checkpoints.push({ lineIndex, top });
-  }
-
-  // Find the nearest sparse layout checkpoint at or before a raw file line.
-  // Checkpoints store measured `top` offsets every few thousand lines, so a
-  // binary search lets deep line-position lookups resume from that checkpoint
-  // instead of replaying layout from the start of the file.
-  private getLayoutCheckpointBeforeLineIndex(
-    lineIndex: number
-  ): FileLayoutCheckpoint | undefined {
-    if (lineIndex <= 0 || this.cache.checkpoints.length === 0) {
-      return undefined;
-    }
-
+  // Binary search the sparse layout checkpoints (stored every few thousand
+  // lines, sorted by both lineIndex and top) for the last one whose `key` is at
+  // or before `value`, so deep geometry scans resume there instead of replaying
+  // layout from the start of the file. Returns -1 when there is none.
+  private findLayoutCheckpointIndex(
+    key: 'lineIndex' | 'top',
+    value: number
+  ): number {
+    const { checkpoints } = this.cache;
     let low = 0;
-    let high = this.cache.checkpoints.length - 1;
-    let result: FileLayoutCheckpoint | undefined;
-
+    let high = checkpoints.length - 1;
+    let result = -1;
     while (low <= high) {
       const mid = (low + high) >> 1;
-      const checkpoint = this.cache.checkpoints[mid];
-      if (checkpoint == null) {
-        throw new Error('VirtualizedFile: invalid checkpoint index');
-      }
-      if (checkpoint.lineIndex <= lineIndex) {
-        result = checkpoint;
+      if (checkpoints[mid][key] <= value) {
+        result = mid;
         low = mid + 1;
       } else {
         high = mid - 1;
       }
     }
-
     return result;
-  }
-
-  // Find the nearest sparse layout checkpoint at or before a scroll offset.
-  // Render-range scans start from this checkpoint so variable-height files
-  // only replay the nearby measured rows. When `hunkLineCount` is provided,
-  // step backward to a hunk boundary so hooks that depend on grouped lines
-  // still see a complete hunk.
-  private getLayoutCheckpointBeforeTop(
-    top: number,
-    hunkLineCount?: number
-  ): FileLayoutCheckpoint | undefined {
-    let low = 0;
-    let high = this.cache.checkpoints.length - 1;
-    let resultIndex = -1;
-
-    while (low <= high) {
-      const mid = (low + high) >> 1;
-      const checkpoint = this.cache.checkpoints[mid];
-      if (checkpoint == null) {
-        throw new Error('VirtualizedFile: invalid checkpoint index');
-      }
-      if (checkpoint.top <= top) {
-        resultIndex = mid;
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-
-    if (hunkLineCount == null) {
-      return resultIndex >= 0 ? this.cache.checkpoints[resultIndex] : undefined;
-    }
-
-    for (let index = resultIndex; index >= 0; index--) {
-      const checkpoint = this.cache.checkpoints[index];
-      if (checkpoint == null) {
-        throw new Error('VirtualizedFile: invalid checkpoint index');
-      }
-      if (checkpoint.lineIndex % hunkLineCount === 0) {
-        return checkpoint;
-      }
-    }
-
-    return undefined;
   }
 
   private getVirtualizedTop(): number {
@@ -1140,17 +1022,15 @@ export class VirtualizedFile<
       lineCount > 0 ? getVirtualFilePaddingBottom(this.metrics) : 0;
     const { fileAnnotationHeight } = this.cache;
     const codeRegionTop = headerRegion + fileAnnotationHeight;
+    const codeTop = fileTop + codeRegionTop;
     const codeRowsHeight = Math.max(
       0,
       fileHeight - headerRegion - fileAnnotationHeight - paddingBottom
     );
-    const hasFileAnnotations = includesFileAnnotations(
-      this.getLatestAnnotations()
-    );
     const fileAnnotationTop = fileTop + headerRegion;
     const measuredFileAnnotationVisible =
       fileAnnotationHeight > 0 &&
-      hasFileAnnotations &&
+      includesFileAnnotations(this.getLatestAnnotations()) &&
       fileAnnotationTop < bottom &&
       fileAnnotationTop + fileAnnotationHeight > top;
 
@@ -1185,11 +1065,10 @@ export class VirtualizedFile<
     const viewportCenter = (top + bottom) / 2;
     // Simple case: every line is one line height tall - pure math!
     if (this.hasUniformLineHeights()) {
-      const sourceRowsTop = fileTop + codeRegionTop;
-      const sourceRowsBottom = sourceRowsTop + codeRowsHeight;
-      const sourceRowsVisible =
-        sourceRowsTop < bottom && sourceRowsBottom > top;
-      if (!measuredFileAnnotationVisible && !sourceRowsVisible) {
+      if (
+        !measuredFileAnnotationVisible &&
+        !(codeTop < bottom && codeTop + codeRowsHeight > top)
+      ) {
         return {
           startingLine: 0,
           totalLines: 0,
@@ -1200,10 +1079,9 @@ export class VirtualizedFile<
 
       // Find which line is at viewport center
       const centerLine = Math.floor(
-        measuredFileAnnotationVisible &&
-          viewportCenter < fileTop + codeRegionTop
+        measuredFileAnnotationVisible && viewportCenter < codeTop
           ? 0
-          : (viewportCenter - (fileTop + codeRegionTop)) / lineHeight
+          : (viewportCenter - codeTop) / lineHeight
       );
       const centerHunk = Math.floor(centerLine / hunkLineCount);
 
@@ -1240,33 +1118,41 @@ export class VirtualizedFile<
     }
 
     // Complex case: need to account for line annotations or wrap overflow
-    const overflowHunks = totalHunks;
     const hunkOffsets: number[] = [];
     // Start the scan before the viewport so we collect hunk offsets that may be
     // needed for bufferBefore. This only chooses the scan origin; the returned
-    // render range is still computed from the visible window below.
-    const checkpoint = this.getLayoutCheckpointBeforeTop(
-      Math.max(0, top - fileTop - totalLines * lineHeight * 2),
-      hunkLineCount
+    // render range is still computed from the visible window below. Step back
+    // to a hunk boundary so hooks that depend on grouped lines still see a
+    // complete hunk.
+    const { checkpoints } = this.cache;
+    let checkpointIndex = this.findLayoutCheckpointIndex(
+      'top',
+      Math.max(0, top - fileTop - totalLines * lineHeight * 2)
     );
+    while (
+      checkpointIndex >= 0 &&
+      checkpoints[checkpointIndex].lineIndex % hunkLineCount !== 0
+    ) {
+      checkpointIndex--;
+    }
+    const checkpoint: FileLayoutCheckpoint | undefined =
+      checkpoints[checkpointIndex];
 
     let absoluteLineTop = fileTop + (checkpoint?.top ?? codeRegionTop);
-    let currentLine = checkpoint?.lineIndex ?? 0;
     let firstVisibleHunk: number | undefined;
     let centerHunk: number | undefined;
     let overflowCounter: number | undefined;
 
-    const startingLineIndex = checkpoint?.lineIndex ?? 0;
     for (
-      let lineIndex = startingLineIndex;
+      let lineIndex = checkpoint?.lineIndex ?? 0;
       lineIndex < lineCount;
       lineIndex++
     ) {
-      const isAtHunkBoundary = currentLine % hunkLineCount === 0;
-      const currentHunk = Math.floor(currentLine / hunkLineCount);
+      const isAtHunkBoundary = lineIndex % hunkLineCount === 0;
+      const currentHunk = Math.floor(lineIndex / hunkLineCount);
 
       if (isAtHunkBoundary) {
-        hunkOffsets[currentHunk] = absoluteLineTop - (fileTop + codeRegionTop);
+        hunkOffsets[currentHunk] = absoluteLineTop - codeTop;
 
         if (overflowCounter != null) {
           if (overflowCounter <= 0) {
@@ -1276,7 +1162,7 @@ export class VirtualizedFile<
         }
       }
 
-      const lineHeight = this.getLineHeight(lineIndex, false);
+      const lineHeight = this.getLineHeight(lineIndex);
 
       // Track visible region
       if (absoluteLineTop > top - lineHeight && absoluteLineTop < bottom) {
@@ -1294,10 +1180,9 @@ export class VirtualizedFile<
         absoluteLineTop >= bottom &&
         isAtHunkBoundary
       ) {
-        overflowCounter = overflowHunks;
+        overflowCounter = totalHunks;
       }
 
-      currentLine++;
       absoluteLineTop += lineHeight;
     }
 
@@ -1336,9 +1221,10 @@ export class VirtualizedFile<
         : totalLines;
 
     // Use hunkOffsets array for efficient buffer calculations
-    const codeBufferBefore = hunkOffsets[startHunk] ?? 0;
     const bufferBefore =
-      startingLine === 0 ? 0 : fileAnnotationHeight + codeBufferBefore;
+      startingLine === 0
+        ? 0
+        : fileAnnotationHeight + (hunkOffsets[startHunk] ?? 0);
 
     // Calculate bufferAfter
     const finalHunkIndex = startHunk + clampedTotalLines / hunkLineCount;
@@ -1354,18 +1240,4 @@ export class VirtualizedFile<
       bufferAfter: Math.max(0, bufferAfter),
     };
   }
-}
-
-function measureFileAnnotationHeight(content: HTMLElement): number | undefined {
-  let height: number | undefined;
-  for (const child of content.children) {
-    if (!(child instanceof HTMLElement)) {
-      continue;
-    }
-    if (child.dataset.lineAnnotation !== FILE_ANNOTATION_DOM_KEY) {
-      continue;
-    }
-    height = Math.max(height ?? 0, child.getBoundingClientRect().height);
-  }
-  return height;
 }

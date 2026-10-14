@@ -24,122 +24,124 @@ export function findBracketMatchRanges(
   tokenizer: EditorTokenizer,
   position: Position
 ): [open: Range, close: Range] | undefined {
-  const bracketPosition = findAdjacentBracket(
-    textDocument,
-    tokenizer,
-    textDocument.normalizePosition(position)
-  );
-  if (bracketPosition === undefined) {
+  const { line, character } = textDocument.normalizePosition(position);
+  // Prefer the bracket before the caret. Adjacency is line-local: column-zero
+  // carets are not visually next to the previous line's last character.
+  const bracket =
+    (character > 0
+      ? getBracketAt(textDocument, tokenizer, line, character - 1)
+      : undefined) ?? getBracketAt(textDocument, tokenizer, line, character);
+  if (bracket === undefined) {
     return undefined;
   }
 
-  const closingBracket = OPEN_BRACKETS.get(bracketPosition.char);
-  const openingBracket = CLOSE_BRACKETS.get(bracketPosition.char);
+  const closingBracket = OPEN_BRACKETS.get(bracket.char);
+  const openingBracket = CLOSE_BRACKETS.get(bracket.char);
   if (closingBracket !== undefined) {
-    const matchPosition = findClosingBracket(
-      textDocument,
-      tokenizer,
-      bracketPosition,
-      closingBracket
+    return createBracketMatchRanges(
+      bracket,
+      findPartnerBracket(textDocument, tokenizer, bracket, closingBracket, 1)
     );
-    return createBracketMatchRanges(bracketPosition, matchPosition);
   }
   if (openingBracket !== undefined) {
-    const matchPosition = findOpeningBracket(
-      textDocument,
-      tokenizer,
-      bracketPosition,
-      openingBracket
+    return createBracketMatchRanges(
+      findPartnerBracket(textDocument, tokenizer, bracket, openingBracket, -1),
+      bracket
     );
-    return createBracketMatchRanges(matchPosition, bracketPosition);
   }
   return undefined;
 }
 
-function findAdjacentBracket(
+// Returns the bracket at a position unless it sits inside a string, comment, or
+// regexp. Ignored ranges are only read once a bracket is found.
+function getBracketAt(
   textDocument: TextDocument,
   tokenizer: EditorTokenizer,
-  position: Position
+  line: number,
+  character: number
 ): BracketPosition | undefined {
-  const previousPosition = getPreviousCharacterPosition(position);
-  if (previousPosition !== undefined) {
-    const previousBracket = getBracketAtPosition(
-      textDocument,
-      tokenizer,
-      previousPosition
-    );
-    if (previousBracket !== undefined) {
-      return previousBracket;
-    }
-  }
-  return getBracketAtPosition(textDocument, tokenizer, position);
-}
-
-function getPreviousCharacterPosition(
-  position: Position
-): Position | undefined {
-  if (position.character > 0) {
-    return { line: position.line, character: position.character - 1 };
-  }
-  // Bracket adjacency is line-local: column-zero carets are not visually next to
-  // the previous line's last character.
-  return undefined;
-}
-
-function getBracketAtPosition(
-  textDocument: TextDocument,
-  tokenizer: EditorTokenizer,
-  position: Position
-): BracketPosition | undefined {
-  const lineText = textDocument.getLineText(position.line);
-  const char = lineText[position.character];
+  const char = textDocument.getLineText(line)[character];
   if (
     char === undefined ||
-    (!OPEN_BRACKETS.has(char) && !CLOSE_BRACKETS.has(char)) ||
-    isInIgnoredTokenRange(tokenizer, position)
+    (!OPEN_BRACKETS.has(char) && !CLOSE_BRACKETS.has(char))
   ) {
     return undefined;
   }
-  return { ...position, char };
+  const ranges = tokenizer.getStringCommentRegexpRangesInLine(line);
+  if (ranges !== null) {
+    for (const [start, end] of ranges) {
+      if (character < start) {
+        break;
+      }
+      if (character < end) {
+        return undefined;
+      }
+    }
+  }
+  return { line, character, char };
 }
 
-function findClosingBracket(
+// Scans from `bracket` in `step` direction for its partner, skipping strings,
+// comments, and regexps. Gives up past the scan limits.
+function findPartnerBracket(
   textDocument: TextDocument,
   tokenizer: EditorTokenizer,
-  bracketPosition: BracketPosition,
-  closingBracket: string
+  bracket: BracketPosition,
+  partner: string,
+  step: 1 | -1
 ): BracketPosition | undefined {
   let depth = 0;
   let scannedLines = 0;
   let scannedCharacters = 0;
-  for (let line = bracketPosition.line; line < textDocument.lineCount; line++) {
+  for (
+    let line = bracket.line;
+    line >= 0 && line < textDocument.lineCount;
+    line += step
+  ) {
     if (scannedLines >= MAX_BRACKET_SCAN_LINES) {
       return undefined;
     }
     scannedLines++;
     const lineText = textDocument.getLineText(line);
+    // Ignored ranges are sorted, so one cursor walks them with the scan.
     const ignoredRanges = tokenizer.getStringCommentRegexpRangesInLine(line);
-    const ignoredRangeCursor = { index: 0 };
-    const startCharacter =
-      line === bracketPosition.line ? bracketPosition.character : 0;
-    for (
-      let character = startCharacter;
-      character < lineText.length;
-      character++
-    ) {
+    let rangeIndex =
+      step > 0 || ignoredRanges === null ? 0 : ignoredRanges.length - 1;
+    let character = bracket.character;
+    if (line !== bracket.line) {
+      character = step > 0 ? 0 : lineText.length - 1;
+    }
+    for (; character >= 0 && character < lineText.length; character += step) {
       if (scannedCharacters >= MAX_BRACKET_SCAN_CHARACTERS) {
         return undefined;
       }
       scannedCharacters++;
-      if (
-        isCharacterIgnoredForward(ignoredRanges, character, ignoredRangeCursor)
-      ) {
-        continue;
+      if (ignoredRanges !== null) {
+        if (step > 0) {
+          while (
+            rangeIndex < ignoredRanges.length &&
+            character >= ignoredRanges[rangeIndex][1]
+          ) {
+            rangeIndex++;
+          }
+        } else {
+          while (rangeIndex >= 0 && character < ignoredRanges[rangeIndex][0]) {
+            rangeIndex--;
+          }
+        }
+        const range = ignoredRanges[rangeIndex];
+        if (
+          range !== undefined &&
+          character >= range[0] &&
+          character < range[1]
+        ) {
+          continue;
+        }
       }
       const char = lineText[character];
-      if (char === bracketPosition.char) {
+      if (char === bracket.char) {
         depth++;
-      } else if (char === closingBracket) {
+      } else if (char === partner) {
         depth--;
         if (depth === 0) {
           return { line, character, char };
@@ -148,109 +150,6 @@ function findClosingBracket(
     }
   }
   return undefined;
-}
-
-function findOpeningBracket(
-  textDocument: TextDocument,
-  tokenizer: EditorTokenizer,
-  bracketPosition: BracketPosition,
-  openingBracket: string
-): BracketPosition | undefined {
-  let depth = 0;
-  let scannedLines = 0;
-  let scannedCharacters = 0;
-  for (let line = bracketPosition.line; line >= 0; line--) {
-    if (scannedLines >= MAX_BRACKET_SCAN_LINES) {
-      return undefined;
-    }
-    scannedLines++;
-    const lineText = textDocument.getLineText(line);
-    const ignoredRanges = tokenizer.getStringCommentRegexpRangesInLine(line);
-    const ignoredRangeCursor = {
-      index: ignoredRanges === null ? -1 : ignoredRanges.length - 1,
-    };
-    const startCharacter =
-      line === bracketPosition.line
-        ? bracketPosition.character
-        : lineText.length - 1;
-    for (let character = startCharacter; character >= 0; character--) {
-      if (scannedCharacters >= MAX_BRACKET_SCAN_CHARACTERS) {
-        return undefined;
-      }
-      scannedCharacters++;
-      if (
-        isCharacterIgnoredBackward(ignoredRanges, character, ignoredRangeCursor)
-      ) {
-        continue;
-      }
-      const char = lineText[character];
-      if (char === bracketPosition.char) {
-        depth++;
-      } else if (char === openingBracket) {
-        depth--;
-        if (depth === 0) {
-          return { line, character, char };
-        }
-      }
-    }
-  }
-  return undefined;
-}
-
-function isInIgnoredTokenRange(
-  tokenizer: EditorTokenizer,
-  position: Position
-): boolean {
-  const ranges = tokenizer.getStringCommentRegexpRangesInLine(position.line);
-  return isCharacterInIgnoredRanges(ranges, position.character);
-}
-
-function isCharacterInIgnoredRanges(
-  ranges: [start: number, end: number][] | null,
-  character: number
-): boolean {
-  if (ranges === null) {
-    return false;
-  }
-  for (const [start, end] of ranges) {
-    if (character < start) {
-      return false;
-    }
-    if (character < end) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isCharacterIgnoredForward(
-  ranges: [start: number, end: number][] | null,
-  character: number,
-  cursor: { index: number }
-): boolean {
-  if (ranges === null) {
-    return false;
-  }
-  while (cursor.index < ranges.length && character >= ranges[cursor.index][1]) {
-    cursor.index++;
-  }
-  const range = ranges[cursor.index];
-  return range !== undefined && character >= range[0];
-}
-
-function isCharacterIgnoredBackward(
-  ranges: [start: number, end: number][] | null,
-  character: number,
-  cursor: { index: number }
-): boolean {
-  if (ranges === null) {
-    return false;
-  }
-  while (cursor.index >= 0 && character < ranges[cursor.index][0]) {
-    cursor.index--;
-  }
-  const range = ranges[cursor.index];
-  return range !== undefined && character < range[1];
 }
 
 function createBracketMatchRanges(
@@ -266,9 +165,9 @@ function createBracketMatchRanges(
   ];
 }
 
-function createCharacterRange(position: Position): Range {
+function createCharacterRange({ line, character }: Position): Range {
   return {
-    start: { line: position.line, character: position.character },
-    end: { line: position.line, character: position.character + 1 },
+    start: { line, character },
+    end: { line, character: character + 1 },
   };
 }

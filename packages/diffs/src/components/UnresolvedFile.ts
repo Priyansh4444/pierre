@@ -11,7 +11,6 @@ import type {
   FileDiffMetadata,
   MergeConflictActionPayload,
   MergeConflictMarkerRow,
-  MergeConflictRegion,
   MergeConflictResolution,
   PostRenderPhase,
 } from '../types';
@@ -126,7 +125,6 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
     markerRows: undefined,
   };
   private conflictActions: (MergeConflictDiffAction | undefined)[] = [];
-  private markerRows: MergeConflictMarkerRow[] = [];
   private conflictActionCache: Map<string, MergeConflictActionElementCache> =
     new Map();
 
@@ -185,13 +183,12 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
   protected override createHunksRenderer(
     options: UnresolvedFileOptions<LAnnotation>
   ): UnresolvedFileHunksRenderer<LAnnotation> {
-    const renderer = new UnresolvedFileHunksRenderer<LAnnotation>(
+    return new UnresolvedFileHunksRenderer<LAnnotation>(
       this.getHunksRendererOptions(options),
       this.getAnnotationSlotName,
       this.handleHighlightRender,
       this.workerManager
     );
-    return renderer;
   }
 
   protected override getHunksRendererOptions(
@@ -229,118 +226,98 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
     markerRows,
   }: GetOrComputeDiffProps): GetOrComputeDiffResult | undefined {
     const { maxContextLines, onMergeConflictAction } = this.options;
-    wrapper: {
-      // We are dealing with a controlled component
-      if (onMergeConflictAction != null) {
-        const hasFileDiff = fileDiff != null;
-        const hasActions = actions != null;
-        const hasMarkerRows = markerRows != null;
-        if (hasFileDiff !== hasActions || hasFileDiff !== hasMarkerRows) {
-          throw new Error(
-            'UnresolvedFile.getOrComputeDiff: fileDiff, actions, and markerRows must be passed together'
-          );
-        }
-        // If we were provided a new fileDiff/actions/markerRows, we are a FULLY
-        // controlled component, which means we will not do any computation
-        if (fileDiff != null && actions != null && markerRows != null) {
-          this.computedCache = {
-            file: file ?? this.computedCache.file,
-            fileDiff,
-            actions,
-            markerRows,
-          };
-          break wrapper;
-        }
-        // If we were provided a new file, we should attempt to parse out a new
-        // diff/actions if we haven't computed it before. Once we initialize from
-        // a file, later updates must flow through fileDiff/actions instead of
-        // reparsing from a new file input.
-        else if (file != null || this.computedCache.file != null) {
-          if (
-            file != null &&
-            this.computedCache.file != null &&
-            !areFilesEqual(file, this.computedCache.file) &&
-            this.computedCache.fileDiff != null &&
-            this.computedCache.actions != null
-          ) {
-            throw new Error(
-              'UnresolvedFile.getOrComputeDiff: file can only be used to initialize unresolved state once. Pass fileDiff and actions for subsequent updates.'
-            );
-          }
-          file ??= this.computedCache.file;
-          if (file == null) {
-            throw new Error(
-              'UnresolvedFile.getOrComputeDiff: file is null, should be impossible'
-            );
-          }
-          if (
-            !areFilesEqual(file, this.computedCache.file) ||
-            this.computedCache.fileDiff == null ||
-            this.computedCache.actions == null
-          ) {
-            const computed = parseMergeConflictDiffFromFile(
-              file,
-              maxContextLines
-            );
-            this.computedCache = {
-              file,
-              fileDiff: computed.fileDiff,
-              actions: computed.actions,
-              markerRows: computed.markerRows,
-            };
-          }
-          fileDiff = this.computedCache.fileDiff;
-          actions = this.computedCache.actions;
-          markerRows = this.computedCache.markerRows;
-          break wrapper;
-        }
-        // Otherwise we should fall through and try to use the cache if it exists
-        else {
-          fileDiff = this.computedCache.fileDiff;
-          actions = this.computedCache.actions;
-          markerRows = this.computedCache.markerRows;
-          break wrapper;
-        }
+    const cachedFile = this.computedCache.file;
+    // We are dealing with a controlled component
+    if (onMergeConflictAction != null) {
+      const hasFileDiff = fileDiff != null;
+      if (
+        hasFileDiff !== (actions != null) ||
+        hasFileDiff !== (markerRows != null)
+      ) {
+        throw new Error(
+          'UnresolvedFile.getOrComputeDiff: fileDiff, actions, and markerRows must be passed together'
+        );
       }
-      // If we are uncontrolled we only rely on the file and only use the first
-      // version. After that, the cached diff/action pair is the source of
-      // truth and we should not accept a new file input.
-      else {
-        if (fileDiff != null || actions != null || markerRows != null) {
-          throw new Error(
-            'UnresolvedFile.getOrComputeDiff: fileDiff, actions, and markerRows are only usable in controlled mode, you must pass in `onMergeConflictAction`'
-          );
-        }
+      // If we were provided a new fileDiff/actions/markerRows, we are a FULLY
+      // controlled component, which means we will not do any computation
+      if (fileDiff != null && actions != null && markerRows != null) {
+        this.computedCache = {
+          file: file ?? cachedFile,
+          fileDiff,
+          actions,
+          markerRows,
+        };
+      }
+      // If we were provided a new file, we should attempt to parse out a new
+      // diff/actions if we haven't computed it before. Once we initialize from
+      // a file, later updates must flow through fileDiff/actions instead of
+      // reparsing from a new file input. Otherwise we use the cache as is.
+      else if (file != null || cachedFile != null) {
         if (
           file != null &&
-          this.computedCache.file != null &&
-          !areFilesEqual(file, this.computedCache.file)
+          cachedFile != null &&
+          !areFilesEqual(file, cachedFile) &&
+          this.computedCache.fileDiff != null &&
+          this.computedCache.actions != null
         ) {
           throw new Error(
-            'UnresolvedFile.getOrComputeDiff: uncontrolled unresolved files parse the file only once. Later updates must come from the cached diff state.'
+            'UnresolvedFile.getOrComputeDiff: file can only be used to initialize unresolved state once. Pass fileDiff and actions for subsequent updates.'
           );
         }
-        this.computedCache.file ??= file;
+        const sourceFile = file ?? cachedFile;
         if (
-          this.computedCache.fileDiff == null &&
-          this.computedCache.file != null
+          sourceFile != null &&
+          (!areFilesEqual(sourceFile, cachedFile) ||
+            this.computedCache.fileDiff == null ||
+            this.computedCache.actions == null)
         ) {
           const computed = parseMergeConflictDiffFromFile(
-            this.computedCache.file,
+            sourceFile,
             maxContextLines
           );
-          this.computedCache.fileDiff = computed.fileDiff;
-          this.computedCache.actions = computed.actions;
-          this.computedCache.markerRows = computed.markerRows;
+          this.computedCache = {
+            file: sourceFile,
+            fileDiff: computed.fileDiff,
+            actions: computed.actions,
+            markerRows: computed.markerRows,
+          };
         }
-        // Because we are uncontrolled, the source of truth is the
-        // computedCache
-        fileDiff = this.computedCache.fileDiff;
-        actions = this.computedCache.actions;
-        markerRows = this.computedCache.markerRows;
-        break wrapper;
       }
     }
+    // If we are uncontrolled we only rely on the file and only use the first
+    // version. After that, the cached diff/action pair is the source of
+    // truth and we should not accept a new file input.
+    else {
+      if (fileDiff != null || actions != null || markerRows != null) {
+        throw new Error(
+          'UnresolvedFile.getOrComputeDiff: fileDiff, actions, and markerRows are only usable in controlled mode, you must pass in `onMergeConflictAction`'
+        );
+      }
+      if (
+        file != null &&
+        cachedFile != null &&
+        !areFilesEqual(file, cachedFile)
+      ) {
+        throw new Error(
+          'UnresolvedFile.getOrComputeDiff: uncontrolled unresolved files parse the file only once. Later updates must come from the cached diff state.'
+        );
+      }
+      this.computedCache.file ??= file;
+      if (
+        this.computedCache.fileDiff == null &&
+        this.computedCache.file != null
+      ) {
+        const computed = parseMergeConflictDiffFromFile(
+          this.computedCache.file,
+          maxContextLines
+        );
+        this.computedCache.fileDiff = computed.fileDiff;
+        this.computedCache.actions = computed.actions;
+        this.computedCache.markerRows = computed.markerRows;
+      }
+    }
+    // The cache is now the source of truth in every mode
+    ({ fileDiff, actions, markerRows } = this.computedCache);
     if (fileDiff == null || actions == null || markerRows == null) {
       return undefined;
     }
@@ -372,12 +349,8 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
     // If necessary hydration elements don't exist, we should assume a full
     // render
     if (
-      shouldRenderCode(this.pre, source.fileDiff, this.options.collapsed) ||
-      shouldRenderHeader(
-        this.headerElement,
-        source.fileDiff,
-        this.options.disableFileHeader
-      )
+      (this.options.collapsed !== true && this.pre == null) ||
+      (this.options.disableFileHeader !== true && this.headerElement == null)
     ) {
       this.render({ ...props, preventEmit: true });
     }
@@ -454,26 +427,104 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
 
     const newFileDiff = resolveConflictDiff(fileDiff, action, resolution);
     const previousFile = this.computedCache.file;
-    const { file, actions, markerRows } = rebuildFileAndActions({
-      fileDiff: newFileDiff,
-      previousActions: this.conflictActions,
-      resolvedConflictIndex: conflictIndex,
-      previousFile,
-      resolution,
+    const { conflict } = action;
+    const { startLineIndex, separatorLineIndex, endLineIndex } = conflict;
+    const currentEndIndex = conflict.baseMarkerLineIndex ?? separatorLineIndex;
+    const currentLineCount = currentEndIndex - startLineIndex - 1;
+    const incomingLineCount = endLineIndex - separatorLineIndex - 1;
+    const lineDelta =
+      (resolution === 'current'
+        ? currentLineCount
+        : resolution === 'incoming'
+          ? incomingLineCount
+          : currentLineCount + incomingLineCount) -
+      (endLineIndex - startLineIndex + 1);
+
+    // The diff resolver keeps hunk/content group indexes stable, so later
+    // conflicts only need their source line numbers shifted in the rebuilt
+    // file text.
+    const actions = this.conflictActions.map((other, index) => {
+      if (index === conflictIndex || other == null) {
+        return undefined;
+      }
+      const region = other.conflict;
+      return region.startLineIndex > endLineIndex
+        ? {
+            ...other,
+            conflict: {
+              ...region,
+              startLineIndex: region.startLineIndex + lineDelta,
+              startLineNumber: region.startLineNumber + lineDelta,
+              separatorLineIndex: region.separatorLineIndex + lineDelta,
+              separatorLineNumber: region.separatorLineNumber + lineDelta,
+              endLineIndex: region.endLineIndex + lineDelta,
+              endLineNumber: region.endLineNumber + lineDelta,
+              baseMarkerLineIndex:
+                region.baseMarkerLineIndex != null
+                  ? region.baseMarkerLineIndex + lineDelta
+                  : undefined,
+              baseMarkerLineNumber:
+                region.baseMarkerLineNumber != null
+                  ? region.baseMarkerLineNumber + lineDelta
+                  : undefined,
+            },
+          }
+        : other;
     });
+    const markerRows = buildMergeConflictMarkerRows(newFileDiff, actions);
+
+    // Rebuild the unresolved file text from the previous unresolved source so
+    // the remaining marker blocks are preserved exactly.
+    const lines = splitFileContents(previousFile?.contents ?? '');
+    const currentLines = lines.slice(startLineIndex + 1, currentEndIndex);
+    const incomingLines = lines.slice(separatorLineIndex + 1, endLineIndex);
+    const replacementLines =
+      resolution === 'current'
+        ? currentLines
+        : resolution === 'incoming'
+          ? incomingLines
+          : [...currentLines, ...incomingLines];
 
     return {
-      file,
+      file: {
+        name: previousFile?.name ?? newFileDiff.name,
+        contents: [
+          ...lines.slice(0, startLineIndex),
+          ...replacementLines,
+          ...lines.slice(endLineIndex + 1),
+        ].join(''),
+        cacheKey:
+          previousFile?.cacheKey != null
+            ? `${previousFile.cacheKey}:mc-${conflictIndex}-${resolution}`
+            : undefined,
+      },
       fileDiff: newFileDiff,
       actions,
       markerRows,
     };
   }
 
-  private resolveConflictAndRender(
-    conflictIndex: number,
-    resolution: MergeConflictResolution
+  private setActiveMergeConflictState(
+    actions: (MergeConflictDiffAction | undefined)[],
+    markerRows: MergeConflictMarkerRow[]
   ): void {
+    this.conflictActions = actions;
+    if (
+      this.computedCache.fileDiff != null &&
+      this.hunksRenderer instanceof UnresolvedFileHunksRenderer
+    ) {
+      this.hunksRenderer.setConflictState(
+        this.options.mergeConflictActionsType === 'none' ? [] : actions,
+        markerRows,
+        this.computedCache.fileDiff
+      );
+    }
+  }
+
+  private handleMergeConflictActionClick = ({
+    conflictIndex,
+    resolution,
+  }: MergeConflictActionTarget): void => {
     const action = this.conflictActions[conflictIndex];
     if (action == null) {
       return;
@@ -481,24 +532,22 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
     if (action.conflictIndex !== conflictIndex) {
       console.error({ conflictIndex, action });
       throw new Error(
-        "UnresolvedFile.resolveConflictAndRender: conflictIndex and conflictAction don't match"
+        "UnresolvedFile.handleMergeConflictActionClick: conflictIndex and conflictAction don't match"
       );
     }
     const payload: MergeConflictActionPayload = {
       resolution,
       conflict: action.conflict,
     };
-    const { file, fileDiff, actions, markerRows } =
-      this.resolveConflict(conflictIndex, resolution) ?? {};
-    if (
-      file == null ||
-      fileDiff == null ||
-      actions == null ||
-      markerRows == null
-    ) {
+    if (this.options.onMergeConflictAction != null) {
+      this.options.onMergeConflictAction(payload, this);
       return;
     }
-
+    const resolved = this.resolveConflict(conflictIndex, resolution);
+    if (resolved == null) {
+      return;
+    }
+    const { file, fileDiff, actions, markerRows } = resolved;
     this.computedCache = { file, fileDiff, actions, markerRows };
     this.setActiveMergeConflictState(actions, markerRows);
     // NOTE(amadeus): This is a bit jank, but helps to ensure we don't see a
@@ -515,48 +564,6 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
       this.render({ forceRender: true });
     }
     this.options.onMergeConflictResolve?.(file, payload);
-  }
-
-  private setActiveMergeConflictState(
-    actions: (MergeConflictDiffAction | undefined)[] = this.conflictActions,
-    markerRows: MergeConflictMarkerRow[] = this.markerRows
-  ): void {
-    this.conflictActions = actions;
-    this.markerRows = markerRows;
-    if (
-      this.computedCache.fileDiff != null &&
-      this.hunksRenderer instanceof UnresolvedFileHunksRenderer
-    ) {
-      this.hunksRenderer.setConflictState(
-        this.options.mergeConflictActionsType === 'none' ? [] : actions,
-        markerRows,
-        this.computedCache.fileDiff
-      );
-    }
-  }
-
-  private handleMergeConflictActionClick = (
-    target: MergeConflictActionTarget
-  ): void => {
-    const action = this.conflictActions[target.conflictIndex];
-    if (action == null) {
-      return;
-    }
-    if (action.conflictIndex !== target.conflictIndex) {
-      console.error({ conflictIndex: target.conflictIndex, action });
-      throw new Error(
-        "UnresolvedFile.handleMergeConflictActionClick: conflictIndex and conflictAction don't match"
-      );
-    }
-    const payload: MergeConflictActionPayload = {
-      resolution: target.resolution,
-      conflict: action.conflict,
-    };
-    if (this.options.onMergeConflictAction != null) {
-      this.options.onMergeConflictAction(payload, this);
-      return;
-    }
-    this.resolveConflictAndRender(target.conflictIndex, target.resolution);
   };
 
   private renderMergeConflictActionSlots(): void {
@@ -591,11 +598,10 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
       if (anchor == null) {
         continue;
       }
-      const conflictIndex = action.conflictIndex;
       const slotName = getMergeConflictActionSlotName({
         hunkIndex: anchor.hunkIndex,
         lineIndex: anchor.lineIndex,
-        conflictIndex,
+        conflictIndex: actionIndex,
       });
       const id = `${actionIndex}-${slotName}`;
       let cache = this.conflictActionCache.get(id);
@@ -604,8 +610,20 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
         !areMergeConflictActionsEqual(cache.action, action)
       ) {
         cache?.element.remove();
-        const rendered = this.renderMergeConflictAction(action);
-        if (rendered == null) {
+        let rendered =
+          typeof this.options.mergeConflictActionsType === 'function'
+            ? this.options.mergeConflictActionsType(action, this)
+            : undefined;
+        if (
+          typeof DocumentFragment !== 'undefined' &&
+          rendered instanceof DocumentFragment
+        ) {
+          const wrapper = document.createElement('div');
+          wrapper.style.display = 'contents';
+          wrapper.appendChild(rendered);
+          rendered = wrapper;
+        }
+        if (!(rendered instanceof HTMLElement)) {
           continue;
         }
         const element = createAnnotationWrapperNode(slotName);
@@ -616,35 +634,10 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
       }
       staleActions.delete(id);
     }
-    for (const [id, { element }] of staleActions.entries()) {
+    for (const [id, { element }] of staleActions) {
       this.conflictActionCache.delete(id);
       element.remove();
     }
-  }
-
-  private renderMergeConflictAction(
-    action: MergeConflictDiffAction
-  ): HTMLElement | undefined {
-    if (typeof this.options.mergeConflictActionsType !== 'function') {
-      return undefined;
-    }
-    const rendered = this.options.mergeConflictActionsType(action, this);
-    if (rendered == null) {
-      return undefined;
-    }
-    if (rendered instanceof HTMLElement) {
-      return rendered;
-    }
-    if (
-      typeof DocumentFragment !== 'undefined' &&
-      rendered instanceof DocumentFragment
-    ) {
-      const wrapper = document.createElement('div');
-      wrapper.style.display = 'contents';
-      wrapper.appendChild(rendered);
-      return wrapper;
-    }
-    return undefined;
   }
 
   private clearMergeConflictActionCache(): void {
@@ -653,213 +646,6 @@ export class UnresolvedFile<LAnnotation = undefined> extends FileDiff<
     }
     this.conflictActionCache.clear();
   }
-}
-
-interface RebuildFileAndActionsProps {
-  fileDiff: FileDiffMetadata;
-  previousActions: (MergeConflictDiffAction | undefined)[];
-  resolvedConflictIndex: number;
-  // FIXME: Probably should remove this...
-  // additionOffset: number;
-  // deletionOffset: number;
-  previousFile: FileContents | undefined;
-  resolution: MergeConflictResolution;
-}
-
-// Rebuild the emitted unresolved file contents and remaining action anchors in
-// one pass over the post-resolution diff state.
-function rebuildFileAndActions({
-  fileDiff,
-  previousActions,
-  resolvedConflictIndex,
-  previousFile,
-  resolution,
-}: RebuildFileAndActionsProps): Pick<
-  ResolveConflictReturn,
-  'file' | 'actions' | 'markerRows'
-> {
-  const resolvedAction = previousActions[resolvedConflictIndex];
-  if (resolvedAction == null) {
-    throw new Error(
-      'rebuildFileAndActions: missing resolved action for unresolved file rebuild'
-    );
-  }
-
-  const actions = updateConflictActionsAfterResolution(
-    previousActions,
-    resolvedConflictIndex,
-    resolvedAction,
-    resolution
-  );
-  const markerRows = buildMergeConflictMarkerRows(fileDiff, actions);
-
-  const file = rebuildUnresolvedFile({
-    fileDiff,
-    resolvedAction,
-    resolvedConflictIndex,
-    previousFile,
-    resolution,
-  });
-
-  return {
-    file,
-    actions,
-    markerRows,
-  };
-}
-
-interface RebuildUnresolvedFileProps {
-  fileDiff: FileDiffMetadata;
-  resolvedAction: MergeConflictDiffAction;
-  resolvedConflictIndex: number;
-  previousFile: FileContents | undefined;
-  resolution: MergeConflictResolution;
-}
-
-// Rebuild the unresolved file text from the previous unresolved source so we
-// preserve remaining marker blocks exactly while the diff state stays in-place.
-function rebuildUnresolvedFile({
-  resolvedAction,
-  resolvedConflictIndex,
-  previousFile,
-  fileDiff,
-  resolution,
-}: RebuildUnresolvedFileProps): FileContents {
-  const previousContents = previousFile?.contents ?? '';
-  const lines = splitFileContents(previousContents);
-  const { conflict } = resolvedAction;
-  const replacementLines = getResolvedConflictReplacementLines(
-    lines,
-    conflict,
-    resolution
-  );
-  const contents = [
-    ...lines.slice(0, conflict.startLineIndex),
-    ...replacementLines,
-    ...lines.slice(conflict.endLineIndex + 1),
-  ].join('');
-
-  return {
-    name: previousFile?.name ?? fileDiff.name,
-    contents,
-    cacheKey:
-      previousFile?.cacheKey != null
-        ? `${previousFile.cacheKey}:mc-${resolvedConflictIndex}-${resolution}`
-        : undefined,
-  };
-}
-
-function getResolvedConflictReplacementLines(
-  lines: string[],
-  conflict: MergeConflictDiffAction['conflict'],
-  resolution: MergeConflictResolution
-): string[] {
-  const currentLines = lines.slice(
-    conflict.startLineIndex + 1,
-    conflict.baseMarkerLineIndex ?? conflict.separatorLineIndex
-  );
-  const incomingLines = lines.slice(
-    conflict.separatorLineIndex + 1,
-    conflict.endLineIndex
-  );
-
-  if (resolution === 'current') {
-    return currentLines;
-  }
-  if (resolution === 'incoming') {
-    return incomingLines;
-  }
-  return [...currentLines, ...incomingLines];
-}
-
-// The diff resolver keeps hunk/content group indexes stable, so the only
-// follow-up update we need here is shifting unresolved source-region line
-// numbers for later conflicts in the rebuilt file text.
-function updateConflictActionsAfterResolution(
-  previousActions: (MergeConflictDiffAction | undefined)[],
-  resolvedConflictIndex: number,
-  resolvedAction: MergeConflictDiffAction,
-  resolution: MergeConflictResolution
-): (MergeConflictDiffAction | undefined)[] {
-  const lineDelta = getResolvedConflictLineDelta(
-    resolvedAction.conflict,
-    resolution
-  );
-
-  return previousActions.map((action, index) => {
-    if (index === resolvedConflictIndex) {
-      return undefined;
-    }
-    if (action == null) {
-      return undefined;
-    }
-    if (action.conflict.startLineIndex > resolvedAction.conflict.endLineIndex) {
-      return {
-        ...action,
-        conflict: shiftMergeConflictRegion(action.conflict, lineDelta),
-      };
-    }
-    return action;
-  });
-}
-
-function getResolvedConflictLineDelta(
-  conflict: MergeConflictRegion,
-  resolution: MergeConflictResolution
-): number {
-  const currentLineCount =
-    (conflict.baseMarkerLineIndex ?? conflict.separatorLineIndex) -
-    conflict.startLineIndex -
-    1;
-  const incomingLineCount =
-    conflict.endLineIndex - conflict.separatorLineIndex - 1;
-  const replacementLineCount =
-    resolution === 'current'
-      ? currentLineCount
-      : resolution === 'incoming'
-        ? incomingLineCount
-        : currentLineCount + incomingLineCount;
-  const conflictLineCount = conflict.endLineIndex - conflict.startLineIndex + 1;
-  return replacementLineCount - conflictLineCount;
-}
-
-function shiftMergeConflictRegion(
-  conflict: MergeConflictRegion,
-  lineDelta: number
-): MergeConflictRegion {
-  return {
-    ...conflict,
-    startLineIndex: conflict.startLineIndex + lineDelta,
-    startLineNumber: conflict.startLineNumber + lineDelta,
-    separatorLineIndex: conflict.separatorLineIndex + lineDelta,
-    separatorLineNumber: conflict.separatorLineNumber + lineDelta,
-    endLineIndex: conflict.endLineIndex + lineDelta,
-    endLineNumber: conflict.endLineNumber + lineDelta,
-    baseMarkerLineIndex:
-      conflict.baseMarkerLineIndex != null
-        ? conflict.baseMarkerLineIndex + lineDelta
-        : undefined,
-    baseMarkerLineNumber:
-      conflict.baseMarkerLineNumber != null
-        ? conflict.baseMarkerLineNumber + lineDelta
-        : undefined,
-  };
-}
-
-function shouldRenderCode(
-  pre: HTMLPreElement | undefined,
-  fileDiff: FileDiffMetadata | undefined,
-  collapsed = false
-): boolean {
-  return !collapsed && pre == null && fileDiff != null;
-}
-
-function shouldRenderHeader(
-  headerElement: HTMLElement | undefined,
-  fileDiff: FileDiffMetadata | undefined,
-  disableFileHeader = false
-): boolean {
-  return headerElement == null && fileDiff != null && !disableFileHeader;
 }
 
 // NOTE(amadeus): Should probably pull this out into a util, and make variants

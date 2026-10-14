@@ -195,53 +195,50 @@ const keyboardCodeKeys: Partial<Record<string, KeyboardKey>> = {
 
 function getCompiledEditorKeymap(keymap: EditorKeymap): CompiledEditorKeymap {
   let compiledKeymap = compiledEditorKeymaps.get(keymap);
-  if (compiledKeymap === undefined) {
-    compiledKeymap = {
-      mac: new Map(),
-      windows: new Map(),
-      linux: new Map(),
-    };
+  if (compiledKeymap !== undefined) {
+    return compiledKeymap;
+  }
+  compiledKeymap = { mac: new Map(), windows: new Map(), linux: new Map() };
 
-    // Compile once so keydown resolves by modifier mask and key without
-    // scanning or splitting every configured shortcut.
-    for (const entry of keymap) {
-      for (const shortcut of Object.keys(entry.bindings) as EditorShortcut[]) {
-        const command = entry.bindings[shortcut];
-        if (command === undefined) {
+  // Compile once so keydown resolves by modifier mask and key without
+  // scanning or splitting every configured shortcut.
+  for (const entry of keymap) {
+    for (const shortcut of Object.keys(entry.bindings) as EditorShortcut[]) {
+      const command = entry.bindings[shortcut];
+      if (command === undefined) {
+        continue;
+      }
+      const parts = shortcut.split('+');
+      const shortcutKey = parts.pop() as KeyboardKey;
+
+      for (const platform of ['mac', 'windows', 'linux'] as const) {
+        if (entry.platform !== undefined && entry.platform !== platform) {
           continue;
         }
-        const parts = shortcut.split('+');
-        const shortcutKey = parts.pop() as KeyboardKey;
-
-        for (const platform of ['mac', 'windows', 'linux'] as const) {
-          if (entry.platform !== undefined && entry.platform !== platform) {
-            continue;
+        let modifiers = 0;
+        for (const modifier of parts as KeyboardModifier[]) {
+          if (modifier === 'alt') {
+            modifiers |= 1;
+          } else if (modifier === 'ctrl') {
+            modifiers |= 2;
+          } else if (modifier === 'cmd') {
+            modifiers |= 4;
+          } else if (modifier === 'shift') {
+            modifiers |= 8;
+          } else if (modifier === 'cmdOrCtrl') {
+            modifiers |= platform === 'mac' ? 4 : 2;
           }
-          let modifiers = 0;
-          for (const modifier of parts as KeyboardModifier[]) {
-            if (modifier === 'alt') {
-              modifiers |= 1;
-            } else if (modifier === 'ctrl') {
-              modifiers |= 2;
-            } else if (modifier === 'cmd') {
-              modifiers |= 4;
-            } else if (modifier === 'shift') {
-              modifiers |= 8;
-            } else if (modifier === 'cmdOrCtrl') {
-              modifiers |= platform === 'mac' ? 4 : 2;
-            }
-          }
-          let bindings = compiledKeymap[platform].get(modifiers);
-          if (bindings === undefined) {
-            bindings = new Map();
-            compiledKeymap[platform].set(modifiers, bindings);
-          }
-          bindings.set(shortcutKey, command);
         }
+        let bindings = compiledKeymap[platform].get(modifiers);
+        if (bindings === undefined) {
+          bindings = new Map();
+          compiledKeymap[platform].set(modifiers, bindings);
+        }
+        bindings.set(shortcutKey, command);
       }
     }
-    compiledEditorKeymaps.set(keymap, compiledKeymap);
   }
+  compiledEditorKeymaps.set(keymap, compiledKeymap);
   return compiledKeymap;
 }
 
@@ -274,21 +271,19 @@ export function resolveEditorCommandFromKeyboardEvent(
     (event.metaKey ? 4 : 0) |
     (event.shiftKey ? 8 : 0);
 
-  if (keymap !== undefined) {
-    const bindings = getCompiledEditorKeymap(keymap)[platform].get(modifiers);
-    const command =
+  // Compiled keys are always strings, so an undefined codeKey never matches.
+  const resolve = (compiled: CompiledEditorKeymap) => {
+    const bindings = compiled[platform].get(modifiers);
+    return (
       bindings?.get(eventKey as KeyboardKey) ??
-      (codeKey === undefined ? undefined : bindings?.get(codeKey));
-    if (command !== undefined) {
-      return command;
-    }
-  }
-
-  const bindings = compiledDefaultKeymap[platform].get(modifiers);
-  return (
-    bindings?.get(eventKey as KeyboardKey) ??
-    (codeKey === undefined ? undefined : bindings?.get(codeKey))
-  );
+      bindings?.get(codeKey as KeyboardKey)
+    );
+  };
+  const command =
+    keymap === undefined ? undefined : resolve(getCompiledEditorKeymap(keymap));
+  // Warning: only undefined falls back. A plain-JS `null` binding must win so
+  // it disables the default shortcut.
+  return command !== undefined ? command : resolve(compiledDefaultKeymap);
 }
 
 // Detects the native "find again" shortcut (cmd/ctrl+g for next, adding shift
@@ -299,15 +294,11 @@ export function resolveFindAgainShortcut(
   event: KeyboardEvent,
   isMac: boolean = isMacLike()
 ): 'next' | 'previous' | undefined {
-  if (event.altKey) {
-    return undefined;
-  }
-  if (!isPrimaryModifier(event, isMac)) {
-    return undefined;
-  }
-  const normalizedKey =
-    event.key.length === 1 ? event.key.toLowerCase() : event.key;
-  if (normalizedKey === 'g' || event.code === 'KeyG') {
+  if (
+    !event.altKey &&
+    isPrimaryModifier(event, isMac) &&
+    (event.key === 'g' || event.key === 'G' || event.code === 'KeyG')
+  ) {
     return event.shiftKey ? 'previous' : 'next';
   }
   return undefined;

@@ -10,7 +10,6 @@ import type {
   FileContents,
   FileDiffMetadata,
   Hunk,
-  HunkLineType,
   ParsedPatch,
 } from '../types';
 import { cleanLastNewline } from './cleanLastNewline';
@@ -54,69 +53,53 @@ function _processPatch(
   throwOnError = false,
   patchIndex?: number
 ): ParsedPatch {
-  const isGitDiff = isGitDiffPatch(data);
-  const rawFiles = isGitDiff
-    ? splitGitDiffFiles(data)
-    : splitUnifiedDiffFiles(data);
+  const isGitDiff =
+    data.startsWith('diff --git') || data.includes('\ndiff --git');
   let patchMetadata: string | undefined;
   const files: FileDiffMetadata[] = [];
-  for (const fileOrPatchMetadata of rawFiles) {
-    if (isGitDiff && !GIT_DIFF_FILE_BREAK_REGEX.test(fileOrPatchMetadata)) {
-      if (patchMetadata == null) {
-        patchMetadata = detachString(fileOrPatchMetadata);
-      } else {
-        if (throwOnError) {
-          throw Error('parsePatchContent: unknown file blob');
-        } else {
-          console.error(
-            'parsePatchContent: unknown file blob:',
-            fileOrPatchMetadata
-          );
-        }
-      }
-      // If we get in here, it's most likely the introductory metadata from the
-      // patch, or something is fucked with the diff format
-      continue;
-    } else if (
-      !isGitDiff &&
-      !startsWithUnifiedDiffFileHeader(fileOrPatchMetadata)
+  for (const fileOrPatchMetadata of isGitDiff
+    ? splitAtLinePrefix(data, 'diff --git')
+    : splitUnifiedDiffFiles(data)) {
+    // Anything that is not a file is most likely the introductory metadata
+    // from the patch, or something is fucked with the diff format
+    if (
+      isGitDiff
+        ? !GIT_DIFF_FILE_BREAK_REGEX.test(fileOrPatchMetadata)
+        : !isUnifiedDiffFileHeaderAt(fileOrPatchMetadata, 0)
     ) {
       if (patchMetadata == null) {
         patchMetadata = detachString(fileOrPatchMetadata);
+      } else if (throwOnError) {
+        throw Error('parsePatchContent: unknown file blob');
       } else {
-        if (throwOnError) {
-          throw Error('parsePatchContent: unknown file blob');
-        } else {
-          console.error(
-            'parsePatchContent: unknown file blob:',
-            fileOrPatchMetadata
-          );
-        }
+        console.error(
+          'parsePatchContent: unknown file blob:',
+          fileOrPatchMetadata
+        );
       }
       continue;
     }
-    const currentFile = _processFile(fileOrPatchMetadata, {
-      cacheKey:
-        cacheKeyPrefix != null
-          ? patchIndex == null
-            ? composeCacheKey(
-                'patch-file',
-                cacheKeyPrefix,
-                String(files.length)
-              )
-            : composeCacheKey(
-                'patch-file',
-                cacheKeyPrefix,
-                String(patchIndex),
-                String(files.length)
-              )
-          : undefined,
-      isGitDiff,
-      throwOnError,
-    });
-    if (currentFile != null) {
-      files.push(currentFile);
-    }
+    files.push(
+      _processFile(fileOrPatchMetadata, {
+        cacheKey:
+          cacheKeyPrefix != null
+            ? patchIndex == null
+              ? composeCacheKey(
+                  'patch-file',
+                  cacheKeyPrefix,
+                  String(files.length)
+                )
+              : composeCacheKey(
+                  'patch-file',
+                  cacheKeyPrefix,
+                  String(patchIndex),
+                  String(files.length)
+                )
+            : undefined,
+        isGitDiff,
+        throwOnError,
+      })
+    );
   }
   return { patchMetadata, files };
 }
@@ -149,174 +132,130 @@ function _processFile(
     newFile,
     throwOnError = false,
   }: ProcessFileOptions = {}
-): FileDiffMetadata | undefined {
+): FileDiffMetadata {
   let lastHunkEnd = 0;
-  const hunks = splitAtLinePrefix(fileDiffString, '@@ ');
-  let currentFile: FileDiffMetadata | undefined;
   const isPartial = oldFile == null || newFile == null;
   let deletionLineIndex = 0;
   let additionLineIndex = 0;
-  for (const hunk of hunks) {
-    const lines = splitWithNewlines(hunk);
-    const firstLine = lines[0];
-    if (firstLine == null) {
-      if (throwOnError) {
-        throw Error('parsePatchContent: invalid hunk');
-      } else {
-        console.error('parsePatchContent: invalid hunk', hunk);
-      }
-      continue;
-    }
-    const fileHeader = parseHunkHeader(firstLine);
-    let additionLines = 0;
-    let deletionLines = 0;
-    // Setup currentFile, this should be the first iteration of our hunks, and
-    // technically not a hunk
-    if (fileHeader == null || currentFile == null) {
-      if (currentFile != null) {
+  // The first chunk is the file header, technically not a hunk
+  const chunks = splitAtLinePrefix(fileDiffString, '@@ ');
+  const currentFile: FileDiffMetadata = {
+    name: '',
+    type: 'change',
+    hunks: [],
+    splitLineCount: 0,
+    unifiedLineCount: 0,
+    isPartial,
+    // An empty file has no lines at all
+    additionLines:
+      isPartial || newFile.contents === ''
+        ? []
+        : splitFileContents(newFile.contents),
+    deletionLines:
+      isPartial || oldFile.contents === ''
+        ? []
+        : splitFileContents(oldFile.contents),
+    cacheKey: cacheKey == null ? undefined : detachString(cacheKey),
+  };
+
+  for (const line of splitWithNewlines(chunks[0])) {
+    if (line.startsWith('diff --git')) {
+      const filenameMatch = line.trim().match(GIT_DIFF_HEADER_FILENAMES);
+      if (filenameMatch == null) {
         if (throwOnError) {
-          throw Error('parsePatchContent: Invalid hunk');
-        } else {
-          console.error('parsePatchContent: Invalid hunk', hunk);
+          throw Error('parsePatchContent: invalid git diff header');
         }
+        console.error('parsePatchContent: invalid git diff header', line);
         continue;
       }
-      currentFile = {
-        name: '',
-        type: 'change',
-        hunks: [],
-        splitLineCount: 0,
-        unifiedLineCount: 0,
-        isPartial,
-        additionLines:
-          !isPartial && oldFile != null && newFile != null
-            ? splitFileContents(newFile.contents)
-            : [],
-        deletionLines:
-          !isPartial && oldFile != null && newFile != null
-            ? splitFileContents(oldFile.contents)
-            : [],
-        cacheKey: maybeDetachOptionalString(cacheKey),
-      };
-      // If either file is technically empty, then we should empty the
-      // arrays respectively
-      if (currentFile.additionLines.length === 1 && newFile?.contents === '') {
-        currentFile.additionLines.length = 0;
-      }
-      if (currentFile.deletionLines.length === 1 && oldFile?.contents === '') {
-        currentFile.deletionLines.length = 0;
-      }
-
-      for (const line of lines) {
-        if (line.startsWith('diff --git')) {
-          const filenameMatch = line.trim().match(GIT_DIFF_HEADER_FILENAMES);
-          if (filenameMatch == null) {
-            if (throwOnError) {
-              throw Error('parsePatchContent: invalid git diff header');
-            } else {
-              console.error('parsePatchContent: invalid git diff header', line);
-            }
-            continue;
-          }
-          const prevName = decodeDiffFileName(filenameMatch[1], true);
-          const name = decodeDiffFileName(filenameMatch[2], true);
-          currentFile.name = detachString(name);
-          if (prevName !== name) {
-            currentFile.prevName = detachString(prevName);
-          }
-          continue;
-        }
-
-        const filenameMatch =
-          line.startsWith('---') || line.startsWith('+++')
-            ? line.match(FILENAME_HEADER_REGEX)
-            : null;
-        if (filenameMatch != null) {
-          const [, type, rawFileName] = filenameMatch;
-          const fileName = decodeDiffFileName(rawFileName, isGitDiff);
-          if (type === '---' && fileName !== '/dev/null') {
-            const detachedFileName = detachString(fileName);
-            currentFile.prevName = detachedFileName;
-            currentFile.name = detachedFileName;
-          } else if (type === '+++' && fileName !== '/dev/null') {
-            currentFile.name = detachString(fileName);
-          }
-        }
-        // Git diffs have a bunch of additional metadata we can pull from
-        else if (isGitDiff) {
-          if (line.startsWith('new mode ')) {
-            currentFile.mode = detachString(
-              line.slice('new mode'.length).trim()
-            );
-          }
-          if (line.startsWith('old mode ')) {
-            currentFile.prevMode = detachString(
-              line.slice('old mode'.length).trim()
-            );
-          }
-          if (line.startsWith('new file mode')) {
-            currentFile.type = 'new';
-            currentFile.mode = detachString(
-              line.slice('new file mode'.length).trim()
-            );
-          }
-          if (line.startsWith('deleted file mode')) {
-            currentFile.type = 'deleted';
-            currentFile.mode = detachString(
-              line.slice('deleted file mode'.length).trim()
-            );
-          }
-          if (line.startsWith('similarity index')) {
-            if (line.startsWith('similarity index 100%')) {
-              currentFile.type = 'rename-pure';
-            } else {
-              currentFile.type = 'rename-changed';
-            }
-          }
-          if (line.startsWith('index ')) {
-            const [, prevObjectId, newObjectId, mode] =
-              line.trim().match(INDEX_LINE_METADATA) ?? [];
-            if (prevObjectId != null) {
-              currentFile.prevObjectId = detachString(prevObjectId);
-            }
-            if (newObjectId != null) {
-              currentFile.newObjectId = detachString(newObjectId);
-            }
-            if (mode != null) {
-              currentFile.mode = detachString(mode);
-            }
-          }
-          // Pure renames and copies have no --- / +++ headers. These paths
-          // are already relative to the repository, without transport prefixes.
-          if (
-            line.startsWith('rename from ') ||
-            line.startsWith('copy from ')
-          ) {
-            currentFile.prevName = detachString(
-              decodeDiffFileName(
-                line.slice(
-                  line.startsWith('rename')
-                    ? 'rename from '.length
-                    : 'copy from '.length
-                )
-              )
-            );
-          }
-          if (line.startsWith('rename to ') || line.startsWith('copy to ')) {
-            currentFile.name = detachString(
-              decodeDiffFileName(
-                line.slice(
-                  line.startsWith('rename')
-                    ? 'rename to '.length
-                    : 'copy to '.length
-                )
-              )
-            );
-          }
-        }
+      const prevName = decodeDiffFileName(filenameMatch[1], true);
+      const name = decodeDiffFileName(filenameMatch[2], true);
+      currentFile.name = detachString(name);
+      if (prevName !== name) {
+        currentFile.prevName = detachString(prevName);
       }
       continue;
     }
+
+    const filenameMatch = line.match(FILENAME_HEADER_REGEX);
+    if (filenameMatch != null) {
+      const [, type, rawFileName] = filenameMatch;
+      const fileName = decodeDiffFileName(rawFileName, isGitDiff);
+      if (fileName !== '/dev/null') {
+        const detachedFileName = detachString(fileName);
+        currentFile.name = detachedFileName;
+        if (type === '---') {
+          currentFile.prevName = detachedFileName;
+        }
+      }
+    }
+    // Git diffs have a bunch of additional metadata we can pull from
+    else if (isGitDiff) {
+      if (line.startsWith('new mode ')) {
+        currentFile.mode = detachString(line.slice('new mode'.length).trim());
+      } else if (line.startsWith('old mode ')) {
+        currentFile.prevMode = detachString(
+          line.slice('old mode'.length).trim()
+        );
+      } else if (line.startsWith('new file mode')) {
+        currentFile.type = 'new';
+        currentFile.mode = detachString(
+          line.slice('new file mode'.length).trim()
+        );
+      } else if (line.startsWith('deleted file mode')) {
+        currentFile.type = 'deleted';
+        currentFile.mode = detachString(
+          line.slice('deleted file mode'.length).trim()
+        );
+      } else if (line.startsWith('similarity index')) {
+        currentFile.type = line.startsWith('similarity index 100%')
+          ? 'rename-pure'
+          : 'rename-changed';
+      } else if (line.startsWith('index ')) {
+        const [, prevObjectId, newObjectId, mode] =
+          line.trim().match(INDEX_LINE_METADATA) ?? [];
+        if (prevObjectId != null) {
+          currentFile.prevObjectId = detachString(prevObjectId);
+        }
+        if (newObjectId != null) {
+          currentFile.newObjectId = detachString(newObjectId);
+        }
+        if (mode != null) {
+          currentFile.mode = detachString(mode);
+        }
+      } else {
+        // Pure renames and copies have no --- / +++ headers. These paths
+        // are already relative to the repository, without transport
+        // prefixes.
+        const renameMatch = line.match(/^(?:rename|copy) (from|to) /);
+        if (renameMatch != null) {
+          const fileName = detachString(
+            decodeDiffFileName(line.slice(renameMatch[0].length))
+          );
+          if (renameMatch[1] === 'from') {
+            currentFile.prevName = fileName;
+          } else {
+            currentFile.name = fileName;
+          }
+        }
+      }
+    }
+  }
+
+  for (let chunkIndex = 1; chunkIndex < chunks.length; chunkIndex++) {
+    const hunk = chunks[chunkIndex];
+    const lines = splitWithNewlines(hunk);
+    const firstLine = lines[0];
+    const fileHeader = parseHunkHeader(firstLine);
+    if (fileHeader == null) {
+      if (throwOnError) {
+        throw Error('parsePatchContent: Invalid hunk');
+      }
+      console.error('parsePatchContent: Invalid hunk', hunk);
+      continue;
+    }
+    let additionLines = 0;
+    let deletionLines = 0;
 
     // Otherwise, time to start parsing out the hunk
     let currentContent: ContextContent | ChangeContent | undefined;
@@ -324,19 +263,23 @@ function _processFile(
 
     // Strip trailing bare newlines (format-patch separators between commits)
     // if needed
+    let lastLine = lines.at(-1);
     while (
-      lines.length > 0 &&
-      (lines[lines.length - 1] === '\n' ||
-        lines[lines.length - 1] === '\r' ||
-        lines[lines.length - 1] === '\r\n' ||
-        lines[lines.length - 1] === '')
+      lastLine === '\n' ||
+      lastLine === '\r' ||
+      lastLine === '\r\n' ||
+      lastLine === ''
     ) {
       lines.pop();
+      lastLine = lines.at(-1);
     }
 
-    const { additionStart, deletionStart } = fileHeader;
-    deletionLineIndex = isPartial ? deletionLineIndex : deletionStart - 1;
-    additionLineIndex = isPartial ? additionLineIndex : additionStart - 1;
+    const { additionStart, additionCount, deletionStart, deletionCount } =
+      fileHeader;
+    if (!isPartial) {
+      deletionLineIndex = deletionStart - 1;
+      additionLineIndex = additionStart - 1;
+    }
 
     const hunkData: Hunk = {
       collapsedBefore: 0,
@@ -347,11 +290,11 @@ function _processFile(
       unifiedLineCount: 0,
       unifiedLineStart: 0,
 
-      additionCount: fileHeader.additionCount,
+      additionCount,
       additionStart,
       additionLines,
 
-      deletionCount: fileHeader.deletionCount,
+      deletionCount,
       deletionStart,
       deletionLines,
 
@@ -359,7 +302,10 @@ function _processFile(
       additionLineIndex,
 
       hunkContent: [],
-      hunkContext: maybeDetachOptionalString(fileHeader.hunkContext),
+      hunkContext:
+        fileHeader.hunkContext == null
+          ? undefined
+          : detachString(fileHeader.hunkContext),
       hunkSpecs: detachString(firstLine),
 
       noEOFCRAdditions: false,
@@ -371,14 +317,16 @@ function _processFile(
     let parsedDeletionLines = 0;
     for (let lineIndex = 1; lineIndex < lines.length; lineIndex++) {
       const rawLine = lines[lineIndex];
+      const firstChar = rawLine[0];
+      const isBodyLine =
+        firstChar === '+' || firstChar === '-' || firstChar === ' ';
       if (
-        parsedAdditionLines >= hunkData.additionCount &&
-        parsedDeletionLines >= hunkData.deletionCount &&
-        !rawLine.startsWith('\\')
+        parsedAdditionLines >= additionCount &&
+        parsedDeletionLines >= deletionCount &&
+        firstChar !== '\\'
       ) {
-        const isUnexpectedBodyLine =
-          isHunkBodyLine(rawLine) && !isFormatPatchVersionSeparator(rawLine);
-        if (!isUnexpectedBodyLine) {
+        // A format-patch version separator (`-- `) ends the last hunk
+        if (!isBodyLine || /^--[ \t\r\n]*$/.test(rawLine)) {
           break;
         }
         if (throwOnError) {
@@ -386,16 +334,35 @@ function _processFile(
         }
       }
 
-      const firstChar = rawLine[0];
+      if (firstChar === '\\') {
+        if (currentContent == null) {
+          continue;
+        }
+        // If we're dealing with partial content from a diff, we need to strip
+        // newlines manually from the content
+        if (lastLineType !== 'deletion') {
+          hunkData.noEOFCRAdditions = true;
+          if (isPartial) {
+            currentFile.additionLines.push(
+              cleanLastNewline(currentFile.additionLines.pop()!)
+            );
+          }
+        }
+        if (lastLineType !== 'addition') {
+          hunkData.noEOFCRDeletions = true;
+          if (isPartial) {
+            currentFile.deletionLines.push(
+              cleanLastNewline(currentFile.deletionLines.pop()!)
+            );
+          }
+        }
+        continue;
+      }
+
       // If we can't properly process the line, well, lets just try to salvage
       // things and continue... It's possible an AI generated diff might have
       // some stray blank lines or something in there
-      if (
-        firstChar !== '+' &&
-        firstChar !== '-' &&
-        firstChar !== ' ' &&
-        firstChar !== '\\'
-      ) {
+      if (!isBodyLine) {
         if (throwOnError) {
           throw Error('parsePatchContent: invalid hunk line');
         }
@@ -406,142 +373,100 @@ function _processFile(
         continue;
       }
 
-      const type = parseRawLineType(firstChar);
-      if (type === 'addition') {
-        if (throwOnError && parsedAdditionLines >= hunkData.additionCount) {
-          throw Error('parsePatchContent: hunk has too many addition lines');
-        }
-        const line = getParsedLineContent(rawLine);
-        if (currentContent == null || currentContent.type !== 'change') {
-          currentContent = createContentGroup(
-            'change',
-            deletionLineIndex,
-            additionLineIndex
-          );
-          hunkData.hunkContent.push(currentContent);
-        }
-        additionLineIndex++;
-        parsedAdditionLines++;
-        if (isPartial) {
-          currentFile.additionLines.push(line);
-        }
-        currentContent.additions++;
-        additionLines++;
-        lastLineType = 'addition';
-      } else if (type === 'deletion') {
-        if (throwOnError && parsedDeletionLines >= hunkData.deletionCount) {
-          throw Error('parsePatchContent: hunk has too many deletion lines');
-        }
-        const line = getParsedLineContent(rawLine);
-        if (currentContent == null || currentContent.type !== 'change') {
-          currentContent = createContentGroup(
-            'change',
-            deletionLineIndex,
-            additionLineIndex
-          );
-          hunkData.hunkContent.push(currentContent);
-        }
-        deletionLineIndex++;
-        parsedDeletionLines++;
-        if (isPartial) {
-          currentFile.deletionLines.push(line);
-        }
-        currentContent.deletions++;
-        deletionLines++;
-        lastLineType = 'deletion';
-      } else if (type === 'context') {
+      if (firstChar === ' ') {
         if (
           throwOnError &&
-          (parsedDeletionLines >= hunkData.deletionCount ||
-            parsedAdditionLines >= hunkData.additionCount)
+          (parsedDeletionLines >= deletionCount ||
+            parsedAdditionLines >= additionCount)
         ) {
           throw Error('parsePatchContent: hunk has too many context lines');
         }
-        const line = getParsedLineContent(rawLine);
-        if (currentContent == null || currentContent.type !== 'context') {
-          currentContent = createContentGroup(
-            'context',
+        if (currentContent?.type !== 'context') {
+          currentContent = {
+            type: 'context',
+            lines: 0,
+            additionLineIndex,
             deletionLineIndex,
-            additionLineIndex
-          );
+          };
           hunkData.hunkContent.push(currentContent);
-        }
-        additionLineIndex++;
-        deletionLineIndex++;
-        parsedAdditionLines++;
-        parsedDeletionLines++;
-        if (isPartial) {
-          currentFile.deletionLines.push(line);
-          currentFile.additionLines.push(line);
         }
         currentContent.lines++;
         lastLineType = 'context';
-      } else if (type === 'metadata' && currentContent != null) {
-        if (currentContent.type === 'context') {
-          hunkData.noEOFCRAdditions = true;
-          hunkData.noEOFCRDeletions = true;
-        } else if (lastLineType === 'deletion') {
-          hunkData.noEOFCRDeletions = true;
-        } else if (lastLineType === 'addition') {
-          hunkData.noEOFCRAdditions = true;
-        }
-        // If we're dealing with partial content from a diff, we need to strip
-        // newlines manually from the content
+      } else {
+        const isAddition = firstChar === '+';
         if (
-          isPartial &&
-          (lastLineType === 'addition' || lastLineType === 'context')
+          throwOnError &&
+          (isAddition
+            ? parsedAdditionLines >= additionCount
+            : parsedDeletionLines >= deletionCount)
         ) {
-          const lastIndex = currentFile.additionLines.length - 1;
-          if (lastIndex >= 0) {
-            currentFile.additionLines[lastIndex] = cleanLastNewline(
-              currentFile.additionLines[lastIndex]
-            );
-          }
+          throw Error(
+            `parsePatchContent: hunk has too many ${isAddition ? 'addition' : 'deletion'} lines`
+          );
         }
-        if (
-          isPartial &&
-          (lastLineType === 'deletion' || lastLineType === 'context')
-        ) {
-          const lastIndex = currentFile.deletionLines.length - 1;
-          if (lastIndex >= 0) {
-            currentFile.deletionLines[lastIndex] = cleanLastNewline(
-              currentFile.deletionLines[lastIndex]
-            );
-          }
+        if (currentContent?.type !== 'change') {
+          currentContent = {
+            type: 'change',
+            additions: 0,
+            deletions: 0,
+            additionLineIndex,
+            deletionLineIndex,
+          };
+          hunkData.hunkContent.push(currentContent);
+        }
+        if (isAddition) {
+          currentContent.additions++;
+          additionLines++;
+          lastLineType = 'addition';
+        } else {
+          currentContent.deletions++;
+          deletionLines++;
+          lastLineType = 'deletion';
+        }
+      }
+
+      const processedLine = rawLine.slice(1);
+      const line = detachString(processedLine === '' ? '\n' : processedLine);
+      if (firstChar !== '-') {
+        additionLineIndex++;
+        parsedAdditionLines++;
+        if (isPartial) {
+          currentFile.additionLines.push(line);
+        }
+      }
+      if (firstChar !== '+') {
+        deletionLineIndex++;
+        parsedDeletionLines++;
+        if (isPartial) {
+          currentFile.deletionLines.push(line);
         }
       }
     }
 
     if (
-      parsedAdditionLines !== hunkData.additionCount ||
-      parsedDeletionLines !== hunkData.deletionCount
+      parsedAdditionLines !== additionCount ||
+      parsedDeletionLines !== deletionCount
     ) {
       if (throwOnError) {
         throw Error('parsePatchContent: hunk line count mismatch');
       }
       console.error(
-        `parsePatchContent: hunk line count mismatch: "${firstLine.trimEnd()}", declared old/new ${hunkData.deletionCount}/${hunkData.additionCount}, parsed old/new ${parsedDeletionLines}/${parsedAdditionLines}`
+        `parsePatchContent: hunk line count mismatch: "${firstLine.trimEnd()}", declared old/new ${deletionCount}/${additionCount}, parsed old/new ${parsedDeletionLines}/${parsedAdditionLines}`
       );
       // Re-encode each original boundary using the repaired count. Zero-count
       // ranges use the boundary itself as their start; positive ranges use +1.
       const repairedAdditionStart =
-        getHunkSideStartBoundary(
-          hunkData.additionStart,
-          hunkData.additionCount
-        ) + (parsedAdditionLines === 0 ? 0 : 1);
+        getHunkSideStartBoundary(additionStart, additionCount) +
+        (parsedAdditionLines === 0 ? 0 : 1);
       const repairedDeletionStart =
-        getHunkSideStartBoundary(
-          hunkData.deletionStart,
-          hunkData.deletionCount
-        ) + (parsedDeletionLines === 0 ? 0 : 1);
+        getHunkSideStartBoundary(deletionStart, deletionCount) +
+        (parsedDeletionLines === 0 ? 0 : 1);
 
       // Hydrated hunks index into full-file line arrays, so their indexes must
       // move with repaired starts. Partial hunks index patch-built arrays.
       if (!isPartial) {
-        const additionStartDelta =
-          repairedAdditionStart - hunkData.additionStart;
-        const deletionStartDelta =
-          repairedDeletionStart - hunkData.deletionStart;
+        const additionStartDelta = repairedAdditionStart - additionStart;
+        const deletionStartDelta = repairedDeletionStart - deletionStart;
         hunkData.additionLineIndex += additionStartDelta;
         hunkData.deletionLineIndex += deletionStartDelta;
         for (const content of hunkData.hunkContent) {
@@ -591,9 +516,6 @@ function _processFile(
     currentFile.unifiedLineCount +=
       hunkData.collapsedBefore + hunkData.unifiedLineCount;
   }
-  if (currentFile == null) {
-    return undefined;
-  }
   if (
     throwOnError &&
     isPartial &&
@@ -611,13 +533,10 @@ function _processFile(
     currentFile.additionLines.length > 0 &&
     currentFile.deletionLines.length > 0
   ) {
-    const lastHunk = currentFile.hunks[currentFile.hunks.length - 1];
-    const lastHunkEnd = getHunkSideEndBoundary(
-      lastHunk.additionStart,
-      lastHunk.additionCount
+    const collapsedAfter = Math.max(
+      currentFile.additionLines.length - lastHunkEnd,
+      0
     );
-    const totalFileLines = currentFile.additionLines.length;
-    const collapsedAfter = Math.max(totalFileLines - lastHunkEnd, 0);
     currentFile.splitLineCount += collapsedAfter;
     currentFile.unifiedLineCount += collapsedAfter;
   }
@@ -629,24 +548,13 @@ function _processFile(
       currentFile.prevName != null &&
       currentFile.name !== currentFile.prevName
     ) {
-      if (currentFile.hunks.length > 0) {
-        currentFile.type = 'rename-changed';
-      } else {
-        currentFile.type = 'rename-pure';
-      }
+      currentFile.type =
+        currentFile.hunks.length > 0 ? 'rename-changed' : 'rename-pure';
     }
     // Sort of a hack for detecting deleted/added files...
-    else if (
-      (oldFile == null || oldFile.contents === '') &&
-      newFile != null &&
-      newFile.contents !== ''
-    ) {
+    else if (!oldFile?.contents && newFile?.contents) {
       currentFile.type = 'new';
-    } else if (
-      oldFile != null &&
-      oldFile.contents !== '' &&
-      (newFile == null || newFile.contents === '')
-    ) {
+    } else if (oldFile?.contents && !newFile?.contents) {
       currentFile.type = 'deleted';
     }
   }
@@ -682,10 +590,9 @@ export function parsePatchFiles(
   // NOTE(amadeus): This function is pretty forgiving in that it can accept a
   // patch file that includes commit metdata, multiple commits, or not
   const patches: ParsedPatch[] = [];
-  const rawPatches = hasCommitMetadataBoundary(data)
+  for (const patch of data.startsWith('From ') || data.includes('\nFrom ')
     ? data.split(COMMIT_METADATA_SPLIT)
-    : [data];
-  for (const patch of rawPatches) {
+    : [data]) {
     try {
       patches.push(
         _processPatch(
@@ -698,9 +605,8 @@ export function parsePatchFiles(
     } catch (error) {
       if (throwOnError) {
         throw error;
-      } else {
-        console.error(error);
       }
+      console.error(error);
     } finally {
       releaseStringDetachBuffer();
     }
@@ -720,10 +626,6 @@ function decodeDiffFileName(value: string, stripGitPrefix = false): string {
     : name;
 }
 
-function hasCommitMetadataBoundary(data: string): boolean {
-  return data.startsWith('From ') || data.includes('\nFrom ');
-}
-
 function splitFileContents(contents: string): string[] {
   const lines = splitWithNewlines(contents);
   for (let index = 0; index < lines.length; index++) {
@@ -733,30 +635,21 @@ function splitFileContents(contents: string): string[] {
 }
 
 function splitWithNewlines(contents: string): string[] {
-  if (contents.length === 0) {
-    return [''];
-  }
-
   const lines: string[] = [];
   let startIndex = 0;
-  for (;;) {
-    const newlineIndex = contents.indexOf('\n', startIndex);
-    if (newlineIndex === -1) {
-      break;
-    }
-
+  for (
+    let newlineIndex = contents.indexOf('\n');
+    newlineIndex !== -1;
+    newlineIndex = contents.indexOf('\n', startIndex)
+  ) {
     lines.push(contents.slice(startIndex, newlineIndex + 1));
     startIndex = newlineIndex + 1;
   }
-
-  if (startIndex < contents.length) {
+  // Empty contents still produce one empty line
+  if (startIndex < contents.length || lines.length === 0) {
     lines.push(contents.slice(startIndex));
   }
   return lines;
-}
-
-function splitGitDiffFiles(contents: string): string[] {
-  return splitAtLinePrefix(contents, 'diff --git');
 }
 
 function splitUnifiedDiffFiles(contents: string): string[] {
@@ -798,17 +691,10 @@ function splitUnifiedDiffFiles(contents: string): string[] {
     }
 
     const firstChar = contents[lineStartIndex];
-    if (firstChar === '\\') {
-      lineStartIndex = nextLineStartIndex;
-      continue;
+    if (firstChar === ' ' || firstChar === '-') {
+      remainingDeletionLines = Math.max(remainingDeletionLines - 1, 0);
     }
-
-    if (firstChar === ' ') {
-      remainingDeletionLines = Math.max(remainingDeletionLines - 1, 0);
-      remainingAdditionLines = Math.max(remainingAdditionLines - 1, 0);
-    } else if (firstChar === '-') {
-      remainingDeletionLines = Math.max(remainingDeletionLines - 1, 0);
-    } else if (firstChar === '+') {
+    if (firstChar === ' ' || firstChar === '+') {
       remainingAdditionLines = Math.max(remainingAdditionLines - 1, 0);
     }
     lineStartIndex = nextLineStartIndex;
@@ -818,15 +704,14 @@ function splitUnifiedDiffFiles(contents: string): string[] {
   return parts;
 }
 
-function startsWithUnifiedDiffFileHeader(contents: string): boolean {
-  return isUnifiedDiffFileHeaderAt(contents, 0);
-}
-
 function isUnifiedDiffFileHeaderAt(contents: string, lineStartIndex: number) {
-  const nextLineStartIndex = getNextLineStartIndex(contents, lineStartIndex);
   return (
     isUnifiedDiffHeaderLineAt(contents, lineStartIndex, '---') &&
-    isUnifiedDiffHeaderLineAt(contents, nextLineStartIndex, '+++')
+    isUnifiedDiffHeaderLineAt(
+      contents,
+      getNextLineStartIndex(contents, lineStartIndex),
+      '+++'
+    )
   );
 }
 
@@ -868,37 +753,18 @@ function getNextLineStartIndex(
   return newlineIndex === -1 ? contents.length : newlineIndex + 1;
 }
 
-function isHunkBodyLine(line: string): boolean {
-  const firstChar = line[0];
-  return firstChar === '+' || firstChar === '-' || firstChar === ' ';
-}
-
-function isFormatPatchVersionSeparator(line: string): boolean {
-  if (!line.startsWith('--')) {
-    return false;
-  }
-
-  for (let index = 2; index < line.length; index++) {
-    const char = line[index];
-    if (char !== ' ' && char !== '\t' && char !== '\n' && char !== '\r') {
-      return false;
-    }
-  }
-  return true;
-}
-
+// Hand-rolled `@@ -start[,count] +start[,count] @@[ context]` parser, it is
+// much faster than a regex. A missing count means 1.
 function parseHunkHeader(line: string): ParsedHunkHeader | undefined {
   if (!line.startsWith('@@ -')) {
     return undefined;
   }
 
-  let index = 4;
-  const deletionStartResult = readPositiveInteger(line, index);
+  const deletionStartResult = readPositiveInteger(line, 4);
   if (deletionStartResult == null) {
     return undefined;
   }
-  const deletionStart = deletionStartResult.value;
-  index = deletionStartResult.endIndex;
+  let index = deletionStartResult.endIndex;
 
   let deletionCount = 1;
   if (line[index] === ',') {
@@ -913,13 +779,11 @@ function parseHunkHeader(line: string): ParsedHunkHeader | undefined {
   if (line[index] !== ' ' || line[index + 1] !== '+') {
     return undefined;
   }
-  index += 2;
 
-  const additionStartResult = readPositiveInteger(line, index);
+  const additionStartResult = readPositiveInteger(line, index + 2);
   if (additionStartResult == null) {
     return undefined;
   }
-  const additionStart = additionStartResult.value;
   index = additionStartResult.endIndex;
 
   let additionCount = 1;
@@ -941,16 +805,21 @@ function parseHunkHeader(line: string): ParsedHunkHeader | undefined {
   }
 
   let hunkContext: string | undefined;
-  const contextStartIndex = index + 3;
-  if (line[contextStartIndex] === ' ') {
-    hunkContext = trimLineEnd(line.slice(contextStartIndex + 1));
+  if (line[index + 3] === ' ') {
+    hunkContext = line.slice(index + 4);
+    if (hunkContext.endsWith('\n')) {
+      hunkContext = hunkContext.slice(
+        0,
+        hunkContext.endsWith('\r\n') ? -2 : -1
+      );
+    }
   }
 
   return {
     additionCount,
-    additionStart,
+    additionStart: additionStartResult.value,
     deletionCount,
-    deletionStart,
+    deletionStart: deletionStartResult.value,
     hunkContext,
   };
 }
@@ -968,121 +837,23 @@ function readPositiveInteger(
     }
     parsedValue = parsedValue * 10 + digit;
   }
-
-  if (index === startIndex) {
-    return undefined;
-  }
-  return { value: parsedValue, endIndex: index };
-}
-
-function trimLineEnd(value: string): string {
-  if (value.endsWith('\r\n')) {
-    return value.slice(0, -2);
-  }
-  if (value.endsWith('\n')) {
-    return value.slice(0, -1);
-  }
-  return value;
-}
-
-function isGitDiffPatch(data: string): boolean {
-  return data.startsWith('diff --git') || data.includes('\ndiff --git');
+  return index === startIndex
+    ? undefined
+    : { value: parsedValue, endIndex: index };
 }
 
 function splitAtLinePrefix(contents: string, prefix: string): string[] {
-  if (contents.length === 0) {
-    return [''];
-  }
-
   const newlinePrefix = `\n${prefix}`;
-  const firstBoundaryIndex = contents.startsWith(prefix)
-    ? 0
-    : findLinePrefixIndex(contents, newlinePrefix, 0);
-  if (firstBoundaryIndex === -1) {
-    return [contents];
-  }
-
   const parts: string[] = [];
-  if (firstBoundaryIndex > 0) {
-    parts.push(contents.slice(0, firstBoundaryIndex));
-  }
-
-  let startIndex = firstBoundaryIndex;
-  for (;;) {
-    const nextBoundaryIndex = findLinePrefixIndex(
-      contents,
-      newlinePrefix,
-      startIndex + 1
-    );
-    if (nextBoundaryIndex === -1) {
-      break;
-    }
-
-    parts.push(contents.slice(startIndex, nextBoundaryIndex));
-    startIndex = nextBoundaryIndex;
+  let startIndex = 0;
+  for (
+    let newlineIndex = contents.indexOf(newlinePrefix);
+    newlineIndex !== -1;
+    newlineIndex = contents.indexOf(newlinePrefix, startIndex)
+  ) {
+    parts.push(contents.slice(startIndex, newlineIndex + 1));
+    startIndex = newlineIndex + 1;
   }
   parts.push(contents.slice(startIndex));
   return parts;
-}
-
-function findLinePrefixIndex(
-  contents: string,
-  newlinePrefix: string,
-  fromIndex: number
-): number {
-  const index = contents.indexOf(newlinePrefix, fromIndex);
-  return index === -1 ? -1 : index + 1;
-}
-
-function maybeDetachOptionalString<T extends string | undefined>(value: T): T {
-  return (value == null ? value : detachString(value)) as T;
-}
-
-function parseRawLineType(
-  firstChar: string | undefined
-): Exclude<HunkLineType, 'expanded'> {
-  return firstChar === ' '
-    ? 'context'
-    : firstChar === '\\'
-      ? 'metadata'
-      : firstChar === '+'
-        ? 'addition'
-        : 'deletion';
-}
-
-function getParsedLineContent(rawLine: string): string {
-  const processedLine = rawLine.slice(1);
-  return detachString(processedLine === '' ? '\n' : processedLine);
-}
-
-function createContentGroup(
-  type: 'change',
-  deletionLineIndex: number,
-  additionLineIndex: number
-): ChangeContent;
-function createContentGroup(
-  type: 'context',
-  deletionLineIndex: number,
-  additionLineIndex: number
-): ContextContent;
-function createContentGroup(
-  type: 'change' | 'context',
-  deletionLineIndex: number,
-  additionLineIndex: number
-): ChangeContent | ContextContent {
-  if (type === 'change') {
-    return {
-      type: 'change',
-      additions: 0,
-      deletions: 0,
-      additionLineIndex,
-      deletionLineIndex,
-    };
-  }
-  return {
-    type: 'context',
-    lines: 0,
-    additionLineIndex,
-    deletionLineIndex,
-  };
 }

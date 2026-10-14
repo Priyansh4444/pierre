@@ -103,9 +103,23 @@ export class Virtualizer {
       }
     );
     if (root instanceof Document) {
-      this.setupWindow();
+      window.addEventListener('scroll', this.handleWindowScroll, {
+        passive: true,
+      });
+      window.addEventListener('resize', this.handleWindowResize, {
+        passive: true,
+      });
+      this.resizeObserver.observe(root.documentElement);
     } else {
-      this.setupElement(contentContainer);
+      root.addEventListener('scroll', this.handleElementScroll, {
+        passive: true,
+      });
+      this.resizeObserver.observe(root);
+      contentContainer ??= root.firstElementChild ?? undefined;
+      if (contentContainer instanceof HTMLElement) {
+        this.contentContainer = contentContainer;
+        this.resizeObserver.observe(contentContainer);
+      }
     }
 
     // FIXME(amadeus): Remove me before release
@@ -121,7 +135,7 @@ export class Virtualizer {
         Virtualizer.__STOP = true;
       }
     };
-    for (const [container, instance] of this.connectQueue.entries()) {
+    for (const [container, instance] of this.connectQueue) {
       this.connect(container, instance);
     }
     this.connectQueue.clear();
@@ -179,34 +193,28 @@ export class Virtualizer {
     let shouldQueueUpdate = false;
     for (const entry of entries) {
       const blockSize = entry.borderBoxSize[0].blockSize;
-      if (this.root instanceof Document) {
-        if (blockSize !== this.scrollHeight) {
-          this.scrollHeightDirty = true;
+      const isDocument = this.root instanceof Document;
+      if (!isDocument && entry.target === this.root) {
+        if (blockSize !== this.height) {
+          this.heightDirty = true;
           shouldQueueUpdate = true;
-          if (this.config.resizeDebugging) {
-            console.log('Virtualizer: content size change', this.__id, {
-              sizeChange: blockSize - lastSize,
-              newSize: blockSize,
-            });
-            lastSize = blockSize;
-          }
         }
-      } else {
-        if (entry.target === this.root) {
-          if (blockSize !== this.height) {
-            this.heightDirty = true;
-            shouldQueueUpdate = true;
-          }
-        } else if (entry.target === this.contentContainer) {
-          this.scrollHeightDirty = true;
-          shouldQueueUpdate = true;
-          if (this.config.resizeDebugging) {
-            console.log('Virtualizer: scroller size change', this.__id, {
-              sizeChange: blockSize - lastSize,
-              newSize: blockSize,
-            });
-            lastSize = blockSize;
-          }
+      } else if (
+        isDocument
+          ? blockSize !== this.scrollHeight
+          : entry.target === this.contentContainer
+      ) {
+        this.scrollHeightDirty = true;
+        shouldQueueUpdate = true;
+        if (this.config.resizeDebugging) {
+          console.log(
+            isDocument
+              ? 'Virtualizer: content size change'
+              : 'Virtualizer: scroller size change',
+            this.__id,
+            { sizeChange: blockSize - lastSize, newSize: blockSize }
+          );
+          lastSize = blockSize;
         }
       }
     }
@@ -215,34 +223,6 @@ export class Virtualizer {
       queueRender(this.computeRenderRangeAndEmit);
     }
   };
-
-  private setupWindow() {
-    if (this.root == null || !(this.root instanceof Document)) {
-      throw new Error('Virtualizer.setupWindow: Invalid setup method');
-    }
-    window.addEventListener('scroll', this.handleWindowScroll, {
-      passive: true,
-    });
-    window.addEventListener('resize', this.handleWindowResize, {
-      passive: true,
-    });
-    this.resizeObserver?.observe(this.root.documentElement);
-  }
-
-  private setupElement(contentContainer: Element | undefined) {
-    if (this.root == null || this.root instanceof Document) {
-      throw new Error('Virtualizer.setupElement: Invalid setup method');
-    }
-    this.root.addEventListener('scroll', this.handleElementScroll, {
-      passive: true,
-    });
-    this.resizeObserver?.observe(this.root);
-    contentContainer ??= this.root.firstElementChild ?? undefined;
-    if (contentContainer instanceof HTMLElement) {
-      this.contentContainer = contentContainer;
-      this.resizeObserver?.observe(contentContainer);
-    }
-  }
 
   cleanUp(): void {
     dequeueRender(this.computeRenderRangeAndEmit);
@@ -322,11 +302,7 @@ export class Virtualizer {
   };
 
   private handleWindowScroll = () => {
-    if (
-      Virtualizer.__STOP ||
-      this.root == null ||
-      !(this.root instanceof Document)
-    ) {
+    if (Virtualizer.__STOP || !(this.root instanceof Document)) {
       return;
     }
     this.scrollDirty = true;
@@ -355,7 +331,7 @@ export class Virtualizer {
     // If we got an emitted update from a bunch of instances, we should skip
     // the window check first and attempt to render with existing logic first
     // and then queue up a corrected render after
-    if (this.instancesChanged.size === 0) {
+    if (!instancesHaveChanged) {
       const windowSpecs = createWindowFromScrollPosition({
         scrollTop: this.getScrollTop(),
         height: this.getHeight(),
@@ -387,8 +363,7 @@ export class Virtualizer {
       }
     }
     for (const instance of this.instancesChanged) {
-      if (updatedInstances.has(instance)) continue;
-      if (instance.onRender(wrapperDirty)) {
+      if (!updatedInstances.has(instance) && instance.onRender(wrapperDirty)) {
         updatedInstances.add(instance);
       }
     }
@@ -417,7 +392,6 @@ export class Virtualizer {
     if (instancesHaveChanged || wrapperDirty) {
       queueRender(this.computeRenderRangeAndEmit);
     }
-    updatedInstances.clear();
     this.instancesChanged.clear();
   };
 
@@ -435,22 +409,18 @@ export class Virtualizer {
       if (element instanceof HTMLElement) {
         const top = getRelativeBoundingTop(element, scrollContainer);
         if (top !== lineOffset) {
-          const scrollOffset = top - lineOffset;
-          this.applyScrollFix(scrollOffset);
+          this.applyScrollFix(top - lineOffset);
         }
         return;
       }
     }
     const top = getRelativeBoundingTop(fileElement, scrollContainer);
-    if (fileTypeOffset === 'top') {
-      if (top !== fileOffset) {
-        this.applyScrollFix(top - fileOffset);
-      }
-    } else {
-      const bottom = top + fileElement.getBoundingClientRect().height;
-      if (bottom !== fileOffset) {
-        this.applyScrollFix(bottom - fileOffset);
-      }
+    const edge =
+      fileTypeOffset === 'top'
+        ? top
+        : top + fileElement.getBoundingClientRect().height;
+    if (edge !== fileOffset) {
+      this.applyScrollFix(edge - fileOffset);
     }
   }
 
@@ -480,23 +450,11 @@ export class Virtualizer {
     const scrollContainer = this.getScrollContainerElement();
     let bestAnchor: ScrollAnchor | undefined;
 
-    for (const [fileElement] of this.visibleInstances.entries()) {
+    for (const fileElement of this.visibleInstances.keys()) {
       const fileTop = getRelativeBoundingTop(fileElement, scrollContainer);
       const fileBottom = fileTop + fileElement.offsetHeight;
-
-      // Determine file offset and type based on position
-      // Only use bottom anchor when entire file is above viewport
-      let fileOffset: number;
-      let fileTypeOffset: 'top' | 'bottom';
-      if (fileBottom <= 0) {
-        // Entire file is above viewport - use bottom as anchor
-        fileOffset = fileBottom;
-        fileTypeOffset = 'bottom';
-      } else {
-        // File is at least partially visible or below - use top
-        fileOffset = fileTop;
-        fileTypeOffset = 'top';
-      }
+      // Only use the bottom as anchor when the entire file is above viewport
+      const fileOffset = fileBottom <= 0 ? fileBottom : fileTop;
 
       // Find the best line (first fully visible) within this file
       let bestLineIndex: string | undefined;
@@ -508,9 +466,6 @@ export class Virtualizer {
           '[data-line][data-line-index]'
         ) ?? []) {
           if (!(line instanceof HTMLElement)) continue;
-          const lineIndex = line.dataset.lineIndex;
-          if (lineIndex == null) continue;
-
           const lineOffset = getRelativeBoundingTop(line, scrollContainer);
 
           // Ignore lines with negative offsets (above viewport top)
@@ -519,54 +474,33 @@ export class Virtualizer {
           // First visible line in DOM order is the best one because
           // querySelectorAll will grab lines in order as they appear in the
           // DOM
-          bestLineIndex = lineIndex;
+          bestLineIndex = line.dataset.lineIndex;
           bestLineOffset = lineOffset;
           break;
         }
       }
 
-      // If we already have an anchor with a visible line, skip files without one
-      if (bestAnchor?.lineOffset != null && bestLineOffset == null) {
-        continue;
-      }
-
-      // Decide if this file should become the new best anchor
-      let shouldReplace = false;
-      // If we don't already have an anchor we should set one
-      if (bestAnchor == null) {
-        shouldReplace = true;
-      }
-      // If we found a better line anchor, we should replace the old one
-      else if (
-        bestLineOffset != null &&
-        (bestAnchor.lineOffset == null ||
-          bestLineOffset < bestAnchor.lineOffset)
+      if (
+        // If we don't already have an anchor we should set one
+        bestAnchor == null ||
+        // If we found a better line anchor, we should replace the old one
+        (bestLineOffset != null &&
+          (bestAnchor.lineOffset == null ||
+            bestLineOffset < bestAnchor.lineOffset)) ||
+        // Otherwise compare file only anchors: favor files with their tops in
+        // view, or else the closest file
+        (bestLineOffset == null &&
+          bestAnchor.lineOffset == null &&
+          ((fileOffset >= 0 &&
+            (bestAnchor.fileOffset < 0 ||
+              fileOffset < bestAnchor.fileOffset)) ||
+            (fileOffset < 0 &&
+              bestAnchor.fileOffset < 0 &&
+              fileOffset > bestAnchor.fileOffset)))
       ) {
-        shouldReplace = true;
-      }
-      // Otherwise we need to compare file only anchors
-      else if (bestLineOffset == null && bestAnchor.lineOffset == null) {
-        // Favor files with their tops in view
-        if (
-          fileOffset >= 0 &&
-          (bestAnchor.fileOffset < 0 || fileOffset < bestAnchor.fileOffset)
-        ) {
-          shouldReplace = true;
-        }
-        // Or the closest file
-        else if (
-          fileOffset < 0 &&
-          bestAnchor.fileOffset < 0 &&
-          fileOffset > bestAnchor.fileOffset
-        ) {
-          shouldReplace = true;
-        }
-      }
-
-      if (shouldReplace) {
         bestAnchor = {
           fileElement,
-          fileTypeOffset,
+          fileTypeOffset: fileBottom <= 0 ? 'bottom' : 'top',
           fileOffset,
           lineIndex: bestLineIndex,
           lineOffset: bestLineOffset,
@@ -622,21 +556,16 @@ export class Virtualizer {
       return this.scrollTop;
     }
     this.scrollDirty = false;
-    let scrollTop = (() => {
-      if (this.root == null) {
-        return 0;
-      }
-      if (this.root instanceof Document) {
-        return window.scrollY;
-      }
-      return this.root.scrollTop;
-    })();
-
+    let scrollTop = 0;
+    if (this.root instanceof Document) {
+      scrollTop = window.scrollY;
+    } else if (this.root != null) {
+      scrollTop = this.root.scrollTop;
+    }
     // Lets always make sure to clamp scroll position cases of
     // over/bounce scroll
-    scrollTop = this.clampScrollTop(scrollTop);
-    this.scrollTop = scrollTop;
-    return scrollTop;
+    this.scrollTop = this.clampScrollTop(scrollTop);
+    return this.scrollTop;
   }
 
   /** Scroll to a logical vertical position and queue the normal render pass. */
@@ -668,15 +597,10 @@ export class Virtualizer {
       return this.scrollHeight;
     }
     this.scrollHeightDirty = false;
-    this.scrollHeight = (() => {
-      if (this.root == null) {
-        return 0;
-      }
-      if (this.root instanceof Document) {
-        return this.root.documentElement.scrollHeight;
-      }
-      return this.root.scrollHeight;
-    })();
+    this.scrollHeight =
+      this.root instanceof Document
+        ? this.root.documentElement.scrollHeight
+        : (this.root?.scrollHeight ?? 0);
     return this.scrollHeight;
   }
 
@@ -685,15 +609,10 @@ export class Virtualizer {
       return this.height;
     }
     this.heightDirty = false;
-    this.height = (() => {
-      if (this.root == null) {
-        return 0;
-      }
-      if (this.root instanceof Document) {
-        return globalThis.innerHeight;
-      }
-      return this.root.getBoundingClientRect().height;
-    })();
+    this.height =
+      this.root instanceof Document
+        ? globalThis.innerHeight
+        : (this.root?.getBoundingClientRect().height ?? 0);
     return this.height;
   }
 
