@@ -31,7 +31,11 @@ import { createPortal } from 'react-dom';
 
 import { FeatureHeader } from '@/components/FeatureHeader';
 import { Button } from '@/components/ui/button';
-import { InputWithIcon } from '@/components/ui/input-group';
+import {
+  InputGroup,
+  InputGroupIcon,
+  InputGroupInput,
+} from '@/components/ui/input-group';
 import { Toggle } from '@/components/ui/toggle';
 import { cn } from '@/lib/utils';
 
@@ -61,12 +65,14 @@ export function CustomSearchPanel({ prerenderedFile }: CustomSearchPanelProps) {
   // The editor calls renderSearchPanel when find opens (Cmd/Ctrl+F). The
   // returned element lives in the page's light DOM, so the popup portaled into
   // it below uses the site's own components and styles. `mx-auto` moves it
-  // from the built-in top-right spot to the top center of the code.
+  // from the built-in top-right spot to the top center of the code, and the
+  // width keeps a gutter on narrow screens. It is also the container the
+  // popup's layout queries.
   const editorOptions = useMemo<EditorOptions<'file', undefined, undefined>>(
     () => ({
       renderSearchPanel(search) {
         const element = document.createElement('div');
-        element.className = 'mx-auto';
+        element.className = '@container mx-auto w-[min(30rem,100%_-_2rem)]';
         return {
           element,
           update: (state) => setPanel({ element, search, state }),
@@ -148,31 +154,34 @@ function SearchPopup({ search, state, inputRef }: SearchPopupProps) {
 
   return (
     // The slotted element inherits color and font from the editor, so the
-    // popup sets its own.
-    <div className="bg-background/95 text-foreground flex w-[26rem] max-w-[calc(100vw-4rem)] flex-col gap-1.5 rounded-xl border p-1.5 font-sans shadow-lg backdrop-blur">
-      <div className="flex items-center gap-1">
-        <Button
-          variant="ghost"
-          size="icon-md"
-          aria-label="Toggle replace"
-          aria-expanded={state.mode === 'replace'}
-          onClick={() =>
-            search.setState({
-              mode: state.mode === 'replace' ? 'find' : 'replace',
-            })
-          }
-        >
-          <IconChevronSm
-            className={cn(
-              'transition-transform',
-              state.mode === 'find' && '-rotate-90'
-            )}
-          />
-        </Button>
-        <InputWithIcon
+    // popup sets its own. Three columns keep the find and replace inputs the
+    // same width; narrow popups move each row's actions under its input.
+    <div className="bg-background/95 text-foreground grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-1 rounded-xl border p-1.5 font-sans shadow-lg backdrop-blur @max-md:grid-cols-[auto_minmax(0,1fr)]">
+      <Button
+        variant="ghost"
+        size="icon-md"
+        aria-label="Toggle replace"
+        aria-expanded={state.mode === 'replace'}
+        onClick={() =>
+          search.setState({
+            mode: state.mode === 'replace' ? 'find' : 'replace',
+          })
+        }
+      >
+        <IconChevronSm
+          className={cn(
+            'transition-transform',
+            state.mode === 'find' && '-rotate-90'
+          )}
+        />
+      </Button>
+      <InputGroup>
+        <InputGroupIcon>
+          <IconSearch size={14} />
+        </InputGroupIcon>
+        <InputGroupInput
           ref={inputRef}
-          icon={<IconSearch size={14} />}
-          className="h-8 pl-8"
+          className="h-8 pr-20 pl-9"
           placeholder="Find"
           value={state.text}
           onChange={(event) => search.setState({ text: event.target.value })}
@@ -180,32 +189,34 @@ function SearchPopup({ search, state, inputRef }: SearchPopupProps) {
             search.navigate(event.shiftKey ? 'previous' : 'next')
           )}
         />
-        <OptionToggle
-          label="Match case"
-          pressed={state.caseSensitive}
-          onPressedChange={(caseSensitive) =>
-            search.setState({ caseSensitive })
-          }
-        >
-          <IconType />
-        </OptionToggle>
-        <OptionToggle
-          label="Match whole word"
-          pressed={state.wholeWord}
-          onPressedChange={(wholeWord) => search.setState({ wholeWord })}
-        >
-          <IconTypeWord />
-        </OptionToggle>
-        <OptionToggle
-          label="Use regular expression"
-          pressed={state.regex}
-          onPressedChange={(regex) => search.setState({ regex })}
-        >
-          <IconRegex />
-        </OptionToggle>
-      </div>
-      <div className="flex items-center gap-1 pl-9">
-        <span className="text-muted-foreground min-w-0 flex-1 truncate px-1 text-xs tabular-nums">
+        <div className="absolute right-1 flex items-center">
+          <OptionToggle
+            label="Match case"
+            pressed={state.caseSensitive}
+            onPressedChange={(caseSensitive) =>
+              search.setState({ caseSensitive })
+            }
+          >
+            <IconType />
+          </OptionToggle>
+          <OptionToggle
+            label="Match whole word"
+            pressed={state.wholeWord}
+            onPressedChange={(wholeWord) => search.setState({ wholeWord })}
+          >
+            <IconTypeWord />
+          </OptionToggle>
+          <OptionToggle
+            label="Use regular expression"
+            pressed={state.regex}
+            onPressedChange={(regex) => search.setState({ regex })}
+          >
+            <IconRegex />
+          </OptionToggle>
+        </div>
+      </InputGroup>
+      <div className="flex items-center gap-1 @max-md:col-start-2">
+        <span className="text-muted-foreground min-w-16 flex-1 px-1 text-xs whitespace-nowrap tabular-nums">
           {!hasMatches
             ? 'No results'
             : currentMatchIndex === undefined
@@ -240,9 +251,9 @@ function SearchPopup({ search, state, inputRef }: SearchPopupProps) {
         </Button>
       </div>
       {state.mode === 'replace' && (
-        <div className="flex items-center gap-1 pl-9">
-          <InputWithIcon
-            className="h-8"
+        <>
+          <InputGroupInput
+            className="col-start-2 h-8"
             placeholder="Replace"
             value={state.replaceText}
             onChange={(event) =>
@@ -250,25 +261,27 @@ function SearchPopup({ search, state, inputRef }: SearchPopupProps) {
             }
             onKeyDown={handleKeyDown(search.replace)}
           />
-          <Button
-            variant="ghost"
-            size="icon-md"
-            aria-label="Replace"
-            disabled={!hasMatches}
-            onClick={search.replace}
-          >
-            <IconReplace />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-md"
-            aria-label="Replace all"
-            disabled={!hasMatches}
-            onClick={search.replaceAll}
-          >
-            <IconReplaceAll />
-          </Button>
-        </div>
+          <div className="flex items-center gap-1 @max-md:col-start-2">
+            <Button
+              variant="ghost"
+              size="icon-md"
+              aria-label="Replace"
+              disabled={!hasMatches}
+              onClick={search.replace}
+            >
+              <IconReplace />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-md"
+              aria-label="Replace all"
+              disabled={!hasMatches}
+              onClick={search.replaceAll}
+            >
+              <IconReplaceAll />
+            </Button>
+          </div>
+        </>
       )}
     </div>
   );
@@ -290,7 +303,7 @@ function OptionToggle({
 }: OptionToggleProps) {
   return (
     <Toggle
-      size="sm"
+      className="size-6 min-w-0 px-0"
       aria-label={label}
       title={label}
       pressed={pressed}
