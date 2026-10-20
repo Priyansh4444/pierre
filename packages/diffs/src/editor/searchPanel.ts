@@ -1,3 +1,7 @@
+import {
+  dequeueRender,
+  queueRender,
+} from '../managers/UniversalRenderingManager';
 import { type MatchRange, type SearchParams } from '../search';
 import { resolveFindAgainShortcut } from './command';
 import { isPrimaryModifier } from './platform';
@@ -40,8 +44,12 @@ export interface SearchPanelOptions<TMatch = MatchRange> {
 export class SearchPanelWidget<TMatch = MatchRange> {
   #host: HTMLDivElement;
   #inputElement: HTMLInputElement;
+  #initializeMatches: () => void;
   #updateMatches?: (options?: { syncSelection?: boolean }) => void;
   #applyMode?: (mode: SearchPanelMode) => void;
+  #setReplaceHandlers?: (
+    handlers: SearchPanelReplaceHandlers<TMatch> | undefined
+  ) => void;
   #navigate?: (findPrevious: boolean) => void;
   #close?: () => void;
 
@@ -59,9 +67,10 @@ export class SearchPanelWidget<TMatch = MatchRange> {
       onClose,
     } = options;
 
-    const canReplace = replace !== undefined;
+    let replaceHandlers = replace;
+    let requestedMode = mode;
     const normalizeMode = (nextMode: SearchPanelMode): SearchPanelMode =>
-      canReplace ? nextMode : 'find';
+      replaceHandlers != null ? nextMode : 'find';
 
     const searchParams: SearchParams = {
       text: defaultQuery,
@@ -97,7 +106,9 @@ export class SearchPanelWidget<TMatch = MatchRange> {
       matches.current = currentMatch;
     };
 
+    let matchesUpdated = false;
     const updateMatches = (options?: { syncSelection?: boolean }) => {
+      matchesUpdated = true;
       matches.all =
         searchParams.text !== '' ? search(getSearchParamsSnapshot()) : [];
       const noMatches = matches.all.length === 0;
@@ -165,6 +176,7 @@ export class SearchPanelWidget<TMatch = MatchRange> {
       findNextMatch(findPrevious, true);
 
     const replaceCurrentMatch = () => {
+      const replace = replaceHandlers;
       if (
         replace === undefined ||
         searchParams.text === '' ||
@@ -196,6 +208,7 @@ export class SearchPanelWidget<TMatch = MatchRange> {
     };
 
     const replaceAllMatches = () => {
+      const replace = replaceHandlers;
       if (
         replace === undefined ||
         searchParams.text === '' ||
@@ -346,8 +359,9 @@ export class SearchPanelWidget<TMatch = MatchRange> {
       dataset: { searchClose: '' },
     });
 
-    const gridChildren: Node[] = [findInputBox];
-    if (canReplace) {
+    // Build replacement controls on first use and retain them when capability
+    // is disabled, so switching search scope preserves the replacement text.
+    const createReplaceCells = (): Node[] => {
       const replaceInputElement = h('input', {
         type: 'text',
         placeholder: 'Replace',
@@ -397,8 +411,12 @@ export class SearchPanelWidget<TMatch = MatchRange> {
         ],
       });
 
-      gridChildren.push(replaceInputBox, replaceActionsElement);
-    }
+      return [replaceInputBox, replaceActionsElement];
+    };
+
+    let replaceCells =
+      replaceHandlers != null ? createReplaceCells() : undefined;
+    const gridChildren: Node[] = [findInputBox, ...(replaceCells ?? [])];
 
     gridChildren.push(matchResultElement, navElement, closeElement);
 
@@ -411,10 +429,22 @@ export class SearchPanelWidget<TMatch = MatchRange> {
       children: gridChildren,
     });
 
+    this.#setReplaceHandlers = (handlers) => {
+      replaceHandlers = handlers;
+      if (handlers != null && replaceCells == null) {
+        replaceCells = createReplaceCells();
+        for (const cell of replaceCells) {
+          gridElement.insertBefore(cell, matchResultElement);
+        }
+      }
+      gridElement.dataset.mode = normalizeMode(requestedMode);
+    };
+
     // Toggles the panel between find and find/replace modes by showing or
     // hiding the replace cells, then returns focus to the find input.
     const applyMode = (next: SearchPanelMode) => {
-      gridElement.dataset.mode = normalizeMode(next);
+      requestedMode = next;
+      gridElement.dataset.mode = normalizeMode(requestedMode);
       this.#inputElement.focus();
       this.#inputElement.select();
     };
@@ -448,15 +478,23 @@ export class SearchPanelWidget<TMatch = MatchRange> {
 
     matches.current = initialMatch;
     containerElement.before(this.#host);
+    this.#inputElement.select();
 
-    requestAnimationFrame(() => {
+    // Hosts install the panel before its initial results can be delivered.
+    // An earlier input or refresh has already done that work; closing the
+    // panel also makes this deferred update obsolete. Select the initial query
+    // above so this frame never changes the user's later focus or input caret.
+    this.#initializeMatches = () => {
+      if (matchesUpdated || !this.#host.isConnected) {
+        return;
+      }
       if (initialMatch !== undefined) {
         updateMatches();
       } else {
         onUpdate([]);
       }
-      this.#inputElement.select();
-    });
+    };
+    queueRender(this.#initializeMatches);
   }
 
   getHostElement(): HTMLDivElement {
@@ -479,6 +517,12 @@ export class SearchPanelWidget<TMatch = MatchRange> {
     this.#applyMode?.(mode);
   }
 
+  setReplaceHandlers(
+    handlers: SearchPanelReplaceHandlers<TMatch> | undefined
+  ): void {
+    this.#setReplaceHandlers?.(handlers);
+  }
+
   // Tears the panel down the way the close button and Escape-in-input do:
   // removes the DOM and runs onClose so the editor clears its match highlights.
   // Prefer this over cleanup() for any user-initiated dismissal.
@@ -490,6 +534,7 @@ export class SearchPanelWidget<TMatch = MatchRange> {
   // highlights in place; only use it when the caller clears that state itself
   // (e.g. a full editor reset). User-initiated dismissals should call close().
   cleanup(): void {
+    dequeueRender(this.#initializeMatches);
     this.#host.remove();
   }
 }
