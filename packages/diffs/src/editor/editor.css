@@ -417,6 +417,7 @@
   /* A custom panel from renderSearchPanel defaults to the built-in panel's
      position. Page styles on the slotted element take precedence. */
   slot::slotted(*) {
+    flex-shrink: 0;
     margin-inline: auto 16px;
   }
 

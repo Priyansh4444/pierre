@@ -1998,7 +1998,11 @@ interface CustomSearchPanelFixture extends EditorFixture {
 // Mounts a File editor whose renderSearchPanel records every state pushed to
 // the custom panel, with a helper that dispatches keys on the editor content.
 async function createCustomSearchPanelFixture(
-  contents: string
+  contents: string,
+  options: {
+    onRender?: (search: SearchPanelContext) => void;
+    onUpdate?: (search: SearchPanelContext) => void;
+  } = {}
 ): Promise<CustomSearchPanelFixture> {
   const states: SearchPanelState[] = [];
   const focus = mock(() => {});
@@ -2008,10 +2012,14 @@ async function createCustomSearchPanelFixture(
   const fixture = await createEditorFixture(contents, {
     renderSearchPanel(context) {
       search = context;
+      options.onRender?.(context);
       element = document.createElement('div');
       return {
         element,
-        update: (state) => states.push(state),
+        update: (state) => {
+          states.push(state);
+          options.onUpdate?.(context);
+        },
         focus,
         cleanup: cleanupPanel,
       };
@@ -2045,6 +2053,91 @@ async function createCustomSearchPanelFixture(
 }
 
 describe('Editor renderSearchPanel', () => {
+  test('initializes the query and search options inside the renderer', async () => {
+    const fixture = await createCustomSearchPanelFixture('Foo foo', {
+      onRender: (search) =>
+        search.setState({ text: 'Foo', caseSensitive: true }),
+    });
+    try {
+      fixture.pressKey({ key: 'f', code: 'KeyF', metaKey: true });
+      await wait(20);
+
+      expect(fixture.element()?.isConnected).toBe(true);
+      expect(fixture.states.at(-1)).toMatchObject({
+        text: 'Foo',
+        caseSensitive: true,
+        matchCount: 1,
+        currentMatchIndex: 0,
+      });
+      expect(
+        fixture.container.shadowRoot?.querySelectorAll('[data-match-range]')
+      ).toHaveLength(1);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test.each(['render', 'update'] as const)(
+    'reopens after the custom panel closes during its initial %s',
+    async (stage) => {
+      let closeNext = true;
+      const closeOnce = (search: SearchPanelContext) => {
+        if (closeNext) {
+          closeNext = false;
+          search.close();
+        }
+      };
+      const fixture = await createCustomSearchPanelFixture('foo bar foo', {
+        onRender: stage === 'render' ? closeOnce : undefined,
+        onUpdate: stage === 'update' ? closeOnce : undefined,
+      });
+      try {
+        fixture.pressKey({ key: 'f', code: 'KeyF', metaKey: true });
+        await wait(20);
+        expect(fixture.element()?.isConnected).toBe(false);
+        expect(fixture.cleanupPanel).toHaveBeenCalledTimes(1);
+        expect(fixture.focus).not.toHaveBeenCalled();
+
+        fixture.pressKey({ key: 'f', code: 'KeyF', metaKey: true });
+        await wait(20);
+        expect(fixture.element()?.isConnected).toBe(true);
+        fixture.search()?.setState({ text: 'foo' });
+        expect(fixture.states.at(-1)?.matchCount).toBe(2);
+        expect(fixture.focus).toHaveBeenCalledTimes(1);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  );
+
+  test('keeps an early custom query and navigation through the first frame', async () => {
+    const fixture = await createCustomSearchPanelFixture('foo bar foo', {
+      onRender: (search) => {
+        queueMicrotask(() => {
+          search.setState({ text: 'foo' });
+          search.navigate('next');
+        });
+      },
+    });
+    try {
+      // No word under the caret seeds the initial search.
+      fixture.editor.setSelections([]);
+      fixture.pressKey({ key: 'f', code: 'KeyF', metaKey: true });
+      await wait(20);
+
+      expect(fixture.states.at(-1)).toMatchObject({
+        text: 'foo',
+        matchCount: 2,
+        currentMatchIndex: 1,
+      });
+      expect(
+        fixture.container.shadowRoot?.querySelectorAll('[data-match-range]')
+      ).toHaveLength(2);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   test('opens a custom panel from the find shortcut and closes it on Escape', async () => {
     const fixture = await createCustomSearchPanelFixture('foo bar foo');
     const { container, states, focus, cleanupPanel, pressKey } = fixture;

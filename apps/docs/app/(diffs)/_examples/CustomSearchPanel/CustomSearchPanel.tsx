@@ -1,9 +1,11 @@
 'use client';
 
-import type {
-  EditorOptions,
-  SearchPanelContext,
-  SearchPanelState,
+import {
+  type EditorOptions,
+  resolveEditorCommandFromKeyboardEvent,
+  resolveFindAgainShortcut,
+  type SearchPanelContext,
+  type SearchPanelState,
 } from '@pierre/diffs/edit';
 import { File } from '@pierre/diffs/react';
 import type { PreloadedFileResult } from '@pierre/diffs/ssr';
@@ -136,19 +138,33 @@ function SearchPopup({ search, state, inputRef }: SearchPopupProps) {
     focusFindInput(inputRef.current);
   }, [inputRef]);
 
-  // Enter steps through matches (Shift+Enter goes back) in the find input and
-  // replaces in the replace input; Escape closes from either.
+  // Keep the built-in input shortcuts, including IME confirmation, while
+  // letting the app own the panel's controls and focus.
   const handleKeyDown =
     (onEnter: (event: KeyboardEvent) => void) => (event: KeyboardEvent) => {
-      if (event.nativeEvent.isComposing) {
+      if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) {
         return;
       }
+      const command = resolveEditorCommandFromKeyboardEvent(event.nativeEvent);
+      const findAgain = resolveFindAgainShortcut(event.nativeEvent);
       if (event.key === 'Enter') {
         event.preventDefault();
         onEnter(event);
       } else if (event.key === 'Escape') {
         event.preventDefault();
         search.close();
+      } else if (findAgain !== undefined) {
+        event.preventDefault();
+        search.navigate(findAgain);
+      } else if (
+        command === 'openSearchPanel' ||
+        command === 'openSearchReplacePanel'
+      ) {
+        event.preventDefault();
+        search.setState({
+          mode: command === 'openSearchReplacePanel' ? 'replace' : 'find',
+        });
+        focusFindInput(inputRef.current);
       }
     };
 

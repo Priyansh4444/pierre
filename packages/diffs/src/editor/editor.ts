@@ -6630,6 +6630,7 @@ export class Editor<
 
     this.#searchPanel = searchPanel;
     this.#retainSearchPanelFocus = false;
+    searchPanel.mount();
   }
 
   #getSelectionText() {

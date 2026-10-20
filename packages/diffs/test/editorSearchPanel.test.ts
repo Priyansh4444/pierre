@@ -92,6 +92,7 @@ function createPanel(
       closed = true;
     },
   });
+  panel.mount();
 
   const query = (selector: string) =>
     document.querySelector<HTMLElement>(`[data-search-panel] ${selector}`);
@@ -349,6 +350,7 @@ function mountCustomPanel(contents: string): CustomPanelHarness {
       closed = true;
     },
   });
+  panel.mount();
   if (search === undefined) {
     throw new Error('custom panel was not rendered');
   }
@@ -559,6 +561,7 @@ function mountReplaceHost(contents: string): ReplaceHostHarness {
     },
     onClose: () => {},
   });
+  searchPanel.mount();
 
   const panel = (selector: string) =>
     document.querySelector<HTMLElement>(`[data-search-panel] ${selector}`);

@@ -99,19 +99,13 @@ export class SearchPanel {
   #mode: SearchPanelMode;
   #matches: MatchRange[] = [];
   #currentMatch: MatchRange | undefined;
-  #view: SearchPanelView;
+  #view?: SearchPanelView;
   #container: HTMLDivElement;
   #closed = false;
+  #needsInitialSearch = true;
 
   constructor(options: SearchPanelOptions) {
-    const {
-      containerElement,
-      customPanel,
-      defaultQuery,
-      mode = 'find',
-      initialMatch,
-      onUpdate,
-    } = options;
+    const { defaultQuery, mode = 'find', initialMatch } = options;
     this.#options = options;
     this.#params = {
       text: defaultQuery,
@@ -122,10 +116,25 @@ export class SearchPanel {
     };
     this.#mode = mode;
     this.#currentMatch = initialMatch;
+    this.#container = h('div', { dataset: 'searchPanel' });
+  }
+
+  // Mount only after the editor owns this session: renderer and update
+  // callbacks may initialize its state or close it immediately.
+  mount(): void {
+    if (this.#closed) {
+      return;
+    }
+    const { containerElement, customPanel } = this.#options;
 
     const render = customPanel?.render ?? createDefaultSearchPanel;
-    this.#view = render(this.#createContext());
-    this.#container = h('div', { dataset: 'searchPanel' });
+    const view = render(this.#createContext());
+    if (this.#closed) {
+      view.element.remove();
+      view.cleanup?.();
+      return;
+    }
+    this.#view = view;
     if (customPanel === undefined) {
       this.#container.append(this.#view.element);
     } else {
@@ -138,17 +147,15 @@ export class SearchPanel {
     containerElement.before(this.#container);
     this.#emit();
 
-    // Wait a frame so the panel is laid out. Focus it before the first search
-    // so scrolling to the seeded match keeps focus in the panel.
+    // Focus before the initial search, but preserve any query and navigation
+    // the custom view has already initialized before this frame.
     requestAnimationFrame(() => {
       if (this.#closed) {
         return;
       }
-      this.#view.focus();
-      if (initialMatch !== undefined) {
+      view.focus();
+      if (this.#needsInitialSearch) {
         this.updateMatches();
-      } else {
-        onUpdate([]);
       }
     });
   }
@@ -157,7 +164,10 @@ export class SearchPanel {
   // the editor's shadow root and a custom one in the page, so read focus from
   // whichever root the panel element belongs to.
   hasFocus(): boolean {
-    const element = this.#view.element;
+    const element = this.#view?.element;
+    if (element === undefined) {
+      return false;
+    }
     const { activeElement } = element.getRootNode() as Document | ShadowRoot;
     return activeElement != null && element.contains(activeElement);
   }
@@ -165,7 +175,7 @@ export class SearchPanel {
   // Returns focus to the panel when an editor re-render moved it elsewhere.
   restoreFocus(): void {
     if (!this.hasFocus()) {
-      this.#view.focus();
+      this.#view?.focus();
     }
   }
 
@@ -204,6 +214,10 @@ export class SearchPanel {
   // Re-runs the search and lets the editor pick the current match. After a
   // document edit, pass `syncSelection: false` so the selection stays put.
   updateMatches(options?: { syncSelection?: boolean }): void {
+    if (this.#closed || this.#view === undefined) {
+      return;
+    }
+    this.#needsInitialSearch = false;
     const { textDocument, onUpdate } = this.#options;
     this.#matches =
       this.#params.text !== '' ? textDocument.search(this.#params) : [];
@@ -221,7 +235,7 @@ export class SearchPanel {
   setMode(mode: SearchPanelMode): void {
     this.#mode = mode;
     this.#emit();
-    this.#view.focus();
+    this.#view?.focus();
   }
 
   // Tears the panel down the way the close button and Escape-in-input do:
@@ -244,8 +258,10 @@ export class SearchPanel {
     }
     this.#closed = true;
     this.#container.remove();
-    this.#view.element.remove();
-    this.#view.cleanup?.();
+    const view = this.#view;
+    this.#view = undefined;
+    view?.element.remove();
+    view?.cleanup?.();
   }
 
   // The actions handed to the panel UI. Calls that arrive after the panel
@@ -273,6 +289,11 @@ export class SearchPanel {
     const next = { ...previous, ...params };
     this.#params = next;
     this.#mode = mode ?? this.#mode;
+    // Renderer-time preferences are applied before the first search, once
+    // the returned view is mounted and can receive state updates.
+    if (this.#view === undefined) {
+      return;
+    }
     if (
       next.text !== previous.text ||
       next.caseSensitive !== previous.caseSensitive ||
@@ -350,7 +371,7 @@ export class SearchPanel {
             ([start, end]) =>
               start === currentMatch[0] && end === currentMatch[1]
           );
-    this.#view.update({
+    this.#view?.update({
       ...this.#params,
       mode: this.#mode,
       matchCount: this.#matches.length,

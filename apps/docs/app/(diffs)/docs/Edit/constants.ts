@@ -460,7 +460,10 @@ export function EditableFile({ file }: { file: FileContents }) {
         return {
           element,
           update: (state) => setPanel({ element, search, state }),
-          focus: () => inputRef.current?.focus(),
+          focus: () => {
+            inputRef.current?.focus();
+            inputRef.current?.select();
+          },
           cleanup: () => setPanel(undefined),
         };
       },
@@ -497,6 +500,7 @@ function SearchPopup({
   // focus the input when the popup first renders.
   useEffect(() => {
     inputRef.current?.focus();
+    inputRef.current?.select();
   }, [inputRef]);
 
   return (
@@ -506,9 +510,14 @@ function SearchPopup({
         value={state.text}
         onChange={(e) => search.setState({ text: e.target.value })}
         onKeyDown={(e) => {
+          if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+            return;
+          }
           if (e.key === 'Enter') {
+            e.preventDefault();
             search.navigate(e.shiftKey ? 'previous' : 'next');
           } else if (e.key === 'Escape') {
+            e.preventDefault();
             search.close();
           }
         }}
